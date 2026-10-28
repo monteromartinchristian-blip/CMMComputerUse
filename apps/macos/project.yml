@@ -1,0 +1,70 @@
+name: CMMComputerUse
+options:
+  deploymentTarget:
+    macOS: '15.0'
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: '6.0'
+    MACOSX_DEPLOYMENT_TARGET: '15.0'
+    # A fresh clone must compile without a signing identity: the helper's TCC
+    # identity is established by scripts/build-helper.sh at install time, not by
+    # this project. Pass CODE_SIGNING_ALLOWED=YES to sign inside Xcode.
+    CODE_SIGNING_ALLOWED: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  CMMComputerUse:
+    type: application
+    platform: macOS
+    sources:
+      - CMMComputerUse
+      # The shared contract files the helper EXECUTES: the interaction policy,
+      # the per-application authorization and the window-targeting rules.
+      # tools/build-computer-bridge.sh passes the same files to swiftc, so both
+      # build paths compile one definition.
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_NAME: CMMComputerUse
+        # Stable, and part of the TCC designated requirement: changing it makes
+        # every existing Screen Recording / Accessibility grant point at a
+        # binary that no longer exists.
+        PRODUCT_BUNDLE_IDENTIFIER: com.cmm.chat.computer-use
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: '0.1.0'
+        CURRENT_PROJECT_VERSION: '1'
+        INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_CFBundleDisplayName: CMM Computer Use
+    info:
+      path: CMMComputerUse/Info.plist
+      properties:
+        # REQUIRED, and not cosmetic: without LSUIElement the bundle is treated
+        # as a regular application and the process never joins the session's
+        # dock/app list, so activation requests are accepted and silently
+        # dropped.
+        LSUIElement: true
+        # The person-visible name. PRODUCT_NAME stays the executable/bundle
+        # file name (CMMComputerUse.app) because the bundle identity IS the TCC
+        # identity; the human-facing name is these two keys. They live here
+        # because xcodegen REGENERATES Info.plist from this file.
+        CFBundleName: CMM Computer Use
+        CFBundleDisplayName: CMM Computer Use
+  CMMComputerUseTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: CMMComputerUseTests
+      # Compiled into the test bundle so the exact rules the helper executes are
+      # pinned. No window server, no TCC, no desktop event.
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cmm.chat.computer-use.tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  CMMComputerUse:
+    build:
+      targets:
+        CMMComputerUse: all
+    test:
+      targets: [CMMComputerUseTests]

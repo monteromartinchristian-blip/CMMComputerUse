@@ -1,0 +1,25 @@
+# Build output
+build/
+apps/macos/build/
+DerivedData/
+*.xcresult
+
+# xcodegen owns the project: project.yml is the source of truth
+apps/macos/CMMComputerUse.xcodeproj/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+
+# Packages
+*.tgz
+
+# macOS
+.DS_Store
+
+# Internal evidence for a release pass. The public tree carries none of it.
+docs/evidence/
+docs/architecture/CMM-DSH-ComputerUse-Fase08-Publicacion.md

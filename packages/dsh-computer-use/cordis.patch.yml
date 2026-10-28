@@ -1,0 +1,66 @@
+# Cordis patch for @cmm/dsh-computer-use.
+#
+# Two rows, both additive:
+#
+#   cmm-computer-use        the MCP client DSH already ships, pointed at this
+#                           package's stdio adapter. No second transport, no
+#                           second adapter, no second engine.
+#   cmm-computer-use-panel  this package's Host plugin: the session projection
+#                           and the live mirror.
+#
+# Paths are resolved from `baseUrl`, the profile directory the Loader exposes to
+# `!!js` expressions, so the very same patch works for a registry install, a
+# `link:` install and a checkout. Nothing here is interpolated from a personal
+# path, and nothing is written to the profile by this package.
+
+- insert:
+    - id: "cmm-computer-use"
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        transport: "stdio"
+        serverName: "cmm-computer-use"
+        command: "/bin/sh"
+        args:
+          - !!js >-
+              process.getBuiltinModule('node:path').join(
+                process.getBuiltinModule('node:path').dirname(
+                  process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@cmm/dsh-computer-use/package.json')
+                ), 'adapter', 'serve.sh')
+          - "--socket"
+          - !!js >-
+              process.env.CMM_COMPUTER_BRIDGE_SOCKET ||
+              process.getBuiltinModule('node:path').join(
+                process.getBuiltinModule('node:os').homedir(), '.cmm', 'computer-bridge', 'bridge.sock')
+          - "--mode"
+          - "background"
+        env:
+          # A production session must not write __pycache__ into the package it
+          # is reading, and a like-named module in site-packages must not shadow
+          # the one imported from the adapter directory.
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONNOUSERSITE: "1"
+        cwd: !!js >-
+          process.getBuiltinModule('node:path').join(
+            process.getBuiltinModule('node:path').dirname(
+              process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@cmm/dsh-computer-use/package.json')
+            ), 'adapter')
+        # Above the adapter's own 60 s budget for action.execute, so the model
+        # receives a typed refusal instead of DSH cutting the call first.
+        toolCallTimeoutMs: 70000
+        # The adapter is lazy: initialize and tools/list never touch the socket,
+        # so a missing helper does not block installation; the first tool that
+        # needs it fails with COMPUTER_RUNTIME_UNAVAILABLE.
+        failOnStartupError: true
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10
+
+    - id: "cmm-computer-use-panel"
+      name: "@cmm/dsh-computer-use"
+      config:
+        socket: !!js >-
+          process.env.CMM_COMPUTER_BRIDGE_SOCKET ||
+          process.getBuiltinModule('node:path').join(
+            process.getBuiltinModule('node:os').homedir(), '.cmm', 'computer-bridge', 'bridge.sock')
