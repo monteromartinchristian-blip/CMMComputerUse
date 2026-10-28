@@ -1,0 +1,104 @@
+{
+  "format": 1,
+  "title": {
+    "en": "CMM Computer Use",
+    "es": "CMM Computer Use"
+  },
+  "description": {
+    "en": "A one-plugin index for background computer use on macOS: DeepSeek Harness drives authorized applications without taking focus or moving the cursor.",
+    "es": "Índice de un solo plugin para computer use en segundo plano en macOS: DeepSeek Harness opera aplicaciones autorizadas sin robar el foco ni mover el cursor."
+  },
+  "metadata": {
+    "categories": {
+      "developer-tools": {
+        "title": {
+          "en": "Developer tools",
+          "es": "Herramientas de desarrollo"
+        }
+      }
+    },
+    "labels": {
+      "background": {
+        "title": {
+          "en": "Background",
+          "es": "Segundo plano"
+        }
+      },
+      "fail-closed": {
+        "title": {
+          "en": "Fail-closed",
+          "es": "Cierre seguro"
+        }
+      },
+      "macos-only": {
+        "title": {
+          "en": "macOS only",
+          "es": "Sólo macOS"
+        }
+      }
+    },
+    "sortKeys": {
+      "published": {
+        "title": {
+          "en": "Published",
+          "es": "Publicado"
+        },
+        "order": "desc"
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "@cmm/dsh-computer-use",
+      "title": {
+        "en": "CMM Computer Use",
+        "es": "CMM Computer Use"
+      },
+      "description": {
+        "en": "Observe and operate authorized macOS applications in the background. Window-scoped capture, semantic accessibility actions, a live mirror, and fail-closed per-application authorization.",
+        "es": "Observa y opera aplicaciones macOS autorizadas en segundo plano. Captura acotada a una ventana, acciones semánticas de accesibilidad, espejo en vivo y autorización por aplicación que falla cerrada."
+      },
+      "icon": "https://raw.githubusercontent.com/monteromartinchristian-blip/CMMComputerUse/main/packages/dsh-computer-use/icon.svg",
+      "author": "CMM",
+      "homepage": "https://github.com/monteromartinchristian-blip/CMMComputerUse#readme",
+      "repository": {
+        "url": "https://github.com/monteromartinchristian-blip/CMMComputerUse",
+        "directory": "packages/dsh-computer-use"
+      },
+      "metadata": {
+        "category": "developer-tools",
+        "keywords": [
+          "computer-use",
+          "accessibility",
+          "screencapturekit",
+          "background",
+          "macos",
+          "deepseek-harness"
+        ],
+        "labels": [
+          "background",
+          "fail-closed",
+          "macos-only"
+        ],
+        "sortKeys": {
+          "published": 1793167455
+        }
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1793167455,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/monteromartinchristian-blip/CMMComputerUse.git",
+            "commit": "fcb7a2e1ff197d2c2c49b7907fba8438d8abb008",
+            "path": "packages/dsh-computer-use"
+          },
+          "engines": {
+            "dsh": ">=0.2.1-rc.3 <0.3.0"
+          }
+        }
+      ]
+    }
+  ]
+}
