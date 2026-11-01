@@ -119,16 +119,41 @@ An ad-hoc or development-signed client works too, as long as the requirement
 describes it; the check is about matching what the policy demanded, not about
 Apple's notarization.
 
+## Validating a requirement before you write it
+
+`identifier "x"` compiles, matches, and proves almost nothing: any binary can
+carry that identifier. So the helper answers the three questions a person
+actually has, through `policy.requirements.check` (contract version 1):
+
+| Question | Field | Meaning |
+|---|---|---|
+| Does it compile? | `compiles`, `status`, `message` | A typo is reported as `invalid_requirement` with the raw OSStatus, not folded into "no match" |
+| Does it describe *this* caller? | `matches_peer` | Evaluated against the audit token of the process on the socket |
+| Does it describe *that* application? | `matches_evaluated_path` | Evaluated against `evaluate_path`, when one was given |
+
+The operation is read-only, needs no client identity, and exposes only what
+`codesign -d -r- <path>` already shows to the same user.
+
+### Load-time refusal
+
+A document with a client requirement that does not compile is refused **whole**
+at load: `loaded:false`, `load_error:"client_requirement_invalid"`,
+`invalid_clients:[…]`. Before this, such a document loaded and simply denied that
+client, which is indistinguishable on screen from a client whose requirement is
+valid but does not match. Failing closed on the document makes the typo visible
+and removes the ambiguity.
+
 ## Limitations
 
-- A requirement that fails to compile matches nothing (fail closed), but that is
-  not currently distinguished from "valid, did not match" in `policy.status`.
 - The pid fallback path is weaker than the audit token and should be removed once
   the token is confirmed everywhere.
-- Requirements are compiled per connection; a malformed requirement is not yet a
-  load-time refusal.
+- Requirements are compiled at load (once) and per connection (per client); a
+  heavily populated policy re-validates on each connection, which is correct but
+  not cached.
 - A process running as the same user can still edit `policy.json` directly. Client
   authentication protects use of the bridge, not the file.
+- The helper can evaluate a requirement against a named code object. It cannot
+  prove that the object it evaluated is the one that will connect later.
 
 ## Verifying it yourself
 

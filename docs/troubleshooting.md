@@ -69,12 +69,30 @@ tail -20 ~/.cmm/computer-bridge/helper.log
 
 ## The job restarts in a loop
 
-Almost always a second helper holding the socket. `launchctl print` shows
-`last exit status`; the log line is `another helper already serves …`.
+The historical cause: the job ran `/usr/bin/open -n -W` with `KeepAlive`, so when
+a second instance found the socket already served it exited immediately,
+`open -W` returned, launchd restarted the job, and a third instance repeated it.
+The helper log filled with `another helper already serves …` lines — 7390 of
+them over one job's life.
+
+Current installs run the job through `scripts/run-helper.sh`, which first asks
+the socket whether the deployment is already served. If it is, the supervisor
+**waits** instead of spawning a duplicate, and takes over when that process goes
+away. A loop now means something else:
+
+```bash
+launchctl print gui/$(id -u)/com.cmm.chat.computer-use | sed -n '1,40p'
+tail -20 /tmp/cmm-computer-use.err     # supervisor diagnostics
+```
+
+`run-helper: … waiting instead of spawning a duplicate` is healthy: it means one
+helper serves and the job is supervising it. To stop the deployment, stop the
+**process** — `bootout` only stops the job, and the app `open` launched outlives
+its job definition:
 
 ```bash
 pkill -f "CMMComputerUse.app/Contents/MacOS/CMMComputerUse"
-launchctl kickstart -k gui/$(id -u)/com.cmm.chat.computer-use
+launchctl bootout gui/$(id -u)/com.cmm.chat.computer-use
 ```
 
 ## The mirror shows "View paused" over a still picture

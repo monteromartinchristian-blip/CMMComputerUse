@@ -12,6 +12,7 @@ set -euo pipefail
 LABEL="com.cmm.chat.computer-use"
 APP="${CMM_BRIDGE_APP:-$HOME/Applications/CMMComputerUse.app}"
 SUPPORT_DIR="${CMM_BRIDGE_DIR:-$HOME/.cmm/computer-bridge}"
+SUPERVISOR_DIR="$HOME/Library/Application Support/CMM Computer Use"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 PURGE=0
@@ -39,6 +40,11 @@ fi
 if [ -d "$APP" ]; then
   echo "== removing $APP"
   rm -rf "$APP"
+fi
+
+if [ -d "$SUPERVISOR_DIR" ]; then
+  echo "== removing the job supervisor in $SUPERVISOR_DIR"
+  rm -rf "$SUPERVISOR_DIR"
 fi
 
 if [ "$PURGE" -eq 1 ]; then

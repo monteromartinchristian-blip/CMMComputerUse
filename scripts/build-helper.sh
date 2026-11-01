@@ -32,16 +32,17 @@ SHARED="$APP_SRC/Shared/BridgeTargeting.swift"
 SHARED_POLICY="$APP_SRC/Shared/ComputerUsePolicy.swift"
 SHARED_AUTHZ="$APP_SRC/Shared/ComputerUseAuthorization.swift"
 SHARED_CLIENT="$APP_SRC/Shared/ComputerUseClientIdentity.swift"
+SHARED_REQUIREMENT="$APP_SRC/Shared/ComputerUseRequirement.swift"
 PLIST="$APP_SRC/CMMComputerUse/Info.plist"
 APP_NAME="CMMComputerUse.app"
 APP_DISPLAY_NAME="CMM Computer Use"
 BUNDLE_ID="com.cmm.chat.computer-use"
-VERSION="${CMM_HELPER_VERSION:-0.1.0}"
+VERSION="${CMM_HELPER_VERSION:-0.2.0}"
 INSTALL_DIR="${CMM_BRIDGE_INSTALL_DIR:-$HOME/Applications}"
 APP="$INSTALL_DIR/$APP_NAME"
 BUILD_DIR="${CMM_HELPER_BUILD_DIR:-$REPO/build}"
 
-for required in "$SRC" "$SRC_STREAM" "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$PLIST"; do
+for required in "$SRC" "$SRC_STREAM" "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$PLIST"; do
   if [ ! -f "$required" ]; then
     echo "missing source: $required" >&2; exit 1
   fi
@@ -56,7 +57,7 @@ swiftc -O -target arm64-apple-macosx15.0 \
   -framework ApplicationServices -framework AppKit -framework CoreGraphics -framework Foundation \
   -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework CoreImage -framework ImageIO \
   -framework Security \
-  "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SRC_STREAM" "$SRC" \
+  "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SRC_STREAM" "$SRC" \
   -o "$BUILD_DIR/CMMComputerUse"
 
 echo "== assembling $APP_NAME"
@@ -77,6 +78,7 @@ plist_set CFBundleExecutable CMMComputerUse
 plist_set CFBundleName "$APP_DISPLAY_NAME"
 plist_set CFBundleDisplayName "$APP_DISPLAY_NAME"
 plist_set CFBundleShortVersionString "$VERSION"
+plist_set CFBundleVersion 2
 plist_set CFBundleDevelopmentRegion en
 
 # A staged bundle whose visible name or identity regressed must not be shipped.

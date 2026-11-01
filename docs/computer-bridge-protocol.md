@@ -88,8 +88,9 @@ Use grammar (`COMPUTER_RUNTIME_UNAVAILABLE`, `COMPUTER_PERMISSION_DENIED`,
 | `observation.stream_frame` | `{policy?}` | `{screenshot_base64, media_type: "image/jpeg", frame_index, frame_age_ms, stale, view_identity}` — the last cached frame, never a new capture |
 | `observation.stream_stop` | `{}` | `{stopped, active, window_id?, frames, encode_failures}` — idempotent |
 | `observation.release` | `{}` | `{released, snapshot}` — drops every element handle |
-| `policy.status` | `{}` | `{loaded, source, policy_mode, launch_mode, effective_mode, default, apps[]}` |
+| `policy.status` | `{}` | `{loaded, source, policy_mode, launch_mode, effective_mode, default, load_error, invalid_clients[], requirement_contract, client, peer, clients[], apps[]}` — `clients[]` carries `requirement_valid`, `requirement_sha256` and `apps_sha256`, never the requirement text |
 | `policy.reload` | `{}` | re-reads the allowlist and returns the same shape |
+| `policy.requirements.check` | `{requirements:[{client_id?, requirement}], evaluate_path?}` | `{contract, contract_version, peer, evaluated_path, requirements:[{client_id?, compiles, status, message, requirement_sha256, matches_peer, matches_evaluated_path?}]}` — read-only; see below |
 | `action.execute` | `{kind, params, policy?}` | `{ok, message, interference}` for kinds in the allowlist below |
 
 Action kinds (parity with `ACTION_KINDS`): `app.open`, `app.activate`,
@@ -102,6 +103,38 @@ application name through `NSWorkspace` only.
 These additions are additive within protocol version 1: every new argument is
 optional, every new result field is extra, and a v1 client that ignores them
 behaves exactly as before.
+
+### `policy.requirements.check` (contract version 1)
+
+Compiles code-signing designated requirements with the same Security APIs the
+enforcement path uses, and optionally evaluates them. It writes nothing, reloads
+nothing, grants nothing, and needs no client identity — the moment it matters
+most is before any client is declared.
+
+- `compiles` — `SecRequirementCreateWithString` succeeded. `status` is the raw
+  `OSStatus`; `message` is a symbolic code (`ok`, `invalid_requirement`,
+  `unsupported_requirement`), never a localized string.
+- `matches_peer` — the requirement describes the process on the other end of
+  this socket, resolved from the kernel's audit token and its code signature.
+- `matches_evaluated_path` — present only when `evaluate_path` was supplied and
+  the code object there could be read. Absent means "not asked"; `false` means
+  "asked and did not match". A path that cannot be read yields
+  `evaluated_path.available: false` and no per-requirement value.
+- `requirement_sha256` — `hex(SHA256(utf8(trimmed requirement)))`, so a host can
+  prove the helper compiled the exact string it wrote without policy text
+  travelling back over the socket.
+
+The information exposed is what any process running as the same user already
+gets from `codesign -d -r- <path>`; no administrative authority is added.
+
+### Load-time requirement audit
+
+A version-2 document whose client requirement does not compile is **refused as a
+whole**: `loaded:false`, `load_error:"client_requirement_invalid"`,
+`invalid_clients:[…]`, every application denied. A requirement that cannot
+compile is not a strict client — it is a client that can never authenticate while
+the file claims it exists, which reads on screen as an authorization that does
+not work.
 
 ### Live window stream (`observation.stream_*`)
 

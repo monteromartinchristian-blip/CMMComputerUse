@@ -222,6 +222,24 @@ nonisolated(unsafe) var launchMode: BridgeInteractionMode = .background
 /// connections can observe each other's client.
 nonisolated(unsafe) var currentClient: BridgeClientGrant?
 
+/// The peer of THIS connection, kept alongside `currentClient` and under the
+/// same lock. Diagnostics only: `policy.status` reports what the kernel said
+/// about the caller, which is how an administrator tells "identified by the
+/// system" apart from "declared in a file".
+nonisolated(unsafe) var currentPeer: BridgePeerCode?
+
+/// Why the current policy is not loaded, as a symbolic code. `none` when a
+/// document loaded. Distinguishing "no file" from "the file is broken" is the
+/// difference between the documented deny-all state and a defect worth fixing.
+nonisolated(unsafe) var policyLoadError: String = "none"
+
+/// Client ids whose requirement failed to compile in the last load attempt.
+/// Ids only: requirement text never travels back over the socket.
+nonisolated(unsafe) var invalidPolicyClients: [String] = []
+
+/// Load-time requirement verdicts, keyed by client id.
+nonisolated(unsafe) var policyRequirementVerdicts: [String: BridgeRequirementVerdict] = [:]
+
 /// The loaded allowlist. `denyAll` until a valid file is read: a missing or
 /// malformed policy denies every target instead of falling back to TCC's
 /// process-wide grant.
@@ -230,15 +248,34 @@ nonisolated(unsafe) var authorization: BridgeAuthorizationPolicy =
 
 func loadAuthorizationPolicy() -> BridgeAuthorizationPolicy {
     let path = policyFilePath()
+    policyLoadError = "none"
+    invalidPolicyClients = []
+    policyRequirementVerdicts = [:]
     guard let data = FileManager.default.contents(atPath: path) else {
+        policyLoadError = "no_policy_file"
         log("AUTHORIZATION: no policy at \(path); every application is denied")
         return .denyAll(source: path)
     }
     guard let policy = BridgeAuthorizationPolicy.parse(data, source: path) else {
+        policyLoadError = "policy_malformed"
         log("AUTHORIZATION: policy at \(path) is malformed; every application is denied")
         return .denyAll(source: path)
     }
-    log("AUTHORIZATION: \(policy.grants.count) grant(s) from \(path) mode=\(policy.mode.rawValue)")
+    // A requirement that does not compile is not a strict client: it is a
+    // client that can never authenticate while the file claims it exists. Fail
+    // closed on the whole document, so the person sees a refusal instead of an
+    // allowlist that silently does nothing for one agent.
+    let audit = bridgeAuditClientRequirements(policy)
+    policyRequirementVerdicts = audit.verdicts
+    guard audit.isValid else {
+        policyLoadError = "client_requirement_invalid"
+        invalidPolicyClients = audit.invalidClientIDs
+        log("AUTHORIZATION: policy at \(path) has \(audit.invalidClientIDs.count) client requirement(s)"
+            + " that do not compile; every application is denied")
+        return .denyAll(source: path)
+    }
+    log("AUTHORIZATION: \(policy.grants.count) grant(s) from \(path) mode=\(policy.mode.rawValue)"
+        + " clients=\(policy.clients.count)")
     return policy
 }
 
@@ -922,20 +959,33 @@ func authorizationStatus() -> [String: Any] {
         "effective_mode": deploymentMode.rawValue,
         "default": "deny",
         "client_authorization": authorization.clientAuthorization.rawValue,
+        // Why nothing is loaded, when nothing is loaded. A host that only saw
+        // `loaded:false` could not tell a missing file from a document it should
+        // ask the person to repair.
+        "load_error": policyLoadError,
+        "invalid_clients": invalidPolicyClients,
+        "requirement_contract": bridgeRequirementContractVersion,
         // Who the helper believes is asking on THIS connection. Diagnostics for
         // an administrator, never an authorization input.
         "client": [
             "authenticated": currentClient != nil,
             "client_id": currentClient?.clientID ?? "",
         ],
+        // What the KERNEL said about the caller: the identity layer behind the
+        // `client` above, reported so "identified" is not confused with
+        // "declared".
+        "peer": currentPeer?.summary ?? ["available": false, "valid_signature": false],
         "clients": authorization.clients.map { client -> [String: Any] in
             [
                 "client_id": client.clientID,
                 "apps": client.apps.count,
                 "scopes": client.scopes.map { $0.rawValue }.sorted(),
                 // The requirement text is policy, not a secret, but it is also
-                // long; the count plus a boolean is what a host needs.
+                // long; a host gets its digest and the load-time verdict instead.
                 "requirement_present": !client.requirement.isEmpty,
+                "requirement_valid": policyRequirementVerdicts[client.clientID]?.compiles ?? false,
+                "requirement_sha256": bridgeRequirementDigest(client.requirement),
+                "apps_sha256": bridgeAppsDigest(client.apps),
             ]
         },
         "apps": authorization.grants.map { grant -> [String: Any] in
@@ -947,6 +997,86 @@ func authorizationStatus() -> [String: Any] {
             ]
         },
     ]
+}
+
+/// Compile and evaluate client requirements, without touching any policy.
+///
+/// The three answers an administrator needs, and nothing else:
+///   * `compiles` — the expression is a syntactically valid requirement;
+///   * `matches_peer` — it describes the process on the other end of this
+///     socket (that is how a host checks "the requirement I just wrote names
+///     me");
+///   * `matches_evaluated_path` — it describes a named application bundle, so a
+///     requirement can be checked against the client it is meant to authorize
+///     instead of being written and hoped for.
+///
+/// Absent `evaluate_path` the third answer is null, not false: "not asked" and
+/// "asked and did not match" are different facts.
+func requirementsCheck(arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    guard let raw = arguments["requirements"] as? [[String: Any]] else {
+        return (false, nil, bridgeError(
+            code: "CAPABILITY_UNSUPPORTED",
+            message: "policy.requirements.check needs a requirements array of objects."))
+    }
+    guard raw.count <= 64 else {
+        return (false, nil, bridgeError(
+            code: "CAPABILITY_UNSUPPORTED",
+            message: "At most 64 requirements may be checked at once."))
+    }
+
+    // Resolve the optional code object once. A path that cannot be read is
+    // reported as unavailable, never as "does not match".
+    var evaluatedPath: [String: Any] = ["available": false]
+    var staticCode: SecStaticCode?
+    if let candidate = arguments["evaluate_path"] as? String, !candidate.isEmpty {
+        var summary = bridgeCodeSummary(atPath: candidate)
+        var object: SecStaticCode?
+        let created = SecStaticCodeCreateWithPath(
+            URL(fileURLWithPath: candidate) as CFURL, [], &object)
+        if created == errSecSuccess, let object {
+            staticCode = object
+        } else {
+            summary = BridgeCodeSummary(
+                available: false, identifier: nil, teamID: nil, validSignature: false)
+        }
+        evaluatedPath = summary.summary
+        evaluatedPath["path"] = candidate
+    }
+
+    var results: [[String: Any]] = []
+    for entry in raw {
+        let identifier = (entry["client_id"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = (entry["requirement"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.count <= 4096 else {
+            return (false, nil, bridgeError(
+                code: "CAPABILITY_UNSUPPORTED",
+                message: "Every requirement must be non-empty and at most 4096 characters."))
+        }
+        let verdict = bridgeCompileRequirement(text)
+        var result: [String: Any] = [
+            "compiles": verdict.compiles,
+            "status": Int(verdict.status),
+            "message": verdict.message,
+            "requirement_sha256": verdict.digest,
+            "matches_peer": bridgeRequirementMatches(text, peer: currentPeer),
+        ]
+        if !identifier.isEmpty { result["client_id"] = identifier }
+        if let staticCode {
+            result["matches_evaluated_path"] = bridgeRequirementMatches(
+                text, staticCode: staticCode)
+        }
+        results.append(result)
+    }
+
+    return (true, [
+        "contract": bridgeRequirementContractName,
+        "contract_version": bridgeRequirementContractVersion,
+        "peer": currentPeer?.summary ?? ["available": false, "valid_signature": false],
+        "evaluated_path": evaluatedPath,
+        "requirements": results,
+    ], nil)
 }
 
 // MARK: - Actions (allowlisted; no shell, no script, no paths)
@@ -1467,13 +1597,28 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 // uses this to decide between the mirror and the per-request
                 // capture fallback instead of discovering it by failing.
                 "window_stream": true,
+                // The v2 client dimension exists in THIS build. Without this
+                // flag a host can only infer it from a loaded policy, which is
+                // absent exactly when the answer matters most: "no policy yet"
+                // must never read as "this helper cannot identify clients".
+                "client_authentication": true,
+                // Requirements can be compiled and evaluated on demand, so a
+                // host validates before writing instead of after failing.
+                "requirement_validation": true,
             ],
+            "requirement_contract": bridgeRequirementContractVersion,
             // Live-stream diagnostics (no frame, no pixels): whether a stream
             // is open, on which window, and how healthy its delivery is.
             "window_stream": windowStreamStatus(),
         ], nil)
     case "policy.status":
         return (true, authorizationStatus(), nil)
+    case "policy.requirements.check":
+        // Read-only: compiles requirement strings and evaluates them against
+        // code objects. It cannot write, reload or grant anything, which is why
+        // it is reachable without a client identity — the moment it is needed,
+        // no client is authorized yet.
+        return requirementsCheck(arguments: arguments)
     case "policy.reload":
         // Re-read the user-owned allowlist. It can only re-apply
         // min(launch flag, file mode), so a reload never widens what the
@@ -1767,10 +1912,14 @@ func handleLine(_ text: String, sendTo fd: Int32?, peer: BridgePeerCode? = nil) 
     dispatchLock.lock()
     // Resolve the client for this request under the lock, then dispatch. Every
     // authorization decision below reads `currentClient`, so the two must not be
-    // separated: the whole operation runs inside this critical section.
+    // separated: the whole operation runs inside this critical section. The peer
+    // is published beside it for the same reason: `policy.status` reports the
+    // caller of THIS request, never another connection's.
+    currentPeer = peer
     currentClient = bridgeMatchingClient(peer, policy: authorization)
     let (ok, result, error) = dispatch(operation: operation, arguments: args)
     currentClient = nil
+    currentPeer = nil
     dispatchLock.unlock()
     respond(["ok": ok, "result": result, "error": error], id: rid)
 }

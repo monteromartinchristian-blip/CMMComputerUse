@@ -7,6 +7,35 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The helper and the plugin version independently; this file tracks the plugin
 (`@cmm/dsh-computer-use`) and notes helper-visible changes explicitly.
 
+## Helper 0.2.0 — 2026-11-01
+
+Helper-visible changes that ship with CMM Console 0.2.0. The plugin version is
+unchanged: the wire protocol is still version 1, and every addition is optional.
+
+### Added
+
+- `policy.requirements.check` (contract version 1): compile a client requirement
+  with the same Security APIs the enforcement path uses, and evaluate it against
+  the calling process or a named code object. Read-only; adds no authority over
+  what `codesign` already shows.
+- `policy.status` now reports `load_error`, `invalid_clients`,
+  `requirement_contract`, the caller's `peer` identity, and — per client — the
+  load-time `requirement_valid` verdict plus `requirement_sha256` and
+  `apps_sha256`. The requirement text itself is never echoed.
+- `bridge.ping` advertises `client_authentication` and
+  `requirement_validation`, so a host can tell "this helper cannot identify
+  clients" from "no policy is loaded yet".
+
+### Changed
+
+- A version-2 document whose client requirement does not compile is refused as a
+  whole (`load_error:"client_requirement_invalid"`, deny-all) instead of loading
+  and silently denying that one client.
+- The LaunchAgent runs `scripts/run-helper.sh`, which waits when the socket is
+  already served instead of spawning a duplicate. The job definition gains
+  `ThrottleInterval`. LaunchServices still owns the process: `open -n -W -g -a`
+  is unchanged, so bundle identity and TCC attribution are untouched.
+
 ## [0.1.0] — 2026-10-28
 
 First public release.
