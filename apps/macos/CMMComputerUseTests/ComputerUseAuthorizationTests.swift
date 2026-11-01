@@ -39,8 +39,143 @@ final class ComputerUseAuthorizationTests: XCTestCase {
         XCTAssertNil(parse("[]"))
     }
 
-    func testWrongVersionIsRejected() {
-        XCTAssertNil(parse(#"{"version":2,"mode":"background","apps":[]}"#))
+    func testVersionIsExplicitlyBounded() {
+        // Version 1 authorizes applications; version 2 adds the client
+        // dimension. Anything else is refused rather than read optimistically.
+        XCTAssertNotNil(parse(#"{"version":1,"mode":"background","apps":[]}"#))
+        XCTAssertNotNil(parse(#"{"version":2,"mode":"background","apps":[]}"#))
+        XCTAssertNil(parse(#"{"version":3,"mode":"background","apps":[]}"#))
+        XCTAssertNil(parse(#"{"version":0,"mode":"background","apps":[]}"#))
+    }
+
+    // MARK: - Clients (version 2)
+
+    private let fixtureClients = """
+    {"version":2,"mode":"background","default":"deny","apps":[
+      {"bundle_id":"com.cmm.cu.fixture","name":"CMM CU Fixture","scopes":["observe","control"]},
+      {"bundle_id":"com.cmm.cu.other","name":"CMM CU Other","scopes":["observe"]}
+    ],"clients":[
+      {"client_id":"alpha","requirement":"identifier \\"com.cmm.cu.alpha\\"",
+       "apps":["com.cmm.cu.fixture"],"scopes":["observe"]},
+      {"client_id":"beta","requirement":"identifier \\"com.cmm.cu.beta\\"",
+       "apps":["com.cmm.cu.fixture"],"scopes":["observe","control"]}
+    ]}
+    """
+
+    func testVersionOneDocumentHasNoClientDimensionAndSaysSo() {
+        guard let policy = parse(fixtureGrant) else { return XCTFail("parse") }
+        XCTAssertEqual(policy.clientAuthorization, .legacyNone)
+        XCTAssertTrue(policy.clients.isEmpty)
+        // Legacy documents keep working: the app grant is the only gate.
+        XCTAssertTrue(policy.decision(
+            bundleID: "com.cmm.cu.fixture", name: "CMM CU Fixture",
+            windowTitle: "Fixture", scope: .control).isAllowed)
+    }
+
+    func testVersionTwoWithClientsRequiresOneAndReportsIt() {
+        guard let policy = parse(fixtureClients) else { return XCTFail("parse") }
+        XCTAssertEqual(policy.clientAuthorization, .required)
+        XCTAssertEqual(policy.clients.map(\.clientID), ["alpha", "beta"])
+        XCTAssertEqual(policy.clients[0].scopes, [.observe])
+        XCTAssertEqual(policy.clients[1].scopes, [.observe, .control])
+    }
+
+    func testVersionOneDocumentCarryingClientsIsContradictoryAndRefused() {
+        XCTAssertNil(parse("""
+        {"version":1,"mode":"background","apps":[],"clients":[
+          {"client_id":"alpha","requirement":"identifier \\"x\\"","apps":["a"],"scopes":["observe"]}]}
+        """))
+    }
+
+    func testClientDimensionDeniesWhenNoClientMatched() {
+        guard let policy = parse(fixtureClients) else { return XCTFail("parse") }
+        // nil = the peer's code identity satisfied nobody's requirement.
+        let refusal = policy.decision(
+            bundleID: "com.cmm.cu.fixture", name: "CMM CU Fixture",
+            windowTitle: "Fixture", scope: .observe, client: nil).refusal
+        XCTAssertEqual(refusal?.code, "APPROVAL_REJECTED")
+        XCTAssertEqual(refusal?.detail.contains("client_not_authorized"), true)
+    }
+
+    func testClientCannotExceedItsOwnScopes() {
+        guard let policy = parse(fixtureClients) else { return XCTFail("parse") }
+        let alpha = policy.clients[0]
+        // The APPLICATION grants control; the CLIENT only observe. The
+        // intersection is what applies, so control is refused.
+        let refusal = policy.decision(
+            bundleID: "com.cmm.cu.fixture", name: "CMM CU Fixture",
+            windowTitle: "Fixture", scope: .control, client: alpha).refusal
+        XCTAssertEqual(refusal?.detail.contains("client_scope_not_granted"), true)
+        XCTAssertTrue(policy.decision(
+            bundleID: "com.cmm.cu.fixture", name: "CMM CU Fixture",
+            windowTitle: "Fixture", scope: .observe, client: alpha).isAllowed)
+    }
+
+    func testClientCannotReachAnApplicationItWasNotGranted() {
+        guard let policy = parse(fixtureClients) else { return XCTFail("parse") }
+        let alpha = policy.clients[0]
+        // Granted by the deployment, but not to this client.
+        let refusal = policy.decision(
+            bundleID: "com.cmm.cu.other", name: "CMM CU Other",
+            windowTitle: nil, scope: .observe, client: alpha).refusal
+        XCTAssertEqual(refusal?.detail.contains("client_app_not_granted"), true)
+    }
+
+    func testApplicationAbsentFromTheDeploymentIsReportedAsSuchToAnAuthorizedClient() {
+        guard let policy = parse(fixtureClients) else { return XCTFail("parse") }
+        let alpha = policy.clients[0]
+        // Nothing granted this application, so the answer is about the
+        // application, not about the client's slice of it.
+        let refusal = policy.decision(
+            bundleID: "com.apple.finder", name: "Finder",
+            windowTitle: nil, scope: .observe, client: alpha).refusal
+        XCTAssertEqual(refusal?.detail.contains("app_not_granted"), true)
+        XCTAssertEqual(refusal?.detail.contains("client_app_not_granted"), false)
+    }
+
+    func testDisplayNameRequestIsJudgedAgainstTheResolvedGrant() {
+        guard let policy = parse(fixtureClients) else { return XCTFail("parse") }
+        let alpha = policy.clients[0]
+        // A caller that names the application "CMM CU Fixture" (display name, no
+        // bundle id) must be judged against the grant's identifiers, or a client
+        // written in bundle ids would appear unauthorized.
+        XCTAssertTrue(policy.decision(
+            bundleID: "", name: "CMM CU Fixture", windowTitle: nil,
+            scope: .observe, client: alpha).isAllowed)
+    }
+
+    func testClientWithNoAppsAuthorizesNothing() {
+        guard let policy = parse("""
+        {"version":2,"mode":"background","default":"deny","apps":[
+          {"bundle_id":"com.cmm.cu.fixture","scopes":["observe"]}],
+         "clients":[{"client_id":"empty","requirement":"identifier \\"x\\"","scopes":["observe"]}]}
+        """) else { return XCTFail("parse") }
+        let client = policy.clients[0]
+        // Empty apps means NONE, never "any".
+        XCTAssertFalse(policy.decision(
+            bundleID: "com.cmm.cu.fixture", name: "", windowTitle: nil,
+            scope: .observe, client: client).isAllowed)
+    }
+
+    func testClientEntryWithoutRequirementOrIdentifierIsRefused() {
+        XCTAssertNil(parse("""
+        {"version":2,"mode":"background","apps":[],"clients":[{"client_id":"a","apps":[]}]}
+        """))
+        XCTAssertNil(parse("""
+        {"version":2,"mode":"background","apps":[],"clients":[{"requirement":"identifier \\"a\\""}]}
+        """))
+        XCTAssertNil(parse("""
+        {"version":2,"mode":"background","apps":[],"clients":[{"client_id":"a","requirement":"x","scopes":["write"]}]}
+        """))
+    }
+
+    func testEmptyClientListIsStillRequiredAndDeniesEveryone() {
+        guard let policy = parse(#"{"version":2,"mode":"background","apps":[],"clients":[]}"#) else {
+            return XCTFail("an explicit empty client list is a valid, strict document")
+        }
+        XCTAssertEqual(policy.clientAuthorization, .required)
+        XCTAssertFalse(policy.decision(
+            bundleID: "a", name: "", windowTitle: nil, scope: .observe, client: nil).isAllowed)
     }
 
     func testUnknownModeIsRejected() {

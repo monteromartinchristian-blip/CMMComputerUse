@@ -216,6 +216,12 @@ func policyFilePath() -> String {
 /// policy reload can re-apply `min(flag, file)` without ever widening.
 nonisolated(unsafe) var launchMode: BridgeInteractionMode = .background
 
+/// The client grant that matched THIS connection, resolved from the peer's code
+/// identity. Read only inside the dispatch lock, which is what makes a single
+/// global correct: `dispatchLock` serializes every operation, so no two
+/// connections can observe each other's client.
+nonisolated(unsafe) var currentClient: BridgeClientGrant?
+
 /// The loaded allowlist. `denyAll` until a valid file is read: a missing or
 /// malformed policy denies every target instead of falling back to TCC's
 /// process-wide grant.
@@ -565,7 +571,7 @@ func visibleWindows(frontmostApp: String, targetPID: pid_t?) -> [[String: Any]] 
             let ownerBundle = owners[ownerPID]?.bundleIdentifier ?? ""
             guard authorization.decision(
                 bundleID: ownerBundle, name: ownerName, windowTitle: title,
-                scope: .observe
+                scope: .observe, client: currentClient
             ).isAllowed else { continue }
             windows.append([
                 "title": title,
@@ -650,7 +656,7 @@ func describe(
     // refused here, before a single AX attribute is read from it.
     if let refusal = authorization.decision(
         bundleID: owner.bundleID, name: owner.name,
-        windowTitle: captureTitle, scope: .observe
+        windowTitle: captureTitle, scope: .observe, client: currentClient
     ).refusal {
         log("observation refused: \(refusal.detail)")
         return (nil, refusal)
@@ -811,7 +817,7 @@ func captureWindowBase64(
                 // unauthorized window by naming it.
                 if let refusal = authorization.decision(
                     bundleID: pair.0.bundleID, name: pair.0.app,
-                    windowTitle: pair.0.title, scope: .observe
+                    windowTitle: pair.0.title, scope: .observe, client: currentClient
                 ).refusal {
                     box.refusal = refusal
                     break
@@ -852,6 +858,18 @@ func captureWindowBase64(
 /// Filtered to the allowlist: a full process inventory is metadata the person
 /// never authorized for this capability, and a client that cannot act on an app
 /// does not need to know it is running.
+/// The list of authorized applications is itself information. Under a
+/// client-required policy an unidentified caller gets a refusal frame, not an
+/// empty array: an empty array would read as "this deployment grants nothing",
+/// which is a different and untrue statement.
+func clientRequiredRefusal(operation: String) -> BridgePolicyRefusal? {
+    guard authorization.clientAuthorization == .required, currentClient == nil else { return nil }
+    return BridgePolicyRefusal(
+        code: "APPROVAL_REJECTED",
+        message: "This deployment requires a verified client identity and this process has none.",
+        detail: "auth=client_not_authorized;want=\(operation);clients=\(authorization.clients.count)")
+}
+
 func appsList() -> [String: Any] {
     var apps: [[String: Any]] = []
     for candidate in NSWorkspace.shared.runningApplications {
@@ -859,6 +877,12 @@ func appsList() -> [String: Any] {
         let bundle = candidate.bundleIdentifier ?? ""
         guard !name.isEmpty || !bundle.isEmpty else { continue }
         guard let grant = authorization.grant(bundleID: bundle, name: name) else { continue }
+        // A client that cannot reach this application must not learn it exists
+        // in the allowlist by reading apps.list.
+        if authorization.clientAuthorization == .required {
+            guard let client = currentClient,
+                  client.covers(bundleID: grant.bundleID, name: grant.name) else { continue }
+        }
         apps.append([
             "name": name,
             "bundle_id": bundle,
@@ -897,6 +921,23 @@ func authorizationStatus() -> [String: Any] {
         "launch_mode": launchMode.rawValue,
         "effective_mode": deploymentMode.rawValue,
         "default": "deny",
+        "client_authorization": authorization.clientAuthorization.rawValue,
+        // Who the helper believes is asking on THIS connection. Diagnostics for
+        // an administrator, never an authorization input.
+        "client": [
+            "authenticated": currentClient != nil,
+            "client_id": currentClient?.clientID ?? "",
+        ],
+        "clients": authorization.clients.map { client -> [String: Any] in
+            [
+                "client_id": client.clientID,
+                "apps": client.apps.count,
+                "scopes": client.scopes.map { $0.rawValue }.sorted(),
+                // The requirement text is policy, not a secret, but it is also
+                // long; the count plus a boolean is what a host needs.
+                "requirement_present": !client.requirement.isEmpty,
+            ]
+        },
         "apps": authorization.grants.map { grant -> [String: Any] in
             [
                 "bundle_id": grant.bundleID,
@@ -1275,7 +1316,7 @@ func elementPreconditions(
     // renamed out of the authorized set must stop being controllable.
     if let refusal = authorization.decision(
         bundleID: context.bundleID, name: context.appName,
-        windowTitle: currentTitle, scope: .control
+        windowTitle: currentTitle, scope: .control, client: currentClient
     ).refusal {
         return refusal
     }
@@ -1321,7 +1362,8 @@ func actionAuthorizationRefusal(
                 detail: "auth=app_missing;kind=\(kind)")
         }
         return authorization.decision(
-            bundleID: request, name: request, windowTitle: nil, scope: .control
+            bundleID: request, name: request, windowTitle: nil, scope: .control,
+            client: currentClient
         ).refusal
     case "window.focus":
         let request = (params["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1340,7 +1382,7 @@ func actionAuthorizationRefusal(
                 let owner = bridgeTargetApp(candidate)
                 return authorization.decision(
                     bundleID: owner.bundleID, name: owner.name,
-                    windowTitle: title, scope: .control
+                    windowTitle: title, scope: .control, client: currentClient
                 ).refusal
             }
         }
@@ -1397,6 +1439,19 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 "loaded": authorization.loaded,
                 "apps": authorization.grants.count,
                 "default": "deny",
+                "client_authorization": authorization.clientAuthorization.rawValue,
+        // Who the helper believes is asking on THIS connection. Diagnostics for
+        // an administrator, never an authorization input.
+        "client": [
+            "authenticated": currentClient != nil,
+            "client_id": currentClient?.clientID ?? "",
+        ],
+                "clients": authorization.clients.count,
+            ],
+            // Who the helper believes it is talking to, for THIS connection.
+            "client": [
+                "authenticated": currentClient != nil,
+                "client_id": currentClient?.clientID ?? "",
             ],
             "capabilities": [
                 "background_actions": true,
@@ -1433,6 +1488,9 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
     case "permissions.request_screen_recording":
         return (true, requestScreenRecording(), nil)
     case "apps.list":
+        if let refusal = clientRequiredRefusal(operation: "apps.list") {
+            return (false, nil, refusalFrame(refusal))
+        }
         return (true, appsList(), nil)
     case "observation.describe":
         let include = (arguments["include_screenshot"] as? Bool) ?? false
@@ -1655,7 +1713,7 @@ func readRequestLine() -> LineRead {
     return .line(String(bytes: bytes, encoding: .utf8) ?? "")
 }
 
-func handleLine(_ text: String, sendTo fd: Int32?) {
+func handleLine(_ text: String, sendTo fd: Int32?, peer: BridgePeerCode? = nil) {
     // sendTo == nil writes the response to stdout (stdio mode); otherwise to
     // the serving socket connection.
     func respond(_ object: [String: Any?], id rid: Any) {
@@ -1707,7 +1765,12 @@ func handleLine(_ text: String, sendTo fd: Int32?) {
         return
     }
     dispatchLock.lock()
+    // Resolve the client for this request under the lock, then dispatch. Every
+    // authorization decision below reads `currentClient`, so the two must not be
+    // separated: the whole operation runs inside this critical section.
+    currentClient = bridgeMatchingClient(peer, policy: authorization)
     let (ok, result, error) = dispatch(operation: operation, arguments: args)
+    currentClient = nil
     dispatchLock.unlock()
     respond(["ok": ok, "result": result, "error": error], id: rid)
 }
@@ -1795,6 +1858,15 @@ func probeSocket(at path: String) -> Bool {
 }
 
 func serveConnection(_ fd: Int32) {
+    // Resolve WHO is on this socket exactly once, from the kernel's view of the
+    // peer (audit token + code signature), never from anything it sends.
+    let peer = bridgePeerCode(fd: fd)
+    if let peer {
+        log("client peer pid=\(peer.pid) signed=\(peer.validSignature) id=\(peer.identifier ?? "-")")
+    } else {
+        log("client peer could not be identified; application operations will be refused"
+            + " when the policy requires clients")
+    }
     var bytes: [UInt8] = []
     bytes.reserveCapacity(1024)
     var overCap = false
@@ -1809,7 +1881,7 @@ func serveConnection(_ fd: Int32) {
                       "error": ["code": "CAPABILITY_UNSUPPORTED", "message": "Request exceeds the bounded size."]],
                      id: NSNull(), fd: fd)
             } else {
-                handleLine(String(bytes: bytes, encoding: .utf8) ?? "", sendTo: fd)
+                handleLine(String(bytes: bytes, encoding: .utf8) ?? "", sendTo: fd, peer: peer)
             }
             bytes.removeAll(keepingCapacity: true)
             overCap = false
@@ -1889,14 +1961,30 @@ NSApplication.shared.setActivationPolicy(.accessory)
 /// nobody chose. Absent `--policy` means `background`: the safe default for a
 /// new client, declared explicitly by the product's LaunchAgent when it wants
 /// the legacy planner surface.
-func parseLaunchArguments() -> (serveSocket: String?, mode: BridgeInteractionMode, preflightOnly: Bool) {
+func parseLaunchArguments() -> (
+    serveSocket: String?, mode: BridgeInteractionMode, preflightOnly: Bool,
+    skipPermissionBootstrap: Bool
+) {
     var preflightOnly = false
+    var skipPermissionBootstrap = false
     var mode = BridgeInteractionMode.background
     var socketPath: String?
     var index = 1
     let arguments = CommandLine.arguments
     while index < arguments.count {
         switch arguments[index] {
+        case "--no-permission-bootstrap":
+            // Isolated verification lane. Serving a policy on a temporary socket
+            // must not touch TCC, and bootstrapPermissions() can present the
+            // system's Accessibility/Screen Recording prompts. This flag skips
+            // ONLY that bootstrap: it grants nothing, and every observation or
+            // action still fails normally if TCC was never granted.
+            guard !skipPermissionBootstrap else {
+                log("FATAL: duplicate --no-permission-bootstrap")
+                exit(2)
+            }
+            skipPermissionBootstrap = true
+            index += 1
         case "--preflight-only":
             guard !preflightOnly else {
                 log("FATAL: duplicate --preflight-only")
@@ -1943,7 +2031,7 @@ func parseLaunchArguments() -> (serveSocket: String?, mode: BridgeInteractionMod
         log("FATAL: --preflight-only cannot serve a socket")
         exit(2)
     }
-    return (socketPath, mode, preflightOnly)
+    return (socketPath, mode, preflightOnly, skipPermissionBootstrap)
 }
 
 launchMode = launchArguments.mode
@@ -1972,7 +2060,11 @@ if let socketPath = launchArguments.serveSocket {
     // the process is never finished launching and every activation request
     // (ours and AX's) is accepted and silently dropped.
     app.finishLaunching()
-    bootstrapPermissions()
+    if launchArguments.skipPermissionBootstrap {
+        log("permission bootstrap skipped (--no-permission-bootstrap)")
+    } else {
+        bootstrapPermissions()
+    }
     app.run()
     exit(0)
 }
@@ -1980,7 +2072,11 @@ if let socketPath = launchArguments.serveSocket {
 log("\(bridgeName) protocol v\(bridgeVersion) ready pid=\(ProcessInfo.processInfo.processIdentifier) bundle=\(Bundle.main.bundleIdentifier ?? "?") policy=\(deploymentMode.rawValue)")
 
 app.finishLaunching()
-bootstrapPermissions()
+if launchArguments.skipPermissionBootstrap {
+    log("permission bootstrap skipped (--no-permission-bootstrap)")
+} else {
+    bootstrapPermissions()
+}
 while true {
     switch readRequestLine() {
     case .eof:
