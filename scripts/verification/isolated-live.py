@@ -640,7 +640,7 @@ def phase_verify_production(evidence: str) -> None:
     ls_failures, ls_drift = lib.launchservices_verdict(
         before.get("launchservices_paths"), after.get("launchservices_paths"), HOME, str(REPO))
     failures = diff + ["launchservices: " + f for f in ls_failures]
-    pathlib.Path(evidence, "production-diff.txt").write_text("\n".join(failures) + "\n")
+    pathlib.Path(evidence, "production-diff.txt").write_text(lib.diff_file_text(failures))
     # Full BEFORE/AFTER lists stay in the evidence for audit, with the drift.
     pathlib.Path(evidence, "launchservices-audit.json").write_text(json.dumps({
         "before": before.get("launchservices_paths"),

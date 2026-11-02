@@ -282,6 +282,15 @@ def launchservices_verdict(
     return failures, diagnostics
 
 
+def diff_file_text(failures: List[str]) -> str:
+    """Contents of production-diff.txt: one line per failure with a final
+    newline, and EXACTLY empty (0 bytes) when there is none, so "empty file"
+    means "no difference" to any wrapper."""
+
+    text = "\n".join(failures)
+    return text + "\n" if text else ""
+
+
 def launchctl_facts(text: str) -> Dict[str, Any]:
     """Stable facts from `launchctl print gui/<uid>/<label>`; volatile counters
     are left out on purpose, the pid and arguments are kept."""

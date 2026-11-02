@@ -293,6 +293,37 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(lib.tcc_ready({})[0])
 
 
+class DiffFileTests(unittest.TestCase):
+    def write_and_read(self, failures):
+        work = tempfile.mkdtemp(prefix="cmm-cu-difffile-test-")
+        try:
+            path = pathlib.Path(work, "production-diff.txt")
+            path.write_text(lib.diff_file_text(failures))
+            return path.read_bytes()
+        finally:
+            shutil.rmtree(work)
+
+    def test_no_failures_is_a_zero_byte_file(self):
+        self.assertEqual(lib.diff_file_text([]), "")
+        self.assertEqual(self.write_and_read([]), b"")
+
+    def test_failures_are_one_per_line_with_a_final_newline(self):
+        self.assertEqual(self.write_and_read(["changed launchctl/pid: 1 -> 2"]),
+                         b"changed launchctl/pid: 1 -> 2\n")
+        lines = ["changed support_dir/policy.json/sha256: a -> b",
+                 "launchservices: lane path survived the teardown: /private/tmp/cmm-cu-isolated-x/CMMComputerUse.app"]
+        content = self.write_and_read(lines)
+        self.assertEqual(content, ("\n".join(lines) + "\n").encode())
+        self.assertEqual(content.decode().splitlines(), lines)
+        self.assertTrue(content.endswith(b"\n") and not content.endswith(b"\n\n"))
+
+    def test_verify_production_writes_through_the_helper(self):
+        body = ORCHESTRATOR.split('"""', 2)[2]
+        phase = body[body.index("def phase_verify_production"):body.index("def main(")]
+        self.assertIn('write_text(lib.diff_file_text(failures))', phase)
+        self.assertNotIn('"\\n".join(failures) + "\\n"', phase)
+
+
 class LaunchServicesGateTests(unittest.TestCase):
     HOME = "/Users/tester"
     REPO = "/Users/tester/CMM Desarrollo/CMM Computer Use"
