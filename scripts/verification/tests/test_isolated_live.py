@@ -402,6 +402,41 @@ class LaunchServicesGateTests(unittest.TestCase):
         self.assertIn("for app in pathlib.Path(lane.work).rglob(\"*.app\"):", body)
 
 
+class AllFlowTests(unittest.TestCase):
+    """`all` must reach after-breach even when a LIVE check fails, with the
+    control confirmation, and must still report the LIVE failure."""
+
+    def all_block(self):
+        body = ORCHESTRATOR.split('"""', 2)[2]
+        start = body.index('if args.phase == "all":')
+        return body[start:body.index('if args.phase == "prepare":', start)]
+
+    def test_after_breach_runs_after_a_live_failure_with_confirm_control(self):
+        block = self.all_block()
+        live = block.index("phase_live(lane)")
+        caught = block.index("except Gate as gate:", live)
+        after = block.index("phase_after_breach(lane, confirm_control=True)", caught)
+        self.assertLess(live, caught)
+        self.assertLess(caught, after)
+        self.assertIn("live_failure = gate", block[caught:after])
+
+    def test_the_live_failure_is_still_the_result_after_teardown(self):
+        block = self.all_block()
+        teardown = block.index("phase_teardown(lane)")
+        verify = block.index("phase_verify_production(evidence)")
+        reraise = block.index("raise live_failure")
+        self.assertLess(teardown, reraise)
+        self.assertLess(verify, reraise)
+        self.assertIn("summarize(lane)", block)
+
+    def test_no_live_still_skips_live_and_after_breach(self):
+        block = self.all_block()
+        self.assertIn("if not args.no_live:", block)
+        guarded = block[block.index("if not args.no_live:"):block.index("finally:")]
+        self.assertIn("phase_live(lane)", guarded)
+        self.assertIn("phase_after_breach(", guarded)
+
+
 class OrchestratorSourceTests(unittest.TestCase):
     """What the lane may not do, pinned on its source."""
 

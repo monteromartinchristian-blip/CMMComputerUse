@@ -96,13 +96,21 @@ identidad de código (cdhash) del intérprete que actúa como agente.
    `rearmed`. Auditoría: un `rearmed` con `actor_client_id=test-rearm`,
    `actor_signing_id=com.cmm.computer-use.test-rearm` y el motivo, y ≥3
    `rearm_refused`.
-5. **live** — sólo si 3 y 4 pasaron. `live-background-e2e.sh --electron-app …
+5. **live** — sólo si 3 y 4 pasaron. Gates actualizados (2026-11-02, tras el
+   primer LIVE): el scroll del fixture debe estar verificado por el helper
+   (`effect=moved`) y por el `scroll_y` del fixture; Claude se juzga por
+   `electron_observe_readable` (observe-only), y `actionable` es sólo
+   diagnóstico — el control real de Claude sigue sin demostrar; cualquier
+   movimiento de cursor sigue haciendo FAIL y se diagnostica por paso. `live-background-e2e.sh --electron-app …
    --breach-control` contra el socket aislado: status, observe, nombre en
    PiP, botón de ventana rechazado, press sin robo de foco, scroll, Electron
    (sólo observe), guard anti-bypass y, **al final**, el breach controlado del
    fixture (`INTERFERENCE_BREACH`, latch en helper y DSH, testigo
    independiente lo ve, sin `focus_restore`).
-6. **after-breach** — el breach real está latcheado a nombre de `live-agent`;
+6. **after-breach** — en `all` se ejecuta SIEMPRE tras `live`, aunque algún
+   check de `live` haya fallado (el fallo de `live` sigue siendo el resultado
+   final), y siempre con `--confirm-control`. Al final se imprime un resumen
+   por fase. El breach real está latcheado a nombre de `live-agent`;
    reinicio de la instancia aislada → **sigue latcheado**; el agente no puede
    rearmarlo; el probe lo rearma con motivo. `--confirm-control` añade un press
    del fixture para demostrar que el control vuelve.

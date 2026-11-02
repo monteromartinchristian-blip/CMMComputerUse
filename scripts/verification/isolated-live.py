@@ -551,6 +551,7 @@ def phase_live(lane: Lane) -> None:
 
 def phase_after_breach(lane: Lane, confirm_control: bool) -> None:
     r: Dict[str, Any] = {}
+    lane.state.setdefault("results", {})["after_breach"] = r  # visible even if a gate closes
     before = probe(lane, "status")
     frame = json.loads(before.stdout.strip().splitlines()[-1])
     real = [b for b in frame["result"]["breaches"] if b["target_bundle"] == lib.FIXTURE_BUNDLE_ID]
@@ -591,6 +592,20 @@ def phase_after_breach(lane: Lane, confirm_control: bool) -> None:
         client.close()
     lane.state["results"]["after_breach"] = r
     lane.save()
+
+
+def summarize(lane: Lane) -> None:
+    """One line per phase check, so a failure in one phase never hides what
+    the later phases proved."""
+
+    say("══ lane summary")
+    for phase in ("prepare", "start", "verify_tcc", "rearm_tests", "live", "after_breach"):
+        results = lane.state.get("results", {}).get(phase)
+        if results is None:
+            say("  %-13s not run" % phase)
+            continue
+        failed = sorted(k for k, v in results.items() if v is False)
+        say("  %-13s %s" % (phase, "PASS (%d)" % len(results) if not failed else "FAIL: %s" % ", ".join(failed)))
 
 
 def phase_teardown(lane: Lane) -> str:
@@ -669,22 +684,35 @@ def main() -> int:
     parser.add_argument("--electron-app", default="")
     parser.add_argument("--no-live", action="store_true", help="all: stop after rearm-tests (no LIVE, no breach)")
     parser.add_argument("--confirm-control", action="store_true",
-                        help="after-breach: one fixture press after the rearm, to show control is back")
+                        help="after-breach phase alone: one fixture press after the rearm "
+                             "(always on in `all`)")
     args = parser.parse_args()
     try:
         if args.phase == "all":
             lane = phase_prepare(args)
             evidence = None
+            live_failure: Optional[Gate] = None
             try:
                 phase_start(lane)
                 phase_verify_tcc(lane)
                 phase_rearm_tests(lane)
                 if not args.no_live:
-                    phase_live(lane)
-                    phase_after_breach(lane, args.confirm_control)
+                    # A failing LIVE check must not hide the recovery checks:
+                    # after-breach ALWAYS runs (it fails on its own if no breach
+                    # was latched), with --confirm-control mandatory here. The
+                    # LIVE failure is still the run's result.
+                    try:
+                        phase_live(lane)
+                    except Gate as gate:
+                        live_failure = gate
+                        say("LIVE failed (%s); continuing to after-breach anyway" % gate)
+                    phase_after_breach(lane, confirm_control=True)
             finally:
+                summarize(lane)
                 evidence = phase_teardown(lane)
                 phase_verify_production(evidence)
+            if live_failure is not None:
+                raise live_failure
             return 0
         if args.phase == "prepare":
             phase_prepare(args)
