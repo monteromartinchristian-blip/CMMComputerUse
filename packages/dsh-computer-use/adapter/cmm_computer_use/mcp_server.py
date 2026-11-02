@@ -83,6 +83,28 @@ MAX_ELEMENTS_IN_TEXT = 40
 MAX_CONTENT_IN_TEXT = 60
 
 
+#: Sent as the MCP ``instructions`` of this server and repeated on every
+#: refusal. The tools ARE the boundary: a capability they lack is not a gap for
+#: the agent to fill with its own automation, because every such route
+#: (synthetic events, scripting, ad-hoc AX clients) bypasses the allowlist, the
+#: no-focus guarantee and the interference ledger at once.
+NO_BYPASS_POLICY = (
+    "CMM Computer Use is the ONLY permitted way to observe or operate other "
+    "applications' windows. When a computer_use_* tool refuses, reports "
+    "CAPABILITY_UNSUPPORTED or AX_TREE_UNAVAILABLE, or simply cannot do what is "
+    "needed, STOP and report it to the person. Never work around it with Bash, "
+    "osascript, AppleScript, JXA, System Events, Swift or Python scripts, "
+    "CGEvent / Quartz event posting, cursor warping, cliclick, open -a, or any "
+    "other accessibility or automation tool: those routes bypass the "
+    "authorization policy, can take the person's focus and cursor, and are "
+    "invisible to the interference ledger."
+)
+NO_BYPASS_LINE = (
+    "Do not work around this with Bash, osascript/JXA/AppleScript, System Events, "
+    "Swift, CGEvent or other automation; report it to the person."
+)
+
+
 def _schema(
     properties: Dict[str, Any], required: Optional[List[str]] = None
 ) -> Dict[str, Any]:
@@ -184,7 +206,9 @@ class ToolRegistry:
                     "(AXPress: the application's own action, no synthetic input). "
                     "Requires the element id and the snapshot it came from. The "
                     "result reports whether the action changed the frontmost "
-                    "application or the cursor."
+                    "application or the cursor. Window controls (close, "
+                    "minimize, zoom, full screen) are refused in background "
+                    "mode: they bring the window to the front."
                 ),
                 "inputSchema": _schema(
                     {
@@ -212,6 +236,30 @@ class ToolRegistry:
                         "snapshot": {"type": "integer", "minimum": 1},
                     },
                     required=["element_id", "text", "snapshot"],
+                ),
+            },
+            {
+                "name": "computer_use_scroll",
+                "description": (
+                    "Scroll one observed element (usually an AXScrollArea marked "
+                    "'scrollable') with accessibility primitives only: the "
+                    "element's own page action or its scroll bar value. Never "
+                    "posts a scroll-wheel event, never moves the cursor. When the "
+                    "element offers neither, the helper answers "
+                    "CAPABILITY_UNSUPPORTED; report that instead of scrolling "
+                    "another way."
+                ),
+                "inputSchema": _schema(
+                    {
+                        "element_id": {"type": "integer", "minimum": 1},
+                        "snapshot": {"type": "integer", "minimum": 1},
+                        "direction": {
+                            "type": "string",
+                            "enum": ["up", "down", "left", "right"],
+                        },
+                        "pages": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
+                    },
+                    required=["element_id", "snapshot", "direction"],
                 ),
             },
             {
@@ -288,10 +336,11 @@ class ToolRegistry:
                         ),
                     },
                     {
-                        "name": "computer_use_scroll",
+                        "name": "computer_use_pointer_scroll",
                         "description": (
-                            "UNSAFE: post a global scroll event at the cursor. Only "
-                            "available in unrestricted mode."
+                            "UNSAFE: post a global scroll-wheel event wherever the "
+                            "cursor is. Only available in unrestricted mode; prefer "
+                            "computer_use_scroll."
                         ),
                         "inputSchema": _schema(
                             {"dy": {"type": "integer", "minimum": -100, "maximum": 100}},
@@ -355,6 +404,15 @@ class ToolRegistry:
                      "text": str(arguments.get("text", "")),
                      "snapshot": _int(arguments, "snapshot")},
                 )
+            if name == "computer_use_scroll":
+                pages = arguments.get("pages", 1)
+                return self._element_action(
+                    "ui.scroll",
+                    {"element_id": _int(arguments, "element_id"),
+                     "snapshot": _int(arguments, "snapshot"),
+                     "direction": str(arguments.get("direction", "")),
+                     "pages": _int({"pages": pages}, "pages")},
+                )
             if name == "computer_use_activate_app":
                 return self._action("app.activate", {"app": str(arguments.get("app", ""))})
             if name == "computer_use_focus_window":
@@ -372,7 +430,7 @@ class ToolRegistry:
                 return self._action(
                     "keyboard.shortcut", {"keys": str(arguments.get("keys", ""))}
                 )
-            if name == "computer_use_scroll":
+            if name == "computer_use_pointer_scroll":
                 return self._action(
                     "pointer.scroll", {"dy": int(arguments.get("dy", -3))}
                 )
@@ -572,6 +630,7 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
             "window": observation.get("target_window"), "window_id": observation.get("target_window_id")})
         # Before all untrusted AX content; fourth line of the observation.
         lines.extend(metadata.lstrip("\n").splitlines())
+    lines.extend(_render_ax_tree(observation))
     windows = observation.get("windows") or []
     if windows:
         lines.append("windows on screen (%d):" % len(windows))
@@ -606,7 +665,7 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
         limit = len(elements) if element_filter else MAX_ELEMENTS_IN_TEXT
         for element in elements[:limit]:
             lines.append(
-                '[%s] %s "%s" (%s,%s %sx%s)%s'
+                '[%s] %s "%s" (%s,%s %sx%s)%s%s%s'
                 % (
                     element.get("element_id"),
                     element.get("role", ""),
@@ -615,7 +674,9 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
                     element.get("y", 0),
                     element.get("width", 0),
                     element.get("height", 0),
-                    " pressable" if element.get("pressable") else "",
+                    " pressable" if element.get("pressable") and not element.get("window_chrome") else "",
+                    " window-control(not pressable in background)" if element.get("window_chrome") else "",
+                    _scroll_flag(element),
                 )
             )
         if len(elements) > limit:
@@ -623,6 +684,45 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
     else:
         lines.append("interactive elements: none detected")
     return "\n".join(lines)
+
+
+def _scroll_flag(element: Dict[str, Any]) -> str:
+    if "scrollable" not in element:
+        return ""
+    if element.get("scrollable"):
+        return " scrollable"
+    return " not-scrollable(%s)" % (element.get("scroll_unsupported") or "unsupported")
+
+
+def _render_ax_tree(observation: Dict[str, Any]) -> List[str]:
+    """State whether the accessibility tree is usable, never imply it is.
+
+    ``chrome_only`` is the Electron/Chromium failure seen with Claude Desktop:
+    only the title-bar buttons are exposed. The helper already tried the
+    supported enrichment (``AXManualAccessibility``) and verified the result;
+    when that did not help, the answer is an explicit capability gap.
+    """
+
+    lines: List[str] = []
+    enrichment = observation.get("ax_enrichment")
+    if isinstance(enrichment, dict) and enrichment.get("state") not in (None, "not_needed"):
+        lines.append(
+            "ax_enrichment: %s via %s nodes %s->%s"
+            % (
+                enrichment.get("state"),
+                enrichment.get("mechanism"),
+                enrichment.get("nodes_before"),
+                enrichment.get("nodes_after"),
+            )
+        )
+    tree = observation.get("ax_tree")
+    if tree in ("chrome_only", "empty"):
+        lines.append(
+            "AX_TREE_UNAVAILABLE: this window exposes %s through accessibility; its "
+            "content cannot be read or operated by CMM Computer Use. %s"
+            % ("only its window controls" if tree == "chrome_only" else "no elements", NO_BYPASS_LINE)
+        )
+    return lines
 
 
 def _render_action(kind: str, result: Any) -> "tuple":
@@ -697,6 +797,21 @@ def _render_interference(interference: Any) -> List[str]:
                 interference.get("restored"),
             )
         )
+    if "observed_for_ms" in interference or "window_raised_over_person" in interference:
+        lines.append(
+            "settle: observed_for_ms=%s target_front_at_ms=%s window_raised_over_person=%s"
+            % (
+                interference.get("observed_for_ms"),
+                interference.get("target_front_at_ms", "none"),
+                interference.get("window_raised_over_person"),
+            )
+        )
+    restore = interference.get("focus_restore")
+    if isinstance(restore, dict) and restore.get("attempted"):
+        lines.append(
+            "focus_restore: accepted=%s succeeded=%s frontmost_now=%s"
+            % (restore.get("accepted"), restore.get("succeeded"), restore.get("frontmost_now"))
+        )
     return lines
 
 
@@ -724,6 +839,7 @@ def _render_refusal(error: BridgeError) -> Dict[str, Any]:
             "report it and let the operator review the ledger."
             % interference.get("policy")
         )
+    lines.append(NO_BYPASS_LINE)
     return _text("\n".join(lines), is_error=True)
 
 
@@ -771,6 +887,7 @@ def handle_message(registry: ToolRegistry, message: Any) -> Optional[Dict[str, A
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": NO_BYPASS_POLICY,
             },
         )
     if method == "ping":

@@ -86,6 +86,8 @@ class CatalogTests(ServerTestCase):
             "computer_use_press",
             "computer_use_set_value",
             "computer_use_release",
+            # Accessibility-only scroll: no wheel event, no cursor.
+            "computer_use_scroll",
         ):
             self.assertIn(name, names)
         for forbidden in (
@@ -94,7 +96,7 @@ class CatalogTests(ServerTestCase):
             "computer_use_click",
             "computer_use_type_text",
             "computer_use_shortcut",
-            "computer_use_scroll",
+            "computer_use_pointer_scroll",
         ):
             self.assertNotIn(
                 forbidden, names,
@@ -110,7 +112,7 @@ class CatalogTests(ServerTestCase):
             "computer_use_click",
             "computer_use_type_text",
             "computer_use_shortcut",
-            "computer_use_scroll",
+            "computer_use_pointer_scroll",
         ):
             self.assertNotIn(forbidden, names)
 
@@ -121,7 +123,7 @@ class CatalogTests(ServerTestCase):
             "computer_use_click",
             "computer_use_type_text",
             "computer_use_shortcut",
-            "computer_use_scroll",
+            "computer_use_pointer_scroll",
         ):
             self.assertIn(name, names)
 

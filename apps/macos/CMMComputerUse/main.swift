@@ -89,16 +89,22 @@ let maxVisitedNodes = 6_000
 /// Fan-out cap per node. 40 truncated real content areas mid-way.
 let maxChildrenPerNode = 200
 let maxScreenshotBytes = 24_000_000 // ~24MB base64 ceiling for one PNG frame.
+/// Below this many nodes a window tree is treated as "not materialized":
+/// title-bar controls plus a handful of groups.
+let sparseTreeThreshold = 24
 
 let interactiveRoles: Set<String> = [
     "AXButton", "AXTextField", "AXTextArea", "AXSecureTextField",
     "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuItem",
     "AXLink", "AXTab", "AXSlider", "AXSwitch",
+    // Not pressable, but the one handle `ui.scroll` can aim at: listing it
+    // gives a scroll area an element id without any global input.
+    "AXScrollArea",
 ]
 
 let allowedActions: Set<String> = [
     "app.open", "app.activate", "window.focus",
-    "ui.press", "ui.set_value",
+    "ui.press", "ui.set_value", "ui.scroll",
     "keyboard.type", "keyboard.shortcut",
     "pointer.click", "pointer.scroll",
     "wait", "finish",
@@ -143,6 +149,14 @@ func log(_ message: String) {
 // concurrent scope (screenshot Task) touches only its Sendable box.
 nonisolated(unsafe) var elementTable: [Int: AXUIElement] = [:]
 nonisolated(unsafe) var elementRoles: [Int: String] = [:]
+/// AX subrole per element id, captured with the role: it is what identifies
+/// window controls (AXZoomButton, …) that background mode never presses.
+nonisolated(unsafe) var elementSubroles: [Int: String] = [:]
+/// Target bundles that produced a verified interference breach in a
+/// no-interference mode since this helper started. Control actions against
+/// them are refused until the helper restarts (an operator act): fail-closed,
+/// and independent of any client-side latch.
+nonisolated(unsafe) var breachLatchedTargets: Set<String> = []
 /// What each handle is bound to (application, process, window). Cleared with
 /// the element table; re-validated before every action.
 nonisolated(unsafe) var elementContexts: [Int: BridgeElementContext] = [:]
@@ -172,15 +186,60 @@ func cursorLocation() -> CGPoint {
     return NSEvent.mouseLocation
 }
 
+/// The application that holds keyboard focus according to the accessibility
+/// server, read synchronously (no AppKit cache). Empty when unreadable.
+func axFocusedApplicationBundle() -> String {
+    let systemWide = AXUIElementCreateSystemWide()
+    // Bounded: a hung focused application must not stall the sampler.
+    AXUIElementSetMessagingTimeout(systemWide, 0.1)
+    var value: AnyObject?
+    guard AXUIElementCopyAttributeValue(
+        systemWide, kAXFocusedApplicationAttribute as CFString, &value) == .success,
+        let raw = value, CFGetTypeID(raw) == AXUIElementGetTypeID()
+    else { return "" }
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(raw as! AXUIElement, &pid) == .success, pid > 0 else { return "" }
+    return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+}
+
+/// Owner of the front-most normal (layer 0), visible, non-trivial window, per
+/// the window server's own ordering. Needs no Screen Recording grant: only the
+/// owner pid and layer are read, never a title or pixels.
+func topWindowOwnerBundle() -> String {
+    guard let infos = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    else { return "" }
+    for info in infos {
+        guard (info[kCGWindowLayer as String] as? Int) == 0 else { continue }
+        if let alpha = info[kCGWindowAlpha as String] as? Double, alpha <= 0 { continue }
+        if let bounds = info[kCGWindowBounds as String] as? [String: Any],
+           let width = bounds["Width"] as? CGFloat, let height = bounds["Height"] as? CGFloat,
+           width < 40 || height < 40 { continue }
+        let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value ?? 0
+        guard pid > 0 else { continue }
+        return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+    }
+    return ""
+}
+
 /// What the machine looks like right now, as far as interference cares.
-func currentEnvironment() -> BridgeEnvironment {
+///
+/// Three readings of "who is in front" (see `BridgeEnvironment`): the cached
+/// NSWorkspace frontmost, the live AX focused application and the window
+/// server's front-most window. `origin` is a `systemUptime` reference so each
+/// sample carries its offset.
+func currentEnvironment(origin: Double? = nil) -> BridgeEnvironment {
     let front = NSWorkspace.shared.frontmostApplication
     let cursor = cursorLocation()
+    let now = ProcessInfo.processInfo.systemUptime
     return BridgeEnvironment(
         frontmostApp: front?.localizedName ?? "",
         frontmostBundle: front?.bundleIdentifier ?? "",
         cursorX: Double(cursor.x),
-        cursorY: Double(cursor.y))
+        cursorY: Double(cursor.y),
+        focusedBundle: AXIsProcessTrusted() ? axFocusedApplicationBundle() : "",
+        topWindowBundle: topWindowOwnerBundle(),
+        t: origin.map { now - $0 } ?? 0)
 }
 
 /// Resolve the per-request mode, narrowing the deployment's own mode with it.
@@ -327,9 +386,26 @@ final class InterferenceSampler: @unchecked Sendable {
     private var samples: [BridgeEnvironment] = []
     private var running = false
     private var thread: Thread?
-    /// 2000 samples at ~2 ms covers four seconds; `wait` is capped at 5 s and
-    /// no AX primitive takes that long.
+    /// Each sample now also reads the AX focused application and the window
+    /// list (a few ms), so the interval is 5 ms; 2000 samples cover ten
+    /// seconds, past `wait` (5 s) plus the longest settle window (2 s).
     private let maxSamples = 2000
+    /// `systemUptime` reference shared with the before/after readings.
+    let origin: Double
+    /// Uptime of the last sample whose readings differed from the previous one.
+    private var lastChange: Double
+
+    init(origin: Double) {
+        self.origin = origin
+        self.lastChange = origin
+    }
+
+    /// Seconds since the readings last changed.
+    var sinceLastChange: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return ProcessInfo.processInfo.systemUptime - lastChange
+    }
 
     func start() {
         lock.lock()
@@ -342,13 +418,16 @@ final class InterferenceSampler: @unchecked Sendable {
         let worker = Thread { [weak self] in
             guard let self else { return }
             while self.isRunning {
-                let sample = currentEnvironment()
+                let sample = currentEnvironment(origin: self.origin)
                 self.lock.lock()
+                if let previous = self.samples.last, !bridgeSameApplication(previous, sample) {
+                    self.lastChange = ProcessInfo.processInfo.systemUptime
+                }
                 if self.samples.count < self.maxSamples {
                     self.samples.append(sample)
                 }
                 self.lock.unlock()
-                Thread.sleep(forTimeInterval: 0.002)
+                Thread.sleep(forTimeInterval: 0.005)
             }
         }
         worker.stackSize = 1 << 20
@@ -509,6 +588,101 @@ func axElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
     return raw as! AXUIElement
 }
 
+/// Whether a scroll bar's AXValue can be set (the AX-only scroll route).
+func scrollBarSettable(_ bar: AXUIElement?) -> Bool {
+    guard let bar else { return false }
+    var settable: DarwinBoolean = false
+    guard AXUIElementIsAttributeSettable(bar, kAXValueAttribute as CFString, &settable) == .success
+    else { return false }
+    return settable.boolValue
+}
+
+/// Count accessibility nodes under `root`, breadth-first, stopping at `limit`.
+/// Reads roles' children only: cheap enough to poll.
+func countAXNodes(_ root: AXUIElement, limit: Int) -> Int {
+    var queue: [(AXUIElement, Int)] = [(root, 0)]
+    var count = 0
+    var index = 0
+    while index < queue.count, count < limit {
+        let (element, depth) = queue[index]
+        index += 1
+        count += 1
+        guard depth < maxDepth,
+              let children = axAttr(element, kAXChildrenAttribute) as? [AXUIElement]
+        else { continue }
+        for child in children.prefix(maxChildrenPerNode) { queue.append((child, depth + 1)) }
+    }
+    return count
+}
+
+/// Ask an Electron/Chromium application to build its accessibility tree.
+///
+/// Chromium does not materialize the web contents' tree until an assistive
+/// technology asks for it. Electron documents `AXManualAccessibility` on the
+/// application element as THE way for a third-party assistive client to do
+/// that (VoiceOver itself uses `AXEnhancedUserInterface`, which also changes
+/// window-management behaviour and is NOT used here). It is set:
+///
+/// - from this helper, the process TCC trusts — no auxiliary process, no
+///   script, no change to TCC;
+/// - only on an application the policy already authorized for `observe`
+///   (the caller decides authorization first);
+/// - only when the tree is sparse, so a native app with a real tree is never
+///   touched; an app that does not know the attribute answers
+///   `attributeUnsupported` and nothing changes.
+///
+/// It posts no event and requests no activation. Its lasting effect is that
+/// the target keeps its accessibility tree enabled for its lifetime (some CPU
+/// cost in the target), which the observation reports. The result is VERIFIED
+/// by re-counting the tree, never assumed.
+func ensureAccessibilityTree(appElement: AXUIElement, root: AXUIElement) -> [String: Any] {
+    let attribute = "AXManualAccessibility"
+    let before = countAXNodes(root, limit: 400)
+    var info: [String: Any] = ["mechanism": attribute, "nodes_before": before]
+    if before >= sparseTreeThreshold {
+        info["state"] = "not_needed"
+        info["nodes_after"] = before
+        return info
+    }
+    if let current = axAttr(appElement, attribute) as? Bool, current {
+        // Already on (by us earlier, or by another assistive client) and the
+        // tree is still sparse: nothing more this helper can do safely.
+        info["state"] = "already_enabled"
+        info["nodes_after"] = before
+        return info
+    }
+    let err = AXUIElementSetAttributeValue(appElement, attribute as CFString, true as CFTypeRef)
+    switch err {
+    case .success:
+        break
+    case .attributeUnsupported, .actionUnsupported, .notImplemented, .illegalArgument:
+        info["state"] = "unsupported"
+        info["ax_error"] = Int(err.rawValue)
+        info["nodes_after"] = before
+        return info
+    default:
+        info["state"] = "failed"
+        info["ax_error"] = Int(err.rawValue)
+        info["nodes_after"] = before
+        return info
+    }
+    // Chromium builds the tree asynchronously: poll, bounded, until it grew
+    // and two consecutive counts agree.
+    let deadline = ProcessInfo.processInfo.systemUptime + 2.0
+    var after = before
+    var previous = -1
+    while ProcessInfo.processInfo.systemUptime < deadline {
+        Thread.sleep(forTimeInterval: 0.1)
+        after = countAXNodes(root, limit: 400)
+        if after > before && after == previous { break }
+        previous = after
+    }
+    info["nodes_after"] = after
+    info["state"] = after >= sparseTreeThreshold ? "enabled" : "enabled_still_sparse"
+    log("ax enrichment \(attribute): \(before) -> \(after) nodes")
+    return info
+}
+
 func walk(
     _ element: AXUIElement, into traversal: Traversal, depth: Int,
     owner: BridgeTargetApp, window: AXUIElement?, windowTitle: String
@@ -541,22 +715,40 @@ func walk(
             }
         }
         let value = (axAttr(element, kAXValueAttribute) as? String) ?? ""
+        let subrole = axAttr(element, kAXSubroleAttribute) as? String
         elementTable[elementID] = element
         elementRoles[elementID] = role
+        if let subrole { elementSubroles[elementID] = subrole }
         // What this handle is allowed to touch, captured now and re-checked
         // before any action: the application, its process, and the window the
         // element was found in.
         elementContexts[elementID] = BridgeElementContext(
             pid: owner.pid, bundleID: owner.bundleID, appName: owner.name,
             windowTitle: windowTitle, window: window)
-        traversal.elements.append([
+        var entry: [String: Any] = [
             "element_id": elementID,
             "role": role,
             "title": String(label.prefix(120)),
             "value": String(value.prefix(120)),
             "x": x, "y": y, "width": w, "height": h,
             "pressable": actions.contains("AXPress"),
-        ])
+        ]
+        if let subrole { entry["subrole"] = subrole }
+        if bridgeIsWindowChrome(subrole: subrole) { entry["window_chrome"] = true }
+        let verticalBar = axElement(element, kAXVerticalScrollBarAttribute)
+        let scrollPlan = bridgeScrollPlan(
+            direction: .down, actions: actions, role: role,
+            hasScrollBar: verticalBar != nil,
+            scrollBarSettable: scrollBarSettable(verticalBar))
+        if role == "AXScrollArea" || scrollPlan != .unsupported(reason: "not_scrollable") {
+            if case .unsupported(let reason) = scrollPlan {
+                entry["scrollable"] = false
+                entry["scroll_unsupported"] = reason
+            } else {
+                entry["scrollable"] = true
+            }
+        }
+        traversal.elements.append(entry)
     } else if !interactiveRoles.contains(role),
               traversal.content.count < maxContentNodes,
               let label = Traversal.contentLabel(element, role: role)
@@ -701,11 +893,17 @@ func describe(
 
     elementTable.removeAll()
     elementRoles.removeAll()
+    elementSubroles.removeAll()
     elementContexts.removeAll()
     observationGeneration += 1
     observationCapturedAt = Date().timeIntervalSince1970
 
     let traversal = Traversal()
+    var enrichment: [String: Any] = ["state": "not_trusted"]
+    if AXIsProcessTrusted() {
+        enrichment = ensureAccessibilityTree(
+            appElement: appElement, root: windowElement ?? appElement)
+    }
     if AXIsProcessTrusted() {
         // Scope to the window the person is actually looking at. Walking the
         // whole application spends the element budget on a menu bar and on
@@ -733,7 +931,7 @@ func describe(
             return (buildDescription(
                 frontmostName: frontmostName, frontmost: frontmost, target: target,
                 traversal: traversal, windowTitle: captureTitle, screenshot: nil, scope: "none",
-                error: screenshotError), nil)
+                error: screenshotError, enrichment: enrichment), nil)
         }
         let outcome = captureWindowBase64(app: owner.name, title: captureTitle)
         screenshotB64 = outcome.image
@@ -745,7 +943,7 @@ func describe(
     return (buildDescription(
         frontmostName: frontmostName, frontmost: frontmost, target: target,
         traversal: traversal, windowTitle: captureTitle, screenshot: screenshotB64, scope: screenshotScope,
-        error: screenshotError), nil)
+        error: screenshotError, enrichment: enrichment), nil)
 }
 
 /// One observation frame. `frontmost_*` is always measured truth; `target_*`
@@ -759,7 +957,8 @@ func buildDescription(
     windowTitle: String,
     screenshot: String?,
     scope: String,
-    error: String?
+    error: String?,
+    enrichment: [String: Any] = [:]
 ) -> [String: Any] {
     let windows = visibleWindows(frontmostApp: frontmostName, targetPID: target?.processIdentifier)
     let matches = windows.filter { ($0["title"] as? String) == windowTitle }
@@ -780,6 +979,14 @@ func buildDescription(
         "captured_at": observationCapturedAt,
     ]
     if matches.count == 1 { result["target_window_id"] = matches[0]["window_id"] }
+    if !enrichment.isEmpty { result["ax_enrichment"] = enrichment }
+    // Say it when the tree is useless instead of handing over three title-bar
+    // buttons as if they were the application: `chrome_only` means every
+    // element is a window control and there is no readable content.
+    let chromeOnly = !traversal.elements.isEmpty && traversal.content.isEmpty
+        && traversal.elements.allSatisfy { ($0["window_chrome"] as? Bool) == true }
+    let empty = traversal.elements.isEmpty && traversal.content.isEmpty
+    result["ax_tree"] = chromeOnly ? "chrome_only" : (empty ? "empty" : "ok")
     if let error { result["screenshot_error"] = error }
     return result
 }
@@ -944,6 +1151,7 @@ func releaseObservation() -> [String: Any] {
     let released = elementTable.count
     elementTable.removeAll()
     elementRoles.removeAll()
+    elementSubroles.removeAll()
     elementContexts.removeAll()
     observationCapturedAt = 0
     return ["released": released, "snapshot": observationGeneration]
@@ -1266,6 +1474,59 @@ func uiPress(_ params: [String: Any]) -> [String: Any] {
     return ["ok": true, "message": "pressed"]
 }
 
+/// Scroll one observed element with accessibility primitives only.
+///
+/// Routes, in order: a page action the element itself advertises
+/// (`AXScrollDownByPage`, …), then the element's own scroll bar value. A
+/// scroll-wheel event is never posted: it is global input aimed at the cursor.
+/// When neither route exists the result says so (`unsupported`), and dispatch
+/// turns it into `CAPABILITY_UNSUPPORTED`.
+func uiScroll(_ params: [String: Any]) -> [String: Any] {
+    guard let (_, el) = resolveElement(params: params) else {
+        return ["ok": false, "message": "The referenced UI element is no longer on screen."]
+    }
+    guard let raw = params["direction"] as? String,
+          let direction = BridgeScrollDirection(rawValue: raw.lowercased())
+    else {
+        return ["ok": false, "unsupported": true,
+                "message": "direction must be up, down, left or right",
+                "detail": "reason=invalid_direction"]
+    }
+    let pages = max(1, min(10, (params["pages"] as? NSNumber)?.intValue ?? 1))
+    var names: CFArray?
+    let actions = (AXUIElementCopyActionNames(el, &names) == .success ? (names as? [String]) : nil) ?? []
+    let role = (axAttr(el, kAXRoleAttribute) as? String) ?? "AXUnknown"
+    let bar = axElement(el, direction.isVertical
+        ? kAXVerticalScrollBarAttribute : kAXHorizontalScrollBarAttribute)
+    switch bridgeScrollPlan(
+        direction: direction, actions: actions, role: role,
+        hasScrollBar: bar != nil, scrollBarSettable: scrollBarSettable(bar)) {
+    case .pageAction(let name):
+        for _ in 0..<pages {
+            let err = AXUIElementPerformAction(el, name as CFString)
+            if err != .success {
+                return ["ok": false, "message": "\(name) failed (\(err.rawValue))"]
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+        return ["ok": true, "message": "scrolled \(direction.rawValue) \(pages) page(s) via \(name)"]
+    case .scrollBarValue:
+        guard let bar else { return ["ok": false, "message": "scroll bar vanished"] }
+        let current = (axAttr(bar, kAXValueAttribute) as? NSNumber)?.doubleValue ?? 0
+        let target = bridgeScrollBarTarget(current: current, direction: direction, pages: pages)
+        let err = AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString, NSNumber(value: target))
+        if err != .success {
+            return ["ok": false, "message": "scroll bar AXValue failed (\(err.rawValue))"]
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+        return ["ok": true, "message": String(format: "scrolled %@ via scroll bar %.2f -> %.2f", direction.rawValue, current, target)]
+    case .unsupported(let reason):
+        return ["ok": false, "unsupported": true,
+                "message": "This element offers no accessibility scroll primitive; background mode will not post a scroll-wheel event.",
+                "detail": "reason=\(reason);role=\(role)"]
+    }
+}
+
 func uiSetValue(_ params: [String: Any]) -> [String: Any] {
     guard let (elementID, el) = resolveElement(params: params) else {
         return ["ok": false, "message": "The referenced UI element is no longer on screen."]
@@ -1370,6 +1631,7 @@ func executeAction(kind: String, params: [String: Any]) -> [String: Any] {
     case "window.focus": return windowFocus(params["title"] as? String ?? "")
     case "ui.press": return uiPress(params)
     case "ui.set_value": return uiSetValue(params)
+    case "ui.scroll": return uiScroll(params)
     case "keyboard.type": return keyboardType(params["text"] as? String ?? "")
     case "keyboard.shortcut": return keyboardShortcut(params["keys"] as? String ?? "")
     case "pointer.click": return pointerClick(params)
@@ -1396,7 +1658,7 @@ func executeAction(kind: String, params: [String: Any]) -> [String: Any] {
 func elementPreconditions(
     kind: String, params: [String: Any], mode: BridgeInteractionMode
 ) -> BridgePolicyRefusal? {
-    guard kind == "ui.press" || kind == "ui.set_value" else { return nil }
+    guard kind == "ui.press" || kind == "ui.set_value" || kind == "ui.scroll" else { return nil }
     let now = Date().timeIntervalSince1970
     if bridgeObservationExpired(capturedAt: observationCapturedAt, now: now, mode: mode) {
         return BridgePolicyRefusal(
@@ -1460,7 +1722,7 @@ func elementPreconditions(
 /// switched to another window" (external activity).
 func actionTargetBundle(kind: String, params: [String: Any]) -> String? {
     switch kind {
-    case "ui.press", "ui.set_value":
+    case "ui.press", "ui.set_value", "ui.scroll":
         guard let id = (params["element_id"] as? NSNumber)?.intValue,
               let context = elementContexts[id]
         else { return nil }
@@ -1520,6 +1782,50 @@ func actionAuthorizationRefusal(
     default:
         return nil
     }
+}
+
+/// Refuse a press on a window control in a no-interference mode, before
+/// anything runs (see `bridgeWindowChromeRefusal`).
+func elementChromeRefusal(
+    kind: String, params: [String: Any], mode: BridgeInteractionMode
+) -> BridgePolicyRefusal? {
+    guard kind == "ui.press", let id = (params["element_id"] as? NSNumber)?.intValue else { return nil }
+    var subrole = elementSubroles[id]
+    if subrole == nil, let element = elementTable[id] {
+        subrole = axAttr(element, kAXSubroleAttribute) as? String
+    }
+    return bridgeWindowChromeRefusal(kind: kind, subrole: subrole, mode: mode)
+}
+
+/// After a breach, ask the application the person had in front to come back.
+///
+/// Best effort and reported as measured: macOS may decline an activation
+/// requested by a process that is not itself active. Only ever the person's
+/// OWN previous application, never a guess, and never when the target was
+/// already in front before the action.
+func restorePersonFocus(
+    before: BridgeEnvironment, targetBundle: String?, origin: Double
+) -> [String: Any] {
+    let previousBundle = before.frontmostBundle
+    guard !previousBundle.isEmpty, let targetBundle,
+          previousBundle.lowercased() != targetBundle.lowercased(),
+          let previous = NSRunningApplication.runningApplications(
+              withBundleIdentifier: previousBundle).first
+    else { return ["attempted": false] }
+    let accepted = previous.activate()
+    let deadline = ProcessInfo.processInfo.systemUptime + 1.0
+    var now = currentEnvironment(origin: origin)
+    while ProcessInfo.processInfo.systemUptime < deadline,
+          !(now.frontmostBundle == previousBundle && now.focusedBundle != targetBundle) {
+        Thread.sleep(forTimeInterval: 0.05)
+        now = currentEnvironment(origin: origin)
+    }
+    return [
+        "attempted": true,
+        "accepted": accepted,
+        "frontmost_now": now.frontmostApp,
+        "succeeded": now.frontmostBundle == previousBundle,
+    ]
 }
 
 /// The cached-frame read, factored out of `dispatch`.
@@ -1593,6 +1899,14 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 "scoped_observation": true,
                 "failure_interference_report": true,
                 "transient_sampling": true,
+                // The ledger keeps sampling after the action returns
+                // (bridgeSettleWindow) and reads the AX focused app and the
+                // window order, not only the cached frontmost.
+                "post_action_settle": true,
+                "breach_fail_closed": true,
+                "window_chrome_guard": true,
+                "ax_scroll": true,
+                "ax_tree_enrichment": true,
                 // A live window stream (ScreenCaptureKit SCStream). The host
                 // uses this to decide between the mirror and the per-request
                 // capture fallback instead of discovering it by failing.
@@ -1764,21 +2078,70 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         // Measure the invariant around EVERY executed action, success or
         // failure, and sample DURING it: a before/after pair cannot see a
         // window that raises itself and drops back.
+        let targetBundle = actionTargetBundle(kind: kind, params: params)
+        if let refusal = elementChromeRefusal(kind: kind, params: params, mode: mode) {
+            log("refused \(kind) window chrome")
+            return (false, nil, refusalFrame(refusal))
+        }
+        if mode.promisesNoInterference, let targetBundle,
+           breachLatchedTargets.contains(targetBundle.lowercased()),
+           bridgeActionClass(kind: kind) == .accessibility, kind != "wait", kind != "finish" {
+            log("refused \(kind) breach latch target=\(targetBundle)")
+            return (false, nil, bridgeError(
+                code: "ACTION_FAILED",
+                message: "An earlier action on this application took the person's focus; control is suspended until the helper is restarted.",
+                detail: "policy=\(mode.rawValue);reason=breach;target=\(targetBundle)"))
+        }
         let actionClass = bridgeActionClass(kind: kind) ?? .accessibility
-        let before = currentEnvironment()
-        let sampler = InterferenceSampler()
+        let origin = ProcessInfo.processInfo.systemUptime
+        let before = currentEnvironment(origin: origin)
+        let sampler = InterferenceSampler(origin: origin)
         sampler.start()
         let result = executeAction(kind: kind, params: params)
-        let after = currentEnvironment()
+        // AXPerformAction returns before the window server has acted on what
+        // it triggered. Keep measuring for a bounded settle window instead of
+        // stopping at return — stopping at return is how a press that made
+        // the target frontmost was recorded as `untouched`.
+        if kind != "wait" && kind != "finish" {
+            let window = bridgeSettleWindow(actionClass: actionClass)
+            let returnedAt = ProcessInfo.processInfo.systemUptime
+            while bridgeShouldKeepSettling(
+                window: window,
+                elapsed: ProcessInfo.processInfo.systemUptime - returnedAt,
+                sinceLastChange: sampler.sinceLastChange) {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
         let samples = sampler.stop()
+        let after = currentEnvironment(origin: origin)
         let report = bridgeInterferenceReport(
             before: before, after: after, samples: samples,
             actionClass: actionClass, mode: mode,
-            targetBundle: actionTargetBundle(kind: kind, params: params))
+            targetBundle: targetBundle)
         if report.breach {
-            // The action ran; the promise did not hold. Say so loudly instead
-            // of reporting an unqualified success.
-            log("INTERFERENCE_BREACH kind=\(kind) verdict=\(report.verdict.rawValue) transient=\(report.transientFocusChanges) restored=\(report.restored) before=\(report.frontmostBefore) after=\(report.frontmostAfter)")
+            // The action ran; the promise did not hold. FAIL CLOSED: the call
+            // is reported as a failure (never as success with a footnote), the
+            // target is latched, and the person's own application is asked
+            // back to the front.
+            log("INTERFERENCE_BREACH kind=\(kind) verdict=\(report.verdict.rawValue) transient=\(report.transientFocusChanges) restored=\(report.restored) before=\(report.frontmostBefore) after=\(report.frontmostAfter) target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-") observed_for_ms=\(report.observedForMs)")
+            if let targetBundle { breachLatchedTargets.insert(targetBundle.lowercased()) }
+            var ledger = report.dictionary()
+            ledger["focus_restore"] = restorePersonFocus(
+                before: before, targetBundle: targetBundle, origin: origin)
+            var error = bridgeError(
+                code: "INTERFERENCE_BREACH",
+                message: "The action brought the target application in front of the person's work in a mode that promised no interference.",
+                detail: "policy=\(mode.rawValue);reason=breach;kind=\(kind);action_ok=\(result["ok"] as? Bool == true)")
+            error["interference"] = ledger
+            return (false, nil, error)
+        }
+        if result["unsupported"] as? Bool == true {
+            var error = bridgeError(
+                code: "CAPABILITY_UNSUPPORTED",
+                message: result["message"] as? String ?? "The action is not supported for this element.",
+                detail: "policy=\(mode.rawValue);kind=\(kind);" + (result["detail"] as? String ?? ""))
+            error["interference"] = report.dictionary()
+            return (false, nil, error)
         }
         if result["ok"] as? Bool == true {
             var payload = result

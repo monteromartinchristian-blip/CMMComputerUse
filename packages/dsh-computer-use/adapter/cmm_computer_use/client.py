@@ -89,6 +89,7 @@ ACTION_KINDS = frozenset(
         "window.focus",
         "ui.press",
         "ui.set_value",
+        "ui.scroll",
         "keyboard.type",
         "keyboard.shortcut",
         "pointer.click",
@@ -113,6 +114,9 @@ ERROR_CODES = frozenset(
         "APPROVAL_REJECTED",
         "CAPABILITY_UNSUPPORTED",
         "CANCELLED",
+        # The action ran and brought its target in front of the person's work
+        # in a no-interference mode; the helper fails it closed.
+        "INTERFERENCE_BREACH",
     }
 )
 

@@ -4,6 +4,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The full project changelog, including the macOS helper, lives in the repository.
 
+## Unreleased
+
+- `computer_use_scroll` is now the accessibility-only scroll (all modes); the
+  global wheel tool is `computer_use_pointer_scroll` (unrestricted only).
+- `INTERFERENCE_BREACH`, window-raised breaches and the helper's breach latch
+  all latch the session; projection `stateVersion` 10.
+- Tool guard refuses scripting / synthetic-input bypasses in Computer Use
+  sessions; MCP `instructions` state the no-bypass policy.
+- Observation text reports `ax_enrichment`, `AX_TREE_UNAVAILABLE`, window
+  controls and scrollability.
+
 ## [0.1.0] — 2026-10-28
 
 First public release.

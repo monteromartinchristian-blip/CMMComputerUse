@@ -9,9 +9,9 @@ const RETENTION_MS = 60000;
 /** A frame older than this is shown, but labelled as paused: never as current. */
 const STALE_MS = 10000;
 const PREFIX = 'mcp__cmm-computer-use__computer_use_';
-const TOOLS = new Set(['status','list_apps','observe','capture_window','press','set_value','release']);
+const TOOLS = new Set(['status','list_apps','observe','capture_window','press','set_value','scroll','release']);
 /** Results that mean "the agent tried to show or touch a window". */
-const GUI = new Set(['observe','capture_window','press','set_value']);
+const GUI = new Set(['observe','capture_window','press','set_value','scroll']);
 const clean = x => typeof x === 'string' ? x.replace(/[\u0000-\u001f\u007f]/g,'').slice(0,200) : '';
 const token = x => typeof x === 'string' ? x.replace(/[^\w.:/@-]/g,'').slice(0,80) : '';
 function initialState() {
@@ -156,11 +156,11 @@ function parseStatus(text) {
   if (auth) { helper.loaded = auth[1] ? auth[1] === 'True' : null; helper.apps = Number(auth[2]); helper.default = token(auth[3]); }
   const effective = text.match(/^effective_mode: (\S+)/m); if (effective) helper.effectiveMode = token(effective[1]);
   const grants = [];
-  for (const m of text.matchAll(/^- authorized: ([^\n]+) \[([\w.-]+)\] scopes=([a-z,]+) windows=(\d+)$/gm)) {
+  for (const m of text.matchAll(/^- authorized:[ \u00a0]*([^\[\n]*?)[ \u00a0]*\[([\w.-]+)\] scopes=([a-z,]+) windows=(\d+)$/gm)) {
     const scopes = m[3].split(',').filter(s => s === 'observe' || s === 'control');
     // windows=0 means "any window" in the helper's policy (windowPatterns is
     // empty); it is a valid grant, not a missing one.
-    if (scopes.includes('observe')) grants.push({name:clean(m[1]), bundle:clean(m[2]), scopes});
+    if (scopes.includes('observe')) grants.push({name:clean(m[1])||clean(m[2]), bundle:clean(m[2]), scopes});
   }
   // Proof of a modern, policy-aware helper: it reported a deployment policy, an
   // effective mode and an authorization block, and its protocol is still v1.
@@ -175,6 +175,39 @@ function parseStatus(text) {
     else bridge = 'compatible';
   }
   return {bridge, error, helper, grants};
+}
+
+/**
+ * Routes that would REPLACE a missing computer_use_* capability with the
+ * agent's own automation: scripting another app, synthesizing input, moving
+ * the cursor, activating an app, or driving accessibility from an ad-hoc
+ * process. Every one of them bypasses the helper's allowlist, its background
+ * guarantee and its interference ledger. Content patterns, not tool names:
+ * a heredoc'd Swift file, a `python -c` with Quartz and a Write of a .swift
+ * file with CGEvent are the same bypass.
+ */
+const BYPASS = [
+  [/\bosascript\b/i, 'osascript'],
+  [/-l\s+JavaScript\b|\bJXA\b/, 'JXA'],
+  [/\btell\s+application\b|\bNSAppleScript\b|\bOSAScript\b/i, 'AppleScript'],
+  [/System Events/i, 'System Events'],
+  [/\bCGEvent\w*|\bCGWarpMouseCursorPosition\b|\bCGDisplayMoveCursorToPoint\b|\bCGAssociateMouseAndMouseCursorPosition\b/, 'CGEvent'],
+  [/\bAXUIElement\w*|\bAXManualAccessibility\b|\bAXEnhancedUserInterface\b|\bkAX\w+Action\b/, 'accessibility API'],
+  [/\b(?:from|import)\s+(?:Quartz|ApplicationServices|AppKit)\b|\batomacos\b|\bpyautogui\b|\bpynput\b/, 'Quartz/AX library'],
+  [/\bcliclick\b|\bxdotool\b|\bhs\s+-c\b|\bskhd\b/, 'input tool'],
+  [/\bopen\s+-[a-zA-Z]*[ab]\b/, 'open -a/-b (activation)'],
+];
+const EXECUTING = /bash|shell|exec|command|terminal|run|script|python|node|swift|write|edit|patch|apply/i;
+/** Why this tool call is a Computer Use bypass, or null. Pure and bounded. */
+function bypassReason(exec) {
+  if(!exec || typeof exec.name!=='string' || exec.name.startsWith('mcp__cmm-computer-use__')) return null;
+  if(!EXECUTING.test(exec.name)) return null;
+  const raw=exec.arguments ?? exec.args ?? exec.input ?? exec.params;
+  let text='';
+  try { text=typeof raw==='string'?raw:JSON.stringify(raw ?? ''); } catch { return null; }
+  text=String(text).slice(0,65536);
+  for(const [pattern,label] of BYPASS) if(pattern.test(text)) return label;
+  return null;
 }
 
 function fold(state, event) {
@@ -201,19 +234,26 @@ function fold(state, event) {
   let next={...state,pending,lastAt:Number.isFinite(at)?at:0};
   // Any GUI attempt is new activity for the view; only proven results grant pixels.
   if(GUI.has(call.name)) next={...next,attemptRevision:(state.attemptRevision||0)+1};
-  const action=call.name==='press'||call.name==='set_value';
+  const action=call.name==='press'||call.name==='set_value'||call.name==='scroll';
   if(action) {
     const ledger={};
-    for(const key of ['cursor_events_posted','cursor_moved_by_action','external_activity','focus_became_target']) {
+    for(const key of ['cursor_events_posted','cursor_moved_by_action','external_activity','focus_became_target','window_raised_over_person']) {
       const m=text.match(new RegExp('(?:^|[ \\n])'+key+'=(True|False)(?: |$)','m'));
       if(m) ledger[key]=m[1]==='True';
     }
     next={...next,ledger};
   }
-  const verifiedBreach=action && msg.isError === true
-    && /^attributable: cursor_events_posted=False cursor_moved_by_action=False focus_became_target=True external_activity=(True|False)$/m.test(text)
+  // The target came to the front: either it was activated (AX focus or the
+  // workspace says so) or its window was ordered over the person's work.
+  const targetInFront=/^attributable: cursor_events_posted=False cursor_moved_by_action=False focus_became_target=True external_activity=(True|False)$/m.test(text)
+    || (/^attributable: cursor_events_posted=False cursor_moved_by_action=False focus_became_target=(True|False) external_activity=(True|False)$/m.test(text)
+      && /^settle: observed_for_ms=\d+ target_front_at_ms=(\d+|none) window_raised_over_person=True$/m.test(text));
+  const verifiedBreach=action && msg.isError === true && targetInFront
     && /^STOP: breach recorded(?: on a failed action)? \(policy=background\)\. Do not retry(?: this action; report it and let the operator review the ledger\.|; report it and let the operator review the ledger\.)$/m.test(text);
-  if (verifiedBreach) return {...next,breach:true,target:null,frame:null,error:'BREACH',
+  // The helper's own latch: it refuses a target that already breached.
+  const latchedBreach=action && msg.isError === true
+    && /^REFUSED ACTION_FAILED: [^\n]*\[policy=background;reason=breach;target=[\w.-]+\]$/m.test(text);
+  if (verifiedBreach||latchedBreach) return {...next,breach:true,target:null,frame:null,error:'BREACH',
     attempt:{name:call.name,at:next.lastAt,failed:true,code:'BREACH'}};
   if(state.breach) return next;
   // Negative status is revocation evidence even when a newer capture is pending.
@@ -221,7 +261,7 @@ function fold(state, event) {
   if(msg.isError || /^REFUSED /m.test(text)) {
     const code=text.match(/^REFUSED ([A-Z_]+)/m)?.[1];
     const reason=text.match(/(?:^|[; =])reason=(app_not_granted|window_changed|pid_changed|expired|global_input_not_scoped|breach)(?:[; \n\]]|$)/m)?.[1];
-    const known=['APPROVAL_REJECTED','ACTION_FAILED','CAPABILITY_UNSUPPORTED','TIMEOUT','UNAVAILABLE','COMPUTER_RUNTIME_UNAVAILABLE','COMPUTER_PERMISSION_DENIED','COMPUTER_TARGET_UNAVAILABLE'];
+    const known=['APPROVAL_REJECTED','ACTION_FAILED','CAPABILITY_UNSUPPORTED','TIMEOUT','UNAVAILABLE','COMPUTER_RUNTIME_UNAVAILABLE','COMPUTER_PERMISSION_DENIED','COMPUTER_TARGET_UNAVAILABLE','INTERFERENCE_BREACH'];
     const statusFailure=call.name==='status';
     const failure=reason||(known.includes(code)?code:'REFUSED');
     return {...next,target:null,frame:null,error:failure,
@@ -245,7 +285,7 @@ function fold(state, event) {
   if(call.name==='release') return {...next,target:null,frame:null};
   if(call.name==='observe') {
     const m=text.match(/^target: ([^\n]+) \[([\w.-]+)\] \((background|frontmost)\)$/m);
-    const grant=m&&state.grants.find(g=>g.bundle===m[2]&&(call.app===g.name||call.app===g.bundle));
+    const grant=m&&state.grants.find(g=>g.bundle===m[2]&&(call.app===g.name||call.app===g.bundle||call.app===clean(m[1])));
     if(state.bridge!=='compatible'||!grant) return {...next,target:null,frame:null,error:'UNVERIFIED_TARGET'};
     const identity=viewIdentity(text);
     if(!identity||identity.bundle!==grant.bundle||!['background','frontmost'].includes(m[3]))return {...next,target:null,frame:null,error:'UNVERIFIED_TARGET'};
@@ -255,7 +295,7 @@ function fold(state, event) {
     if(m[3]!=='background')return {...next,target:null,frame:null,error:'TARGET_NOT_BACKGROUND',
       message:null,attempt:{name:'observe',at:next.lastAt,failed:true,code:'TARGET_NOT_BACKGROUND'}};
     return {...next,guiRevision:call.revision,
-      target:{name:grant.name,bundle:grant.bundle,window:identity.window,pid:identity.pid,snapshot:identity.snapshot,windowId:identity.window_id,background:m[3]==='background',scopes:grant.scopes,observedAt:next.lastAt},
+      target:{name:clean(m[1])||grant.name,bundle:grant.bundle,window:identity.window,pid:identity.pid,snapshot:identity.snapshot,windowId:identity.window_id,background:m[3]==='background',scopes:grant.scopes,observedAt:next.lastAt},
       frame:null,error:null,message:null,
       attempt:{name:'observe',at:next.lastAt,failed:false,code:null}};
   }

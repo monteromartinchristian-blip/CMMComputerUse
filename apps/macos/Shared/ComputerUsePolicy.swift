@@ -124,7 +124,7 @@ public enum BridgeActionClass: String, Sendable {
 /// breach).
 public func bridgeActionClass(kind: String) -> BridgeActionClass? {
     switch kind {
-    case "ui.press", "ui.set_value", "wait", "finish":
+    case "ui.press", "ui.set_value", "ui.scroll", "wait", "finish":
         return .accessibility
     case "app.open", "app.activate", "window.focus":
         return .focus
@@ -330,18 +330,184 @@ public func bridgeSnapshotRefusal(
 // MARK: - Interference accounting
 
 /// What the machine looked like at one instant, as far as interference cares.
+///
+/// Three independent readings of "who is in front", because one of them was
+/// observed to lie (2026-11-02: `ui.press` on Claude's zoom button, Claude
+/// became frontmost, every sample still said DeepSeek Harness):
+///
+/// - `frontmostBundle`: `NSWorkspace.frontmostApplication`. A CACHED property
+///   that AppKit refreshes from a workspace notification; it can trail the
+///   window server, and a sampler that stops before the notification lands
+///   records nothing.
+/// - `focusedBundle`: the system-wide accessibility element's
+///   `AXFocusedApplication`, read synchronously from the accessibility server
+///   on every sample. Empty when it could not be read (never guessed).
+/// - `topWindowBundle`: owner of the front-most on-screen layer-0 window per
+///   `CGWindowListCopyWindowInfo`. Catches a window ordered in front of the
+///   person's work even when activation itself did not happen.
+///
+/// `t` is seconds since the first sample of this measurement (0 when unknown),
+/// so a report can say WHEN the target came to the front.
 public struct BridgeEnvironment: Equatable, Sendable {
     public var frontmostApp: String
     public var frontmostBundle: String
     public var cursorX: Double
     public var cursorY: Double
+    public var focusedBundle: String
+    public var topWindowBundle: String
+    public var t: Double
 
-    public init(frontmostApp: String, frontmostBundle: String, cursorX: Double, cursorY: Double) {
+    public init(
+        frontmostApp: String, frontmostBundle: String, cursorX: Double, cursorY: Double,
+        focusedBundle: String = "", topWindowBundle: String = "", t: Double = 0
+    ) {
         self.frontmostApp = frontmostApp
         self.frontmostBundle = frontmostBundle
         self.cursorX = cursorX
         self.cursorY = cursorY
+        self.focusedBundle = focusedBundle
+        self.topWindowBundle = topWindowBundle
+        self.t = t
     }
+
+    /// Does any activation reading (cached frontmost or live AX focus) name
+    /// this bundle?
+    func isActive(_ bundle: String) -> Bool {
+        let target = bundle.lowercased()
+        guard !target.isEmpty else { return false }
+        return frontmostBundle.lowercased() == target || focusedBundle.lowercased() == target
+    }
+
+    /// Is this bundle's window the front-most normal window on screen?
+    func isOnTop(_ bundle: String) -> Bool {
+        let target = bundle.lowercased()
+        return !target.isEmpty && topWindowBundle.lowercased() == target
+    }
+}
+
+// MARK: - Post-action observation window
+
+/// How long the ledger keeps sampling AFTER an action returns, in seconds.
+///
+/// `AXUIElementPerformAction` returns when the target application has accepted
+/// the action, not when the window server has finished acting on it: an
+/// activation the press triggers can materialize hundreds of milliseconds
+/// later. Stopping the sampler at return was the root cause of the
+/// `verdict=untouched` / frontmost=target contradiction. The window is
+/// bounded: `minimum` always, extended while readings are still changing,
+/// never past `maximum`.
+public struct BridgeSettleWindow: Equatable, Sendable {
+    public let minimum: Double
+    public let quiet: Double
+    public let maximum: Double
+
+    public init(minimum: Double, quiet: Double, maximum: Double) {
+        self.minimum = minimum
+        self.quiet = quiet
+        self.maximum = maximum
+    }
+}
+
+public func bridgeSettleWindow(actionClass: BridgeActionClass) -> BridgeSettleWindow {
+    switch actionClass {
+    case .accessibility, .focus:
+        return BridgeSettleWindow(minimum: 0.8, quiet: 0.25, maximum: 2.0)
+    case .pointer, .globalKeyboard:
+        return BridgeSettleWindow(minimum: 0.4, quiet: 0.2, maximum: 1.0)
+    }
+}
+
+/// Keep sampling? `elapsed` since the action returned, `sinceLastChange`
+/// since the last reading that differed from the one before it.
+public func bridgeShouldKeepSettling(
+    window: BridgeSettleWindow, elapsed: Double, sinceLastChange: Double
+) -> Bool {
+    if elapsed >= window.maximum { return false }
+    if elapsed < window.minimum { return true }
+    return sinceLastChange < window.quiet
+}
+
+// MARK: - Background-unsafe accessibility targets
+
+/// Window-management buttons in a window's title bar.
+///
+/// They are accessibility elements like any other, but pressing them is not
+/// "the application acting on its own content": zoom and full screen order
+/// the window front (full screen moves it to its own Space), and close and
+/// minimize change what the person sees on their desktop. The observed press
+/// of an Electron window's zoom button activated the application. In a mode
+/// that promises no interference they are refused BEFORE anything runs.
+public let bridgeWindowChromeSubroles: Set<String> = [
+    "AXCloseButton", "AXMinimizeButton", "AXZoomButton", "AXFullScreenButton",
+]
+
+public func bridgeIsWindowChrome(subrole: String?) -> Bool {
+    guard let subrole else { return false }
+    return bridgeWindowChromeSubroles.contains(subrole)
+}
+
+public func bridgeWindowChromeRefusal(
+    kind: String, subrole: String?, mode: BridgeInteractionMode
+) -> BridgePolicyRefusal? {
+    guard kind == "ui.press", mode.promisesNoInterference,
+          bridgeIsWindowChrome(subrole: subrole), let subrole
+    else { return nil }
+    return BridgePolicyRefusal(
+        code: "CAPABILITY_UNSUPPORTED",
+        message: "Window controls (close, minimize, zoom, full screen) can bring the application to the front; \(mode.rawValue) mode does not press them.",
+        detail: "policy=\(mode.rawValue);kind=ui.press;reason=window_chrome;subrole=\(subrole)")
+}
+
+// MARK: - Accessibility-only scrolling
+
+public enum BridgeScrollDirection: String, CaseIterable, Sendable {
+    case up, down, left, right
+
+    /// The AX page action an element may advertise for this direction.
+    public var pageAction: String {
+        switch self {
+        case .up: return "AXScrollUpByPage"
+        case .down: return "AXScrollDownByPage"
+        case .left: return "AXScrollLeftByPage"
+        case .right: return "AXScrollRightByPage"
+        }
+    }
+
+    public var isVertical: Bool { self == .up || self == .down }
+}
+
+/// How `ui.scroll` will move one observed element, or why it cannot.
+///
+/// Only accessibility primitives: an action the element advertises, or the
+/// value of its own scroll bar. NEVER a scroll-wheel event: that is global
+/// input, lands under the cursor and (to aim it) needs the cursor moved —
+/// exactly what background mode forbids.
+public enum BridgeScrollPlan: Equatable, Sendable {
+    case pageAction(String)
+    case scrollBarValue
+    case unsupported(reason: String)
+}
+
+public func bridgeScrollPlan(
+    direction: BridgeScrollDirection, actions: [String], role: String,
+    hasScrollBar: Bool, scrollBarSettable: Bool
+) -> BridgeScrollPlan {
+    if actions.contains(direction.pageAction) { return .pageAction(direction.pageAction) }
+    if hasScrollBar && scrollBarSettable { return .scrollBarValue }
+    if hasScrollBar { return .unsupported(reason: "scrollbar_not_settable") }
+    if role == "AXScrollArea" { return .unsupported(reason: "scroll_area_without_scrollbar") }
+    return .unsupported(reason: "not_scrollable")
+}
+
+/// New scroll-bar value for `pages` pages in `direction`, clamped to 0...1.
+/// A page is approximated by `pageFraction` of the range when the element
+/// cannot report its visible fraction.
+public func bridgeScrollBarTarget(
+    current: Double, direction: BridgeScrollDirection, pages: Int, pageFraction: Double = 0.2
+) -> Double {
+    let step = Double(max(1, min(pages, 10))) * max(0.01, min(pageFraction, 1.0))
+    let sign: Double = (direction == .down || direction == .right) ? 1 : -1
+    return max(0, min(1, current + sign * step))
 }
 
 public enum BridgeInterferenceVerdict: String, Sendable {
@@ -402,6 +568,14 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
     public let transientCursorMaxDelta: Double
     /// A change was observed and the final state equals the initial one.
     public let restored: Bool
+    /// The target's window became the front-most normal window over the
+    /// person's application, with or without activation.
+    public let windowRaisedOverPerson: Bool
+    /// Milliseconds after the first sample at which the target was first seen
+    /// in front; nil when it never was.
+    public let targetFrontAtMs: Int?
+    /// How long the measurement actually covered, in milliseconds.
+    public let observedForMs: Int
 
     public init(
         verdict: BridgeInterferenceVerdict,
@@ -420,7 +594,10 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
         sampled: Int = 0,
         transientFocusChanges: Int = 0,
         transientCursorMaxDelta: Double = 0,
-        restored: Bool = false
+        restored: Bool = false,
+        windowRaisedOverPerson: Bool = false,
+        targetFrontAtMs: Int? = nil,
+        observedForMs: Int = 0
     ) {
         self.verdict = verdict
         self.frontmostBefore = frontmostBefore
@@ -439,11 +616,14 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
         self.transientFocusChanges = transientFocusChanges
         self.transientCursorMaxDelta = transientCursorMaxDelta
         self.restored = restored
+        self.windowRaisedOverPerson = windowRaisedOverPerson
+        self.targetFrontAtMs = targetFrontAtMs
+        self.observedForMs = observedForMs
     }
 
     /// Wire shape. Stable keys, no user content beyond application names.
     public func dictionary() -> [String: Any] {
-        [
+        var wire: [String: Any] = [
             "verdict": verdict.rawValue,
             "frontmost_before": frontmostBefore,
             "frontmost_after": frontmostAfter,
@@ -462,7 +642,11 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
             "transient_focus_changes": transientFocusChanges,
             "transient_cursor_max_delta": transientCursorMaxDelta,
             "restored": restored,
+            "window_raised_over_person": windowRaisedOverPerson,
+            "observed_for_ms": observedForMs,
         ]
+        if let targetFrontAtMs { wire["target_front_at_ms"] = targetFrontAtMs }
+        return wire
     }
 }
 
@@ -491,6 +675,8 @@ public func bridgeInterferenceReport(
     sequence.append(contentsOf: samples)
     sequence.append(after)
 
+    // Activation and window order are judged on every reading the sample
+    // carries (see BridgeEnvironment), not on the cached frontmost alone.
     var transitions = 0
     var previous = sequence[0]
     for sample in sequence.dropFirst() {
@@ -531,12 +717,19 @@ public func bridgeInterferenceReport(
     // Did the frontmost application become the one we acted on? Tracked across
     // the samples, so a window that raises itself for a moment still counts.
     var focusBecameTarget = false
+    var windowRaisedOverPerson = false
+    var targetFrontAt: Double? = nil
     if let targetBundle, !targetBundle.isEmpty {
-        let target = targetBundle.lowercased()
-        let beforeWasTarget = sequence[0].frontmostBundle.lowercased() == target
+        let beforeWasTarget = sequence[0].isActive(targetBundle)
+        let beforeWasOnTop = sequence[0].isOnTop(targetBundle)
         for sample in sequence.dropFirst() {
-            if sample.frontmostBundle.lowercased() == target {
-                if !beforeWasTarget { focusBecameTarget = true }
+            if !beforeWasTarget && sample.isActive(targetBundle) {
+                focusBecameTarget = true
+                if targetFrontAt == nil { targetFrontAt = sample.t }
+            }
+            if !beforeWasOnTop && !beforeWasTarget && sample.isOnTop(targetBundle) {
+                windowRaisedOverPerson = true
+                if targetFrontAt == nil { targetFrontAt = sample.t }
             }
         }
     }
@@ -544,7 +737,8 @@ public func bridgeInterferenceReport(
     // Attribution. The cursor cannot be ours without a posted event; a focus
     // change is ours only when it lands on our own target.
     let cursorMovedByAction = postsInput && cursorMoved
-    let externalActivity = (cursorMoved && !postsInput) || (focusChanged && !focusBecameTarget)
+    let externalActivity = (cursorMoved && !postsInput)
+        || (focusChanged && !focusBecameTarget && !windowRaisedOverPerson)
 
     // A breach is a promise broken by THIS action: an accessibility action in a
     // no-interference mode that raised the application it acted on. Pointer or
@@ -552,7 +746,7 @@ public func bridgeInterferenceReport(
     // cause of a breach there.
     let breach = mode.promisesNoInterference
         && actionClass == .accessibility
-        && focusBecameTarget
+        && (focusBecameTarget || windowRaisedOverPerson)
 
     let endpointsAgree = bridgeSameApplication(before, after)
         && abs(after.cursorX - before.cursorX) <= tolerance
@@ -576,7 +770,10 @@ public func bridgeInterferenceReport(
         sampled: samples.count,
         transientFocusChanges: transitions,
         transientCursorMaxDelta: maxCursorDelta,
-        restored: sawSomething && endpointsAgree
+        restored: sawSomething && endpointsAgree,
+        windowRaisedOverPerson: windowRaisedOverPerson,
+        targetFrontAtMs: targetFrontAt.map { Int(($0 * 1000).rounded()) },
+        observedForMs: Int(((sequence.last?.t ?? 0) - (sequence.first?.t ?? 0)) * 1000)
     )
 }
 
@@ -587,7 +784,14 @@ public func bridgeInterferenceReport(
 func bridgeSameApplication(_ lhs: BridgeEnvironment, _ rhs: BridgeEnvironment) -> Bool {
     let left = lhs.frontmostBundle.isEmpty ? lhs.frontmostApp : lhs.frontmostBundle
     let right = rhs.frontmostBundle.isEmpty ? rhs.frontmostApp : rhs.frontmostBundle
-    return left == right
+    guard left == right else { return false }
+    // The live readings count only when both samples have them: a reading that
+    // failed once is "unknown", never a transition.
+    if !lhs.focusedBundle.isEmpty, !rhs.focusedBundle.isEmpty,
+       lhs.focusedBundle != rhs.focusedBundle { return false }
+    if !lhs.topWindowBundle.isEmpty, !rhs.topWindowBundle.isEmpty,
+       lhs.topWindowBundle != rhs.topWindowBundle { return false }
+    return true
 }
 
 // MARK: - Window selection

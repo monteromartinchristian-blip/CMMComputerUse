@@ -70,7 +70,8 @@ A stdlib-only Python package. `mcp_server.py` speaks MCP over stdio;
 `client.py` speaks the NDJSON protocol over the socket. The adapter:
 
 - publishes only the tools the effective mode allows (in `background`, there is
-  no activate, no focus, no click, no type, no shortcut, no scroll);
+  no activate, no focus, no click, no type, no shortcut, no global wheel; the
+  accessibility-only `computer_use_scroll` is present);
 - annotates read-only tools so a host can auto-approve them;
 - turns every helper refusal into an `isError` result with the code and detail
   intact, and never retries a refusal;

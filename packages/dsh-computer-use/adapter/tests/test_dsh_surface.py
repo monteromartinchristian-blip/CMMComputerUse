@@ -317,7 +317,7 @@ class AvailabilityTests(SurfaceCase):
         self.assertEqual(initialized["result"]["serverInfo"]["name"], "cmm-computer-use")
         catalog = handle_message(registry, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         assert catalog is not None
-        self.assertEqual(len(catalog["result"]["tools"]), 7)
+        self.assertEqual(len(catalog["result"]["tools"]), 8)  # + computer_use_scroll (AX-only)
         response = self.call("computer_use_status", registry=registry)
         self.assertTrue(is_error(response))
         self.assertIn("REFUSED COMPUTER_RUNTIME_UNAVAILABLE", text_of(response))

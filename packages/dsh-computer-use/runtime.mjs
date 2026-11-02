@@ -5,9 +5,9 @@ export const RETENTION_MS = 60000;
 /** A frame older than this is shown, but labelled as paused: never as current. */
 export const STALE_MS = 10000;
 const PREFIX = 'mcp__cmm-computer-use__computer_use_';
-const TOOLS = new Set(['status','list_apps','observe','capture_window','press','set_value','release']);
+const TOOLS = new Set(['status','list_apps','observe','capture_window','press','set_value','scroll','release']);
 /** Results that mean "the agent tried to show or touch a window". */
-const GUI = new Set(['observe','capture_window','press','set_value']);
+const GUI = new Set(['observe','capture_window','press','set_value','scroll']);
 const clean = x => typeof x === 'string' ? x.replace(/[\u0000-\u001f\u007f]/g,'').slice(0,200) : '';
 const token = x => typeof x === 'string' ? x.replace(/[^\w.:/@-]/g,'').slice(0,80) : '';
 export function initialState() {
@@ -173,6 +173,39 @@ export function parseStatus(text) {
   return {bridge, error, helper, grants};
 }
 
+/**
+ * Routes that would REPLACE a missing computer_use_* capability with the
+ * agent's own automation: scripting another app, synthesizing input, moving
+ * the cursor, activating an app, or driving accessibility from an ad-hoc
+ * process. Every one of them bypasses the helper's allowlist, its background
+ * guarantee and its interference ledger. Content patterns, not tool names:
+ * a heredoc'd Swift file, a `python -c` with Quartz and a Write of a .swift
+ * file with CGEvent are the same bypass.
+ */
+const BYPASS = [
+  [/\bosascript\b/i, 'osascript'],
+  [/-l\s+JavaScript\b|\bJXA\b/, 'JXA'],
+  [/\btell\s+application\b|\bNSAppleScript\b|\bOSAScript\b/i, 'AppleScript'],
+  [/System Events/i, 'System Events'],
+  [/\bCGEvent\w*|\bCGWarpMouseCursorPosition\b|\bCGDisplayMoveCursorToPoint\b|\bCGAssociateMouseAndMouseCursorPosition\b/, 'CGEvent'],
+  [/\bAXUIElement\w*|\bAXManualAccessibility\b|\bAXEnhancedUserInterface\b|\bkAX\w+Action\b/, 'accessibility API'],
+  [/\b(?:from|import)\s+(?:Quartz|ApplicationServices|AppKit)\b|\batomacos\b|\bpyautogui\b|\bpynput\b/, 'Quartz/AX library'],
+  [/\bcliclick\b|\bxdotool\b|\bhs\s+-c\b|\bskhd\b/, 'input tool'],
+  [/\bopen\s+-[a-zA-Z]*[ab]\b/, 'open -a/-b (activation)'],
+];
+const EXECUTING = /bash|shell|exec|command|terminal|run|script|python|node|swift|write|edit|patch|apply/i;
+/** Why this tool call is a Computer Use bypass, or null. Pure and bounded. */
+export function bypassReason(exec) {
+  if(!exec || typeof exec.name!=='string' || exec.name.startsWith('mcp__cmm-computer-use__')) return null;
+  if(!EXECUTING.test(exec.name)) return null;
+  const raw=exec.arguments ?? exec.args ?? exec.input ?? exec.params;
+  let text='';
+  try { text=typeof raw==='string'?raw:JSON.stringify(raw ?? ''); } catch { return null; }
+  text=String(text).slice(0,65536);
+  for(const [pattern,label] of BYPASS) if(pattern.test(text)) return label;
+  return null;
+}
+
 export function fold(state, event) {
   if(event.type==='turn/end') return state.active ? {...state,active:false,pending:{}} : state;
   if (event.type === 'assistant/message') {
@@ -197,19 +230,26 @@ export function fold(state, event) {
   let next={...state,pending,lastAt:Number.isFinite(at)?at:0};
   // Any GUI attempt is new activity for the view; only proven results grant pixels.
   if(GUI.has(call.name)) next={...next,attemptRevision:(state.attemptRevision||0)+1};
-  const action=call.name==='press'||call.name==='set_value';
+  const action=call.name==='press'||call.name==='set_value'||call.name==='scroll';
   if(action) {
     const ledger={};
-    for(const key of ['cursor_events_posted','cursor_moved_by_action','external_activity','focus_became_target']) {
+    for(const key of ['cursor_events_posted','cursor_moved_by_action','external_activity','focus_became_target','window_raised_over_person']) {
       const m=text.match(new RegExp('(?:^|[ \\n])'+key+'=(True|False)(?: |$)','m'));
       if(m) ledger[key]=m[1]==='True';
     }
     next={...next,ledger};
   }
-  const verifiedBreach=action && msg.isError === true
-    && /^attributable: cursor_events_posted=False cursor_moved_by_action=False focus_became_target=True external_activity=(True|False)$/m.test(text)
+  // The target came to the front: either it was activated (AX focus or the
+  // workspace says so) or its window was ordered over the person's work.
+  const targetInFront=/^attributable: cursor_events_posted=False cursor_moved_by_action=False focus_became_target=True external_activity=(True|False)$/m.test(text)
+    || (/^attributable: cursor_events_posted=False cursor_moved_by_action=False focus_became_target=(True|False) external_activity=(True|False)$/m.test(text)
+      && /^settle: observed_for_ms=\d+ target_front_at_ms=(\d+|none) window_raised_over_person=True$/m.test(text));
+  const verifiedBreach=action && msg.isError === true && targetInFront
     && /^STOP: breach recorded(?: on a failed action)? \(policy=background\)\. Do not retry(?: this action; report it and let the operator review the ledger\.|; report it and let the operator review the ledger\.)$/m.test(text);
-  if (verifiedBreach) return {...next,breach:true,target:null,frame:null,error:'BREACH',
+  // The helper's own latch: it refuses a target that already breached.
+  const latchedBreach=action && msg.isError === true
+    && /^REFUSED ACTION_FAILED: [^\n]*\[policy=background;reason=breach;target=[\w.-]+\]$/m.test(text);
+  if (verifiedBreach||latchedBreach) return {...next,breach:true,target:null,frame:null,error:'BREACH',
     attempt:{name:call.name,at:next.lastAt,failed:true,code:'BREACH'}};
   if(state.breach) return next;
   // Negative status is revocation evidence even when a newer capture is pending.
@@ -217,7 +257,7 @@ export function fold(state, event) {
   if(msg.isError || /^REFUSED /m.test(text)) {
     const code=text.match(/^REFUSED ([A-Z_]+)/m)?.[1];
     const reason=text.match(/(?:^|[; =])reason=(app_not_granted|window_changed|pid_changed|expired|global_input_not_scoped|breach)(?:[; \n\]]|$)/m)?.[1];
-    const known=['APPROVAL_REJECTED','ACTION_FAILED','CAPABILITY_UNSUPPORTED','TIMEOUT','UNAVAILABLE','COMPUTER_RUNTIME_UNAVAILABLE','COMPUTER_PERMISSION_DENIED','COMPUTER_TARGET_UNAVAILABLE'];
+    const known=['APPROVAL_REJECTED','ACTION_FAILED','CAPABILITY_UNSUPPORTED','TIMEOUT','UNAVAILABLE','COMPUTER_RUNTIME_UNAVAILABLE','COMPUTER_PERMISSION_DENIED','COMPUTER_TARGET_UNAVAILABLE','INTERFERENCE_BREACH'];
     const statusFailure=call.name==='status';
     const failure=reason||(known.includes(code)?code:'REFUSED');
     return {...next,target:null,frame:null,error:failure,

@@ -71,7 +71,7 @@ Response (failure):
 rejected with `CAPABILITY_UNSUPPORTED`. Error codes are the frozen Computer
 Use grammar (`COMPUTER_RUNTIME_UNAVAILABLE`, `COMPUTER_PERMISSION_DENIED`,
 `COMPUTER_TARGET_UNAVAILABLE`, `ACTION_FAILED`, `APPROVAL_REJECTED`,
-`CAPABILITY_UNSUPPORTED`, `CANCELLED`).
+`CAPABILITY_UNSUPPORTED`, `CANCELLED`, and — helper 0.3.0 — `INTERFERENCE_BREACH`).
 
 ## Operations (allowlist — nothing else exists)
 
@@ -94,7 +94,7 @@ Use grammar (`COMPUTER_RUNTIME_UNAVAILABLE`, `COMPUTER_PERMISSION_DENIED`,
 | `action.execute` | `{kind, params, policy?}` | `{ok, message, interference}` for kinds in the allowlist below |
 
 Action kinds (parity with `ACTION_KINDS`): `app.open`, `app.activate`,
-`window.focus`, `ui.press`, `ui.set_value`, `keyboard.type`,
+`window.focus`, `ui.press`, `ui.set_value`, `ui.scroll`, `keyboard.type`,
 `keyboard.shortcut`, `pointer.click`, `pointer.scroll`, `wait`, `finish`.
 There is deliberately NO shell execution, NO AppleScript passthrough, NO
 executable launch by path, NO filesystem API. `app.open` resolves by
@@ -175,7 +175,7 @@ input is posted:
 
 | Mode | Allows | Refuses |
 |---|---|---|
-| `background` (default when `--policy` is absent) | `ui.press`, `ui.set_value`, `wait`, `finish`, observation, single-window capture | activation, pointer, global keyboard, display captures |
+| `background` (default when `--policy` is absent) | `ui.press` (not on window controls), `ui.set_value`, `ui.scroll`, `wait`, `finish`, observation, single-window capture | activation, pointer (incl. `pointer.scroll`), global keyboard, display captures, window controls |
 | `focus` | the above plus `app.open`, `app.activate`, `window.focus` | pointer, global keyboard, display captures |
 | `unrestricted` | the full legacy allowlist | nothing extra |
 
@@ -209,6 +209,56 @@ input is posted:
   requires `app` and captures that application's window; the display is never
   captured. If the window cannot be resolved the observation is still
   returned, with `screenshot_base64 = null` and `screenshot_error` set.
+
+### Background hardening (helper 0.3.0, 2026-11-02)
+
+Found live: `ui.press` on an Electron window's zoom button made the target
+frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
+
+- **Settle window.** The ledger keeps sampling after `AXUIElementPerformAction`
+  returns — at least 0.8 s, extended while readings still change (quiet
+  0.25 s), never past 2 s (`bridgeSettleWindow`). Before, sampling stopped at
+  return, ~300 ms after the press; the activation it triggered landed later.
+- **Three readings per sample** instead of the cached
+  `NSWorkspace.frontmostApplication`: the system-wide AX
+  `AXFocusedApplication` (synchronous) and the owner of the front-most layer-0
+  window (`CGWindowListCopyWindowInfo`, no title or pixels). Any reading that
+  names the target counts. An unreadable reading is "unknown", never a
+  transition.
+- **Fail closed.** A breach turns the call into
+  `INTERFERENCE_BREACH` (`detail=policy=…;reason=breach;kind=…;action_ok=…`,
+  ledger in `error.interference`), even when the action itself "succeeded";
+  the helper asks the person's previous frontmost app back
+  (`interference.focus_restore = {attempted, accepted, succeeded,
+  frontmost_now}`, best effort, as measured) and **latches** the target:
+  later control actions on it answer `ACTION_FAILED`
+  `detail=policy=…;reason=breach;target=<bundle>` until the helper restarts.
+- **Window controls refused up front.** `ui.press` on an element whose subrole
+  is `AXCloseButton`, `AXMinimizeButton`, `AXZoomButton` or
+  `AXFullScreenButton` answers `CAPABILITY_UNSUPPORTED`
+  `detail=policy=…;kind=ui.press;reason=window_chrome;subrole=…` in
+  `background` and `focus`. Zoom/full screen order the window front (full
+  screen also moves Spaces); close/minimize change the person's desktop; none
+  of them is "the app acting on its content". Elements carry `subrole` and
+  `window_chrome: true` in `observation.describe`.
+- **`ui.scroll`** `{element_id, snapshot, direction: up|down|left|right,
+  pages?: 1…10}`: the element's own `AXScroll<Dir>ByPage` action, else its
+  scroll bar's `AXValue`. Never a wheel event, never the cursor. Neither route
+  → `CAPABILITY_UNSUPPORTED`
+  `detail=…;reason=scroll_area_without_scrollbar|scrollbar_not_settable|not_scrollable|invalid_direction;role=…`.
+  `AXScrollArea` elements are listed with `scrollable` / `scroll_unsupported`.
+- **Accessibility tree materialization.** When the observed window has fewer
+  than 24 AX nodes, the helper sets `AXManualAccessibility=true` on the
+  (already `observe`-authorized) application element — the attribute Electron
+  documents for third-party assistive clients — polls up to 2 s, and reports
+  `ax_enrichment = {mechanism, state: not_needed|already_enabled|enabled|enabled_still_sparse|unsupported|failed|not_trusted, nodes_before, nodes_after, ax_error?}`.
+  `AXEnhancedUserInterface` is NOT used (it changes window management). Every
+  observation states `ax_tree: ok|chrome_only|empty`; the adapter renders
+  `chrome_only`/`empty` as `AX_TREE_UNAVAILABLE`.
+- New ledger fields: `window_raised_over_person`, `target_front_at_ms`
+  (offset of the first sample with the target in front), `observed_for_ms`.
+  New `bridge.ping` capabilities: `post_action_settle`, `breach_fail_closed`,
+  `window_chrome_guard`, `ax_scroll`, `ax_tree_enrichment`.
 
 ## Per-application authorization (deny by default)
 
@@ -270,8 +320,9 @@ Every executed action — successful or not — reports `interference`. On succe
 it rides in `result.interference`; on failure it rides in `error.interference`
 (a key clients ignore, because they read only `code`/`message`/`detail`).
 
-The helper samples the frontmost application and the cursor every ~2 ms while
-the action runs, and the report folds those samples in:
+The helper samples the frontmost application (three readings, see above) and
+the cursor every ~5 ms while the action runs AND through the post-action settle
+window, and the report folds those samples in:
 
 | Field | Meaning |
 |---|---|
@@ -284,7 +335,10 @@ the action runs, and the report folds those samples in:
 | `cursor_moved_by_action` | the measured cursor delta belongs to an input path that could have produced it (`cursor_events_posted && cursorMoved`) |
 | `focus_became_target` | the frontmost application became the action's own target — the one focus change an AX action can plausibly cause |
 | `external_activity` | something changed that this action cannot explain: the person moved the pointer, or switched to an unrelated application |
-| `breach` | an accessibility-only action made the frontmost application its own target, in a mode that promised no interference |
+| `breach` | an accessibility-only action made its own target frontmost, or ordered its window over the person's, in a mode that promised no interference |
+| `window_raised_over_person` | the target's window became the front-most normal window without having been before |
+| `target_front_at_ms` | ms after the first sample at which the target was first seen in front (absent when never) |
+| `observed_for_ms` | how long the measurement covered, settle window included |
 
 **`verdict` describes the environment; `breach` describes responsibility.** The
 person may use the machine while an action runs. An accessibility action posts

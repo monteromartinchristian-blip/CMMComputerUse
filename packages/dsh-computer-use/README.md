@@ -40,11 +40,18 @@ documents the file format and the two scopes.
 | `computer_use_capture_window` | read | a PNG of one authorized window, with its identity |
 | `computer_use_press` | control | `AXPress` on one resolved element of the observed window |
 | `computer_use_set_value` | control | `AXSetValue` on one resolved element |
+| `computer_use_scroll` | control | accessibility-only scroll of one element (its page action or scroll-bar value); `CAPABILITY_UNSUPPORTED` otherwise — never a wheel event |
 | `computer_use_release` | control | drop an observation |
 
 In `background` mode the catalog contains exactly those. `activate_app`,
-`focus_window`, `click`, `type_text`, `shortcut` and `scroll` are **absent**, not
-listed and refused.
+`focus_window`, `click`, `type_text`, `shortcut` and `pointer_scroll` are
+**absent**, not listed and refused. Window controls (close, minimize, zoom,
+full screen) are refused by the helper in `background`.
+
+When a tool cannot do something, the answer is to report it. The adapter says
+so in its MCP `instructions` and on every refusal, and the Host plugin refuses
+Bash/osascript/JXA/AppleScript/System Events/Swift-with-CGEvent/AX/Quartz/
+cliclick/`open -a` routes in any session that has used Computer Use.
 
 ## Configuration
 

@@ -7,6 +7,44 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The helper and the plugin version independently; this file tracks the plugin
 (`@cmm/dsh-computer-use`) and notes helper-visible changes explicitly.
 
+## Unreleased — helper 0.3.0 + plugin (background hardening, 2026-11-02)
+
+Fixes found in a live DeepSeek Harness session against Claude Desktop
+(Electron). See `docs/architecture/CMM-Computer-Use-Informe-20261102.md`.
+
+### Fixed
+
+- **Background focus breach went unrecorded.** `ui.press` on Claude's zoom
+  button made Claude frontmost; the ledger said `verdict=untouched`,
+  `breach=false`. The sampler stopped when `AXUIElementPerformAction` returned
+  and read only the cached `NSWorkspace.frontmostApplication`. It now samples
+  through a bounded post-action settle window (0.8–2 s) and reads the live AX
+  focused application and the window server's front-most window too.
+- **A breach is fail-closed.** It returns `INTERFERENCE_BREACH` (never success
+  with a warning), asks the person's previous app back, and latches the target
+  in the helper until restart; DSH latches the session (stateVersion 10).
+- PiP shows the observed application name (e.g. `Claude`), never the bundle
+  id, for CMM Console grants without `name` (empty, NBSP, `windows=0`).
+- `dist/client.js` was stale against `runtime.mjs` in the snapshot
+  (`verify-manifest` failed); re-rendered.
+
+### Added
+
+- `ui.scroll` / `computer_use_scroll`: accessibility-only scrolling (page
+  action or scroll-bar value) or `CAPABILITY_UNSUPPORTED`. The global wheel
+  tool is renamed `computer_use_pointer_scroll` (unrestricted only).
+- Window controls (close/minimize/zoom/full screen) are refused in
+  `background`/`focus` before anything runs (`reason=window_chrome`).
+- Electron/Chromium AX tree materialization via `AXManualAccessibility` from
+  the helper, verified by node count; `ax_tree: chrome_only|empty` is surfaced
+  as `AX_TREE_UNAVAILABLE`.
+- No-bypass policy: MCP `instructions`, a line on every refusal, and a DSH tool
+  guard that refuses osascript/JXA/AppleScript/System Events/CGEvent/AX/Quartz/
+  cliclick/`open -a` routes in sessions that used Computer Use.
+- `scripts/verification/live-background-e2e.sh`: LIVE end-to-end check with an
+  independent focus/cursor witness and a controlled late-activation breach in
+  the fixture.
+
 ## Helper 0.2.0 — 2026-11-01
 
 Helper-visible changes that ship with CMM Console 0.2.0. The plugin version is

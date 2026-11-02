@@ -1,4 +1,4 @@
-import {KEY, initialState, fold, validAttachment} from './runtime.mjs';
+import {KEY, initialState, fold, validAttachment, bypassReason} from './runtime.mjs';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {connect} from 'node:net';
@@ -347,7 +347,9 @@ export function apply(ctx, config) {
     child.on('exit', () => { child = null; live = null; });
   };
   startStreamer();
-  ctx.sessionProjections.register({key:KEY,stateVersion:9,stateSchema,
+  // 10: fold learned `scroll`, window-raised and helper-latch breaches; rebuild
+  // checkpoints from the log so resumed sessions apply them.
+  ctx.sessionProjections.register({key:KEY,stateVersion:10,stateSchema,
     init:initialState,apply:fold,
     wire:{viewSchema:stateSchema,view:state=>state}});
   if (typeof ctx.effect === 'function') {
@@ -356,8 +358,18 @@ export function apply(ctx, config) {
   // Monotonic refusal after a verified helper breach in this session, including
   // a resumed log. No stop button: this does not cancel an in-flight tool.
   ctx.tools.guard(exec => {
-    if (!exec.name.startsWith('mcp__cmm-computer-use__') || !exec.agent) return;
+    if (!exec || typeof exec.name !== 'string' || !exec.agent) return;
     const state=ctx.sessionProjections.stateOf(exec.agent.session,KEY);
-    if(state?.breach) return 'CMM: verified breach; further Computer Use calls denied in this session.';
+    if (exec.name.startsWith('mcp__cmm-computer-use__')) {
+      if(state?.breach) return 'CMM: verified breach; further Computer Use calls denied in this session.';
+      return;
+    }
+    // A session that is doing Computer Use must not fill a capability gap with
+    // its own automation (Bash/osascript/JXA/Swift/CGEvent/System Events/...).
+    // Scoped to sessions that called a computer_use_* tool, so ordinary coding
+    // sessions are untouched.
+    if(!state || !(state.revision>0)) return;
+    const reason=bypassReason(exec);
+    if(reason) return `CMM: ${reason} is not an allowed route in a Computer Use session. Use computer_use_* tools only; if they cannot do it, report CAPABILITY_UNSUPPORTED to the person.`;
   });
 }

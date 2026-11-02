@@ -101,7 +101,7 @@ final class ComputerUsePolicyTests: XCTestCase {
     func testEveryAllowlistedKindHasAClass() {
         let kinds = [
             "app.open", "app.activate", "window.focus",
-            "ui.press", "ui.set_value",
+            "ui.press", "ui.set_value", "ui.scroll",
             "keyboard.type", "keyboard.shortcut",
             "pointer.click", "pointer.scroll", "wait", "finish",
         ]
@@ -130,7 +130,7 @@ final class ComputerUsePolicyTests: XCTestCase {
     // MARK: - background: the no-interference mode
 
     func testBackgroundAllowsAccessibilityPrimitivesOnly() {
-        for kind in ["ui.press", "ui.set_value", "wait", "finish"] {
+        for kind in ["ui.press", "ui.set_value", "ui.scroll", "wait", "finish"] {
             XCTAssertEqual(
                 bridgePolicyDecision(kind: kind, mode: .background), .allowed,
                 "\(kind) is an accessibility-only primitive")
