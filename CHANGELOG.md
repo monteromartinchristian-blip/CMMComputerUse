@@ -28,6 +28,12 @@ The helper and the plugin version independently; this file tracks the plugin
   emptied, generation N+1, time = now; old handles are refused with
   `reason=released`, no age. When a takeover is detected, attribution,
   breach, settle and latch are unchanged.
+- PiP title showed the bundle id (`com.anthropic.claudefordesktop`) when the
+  CMM Console grant has no human name, although the observe had verified
+  `target.name = "Claude"`. `pipPresentation` now uses `displayAppName`:
+  verified target name, then a human grant name, then `Aplicación`; a bundle
+  id is never the title and stays in `technical.target.bundle`. Display only:
+  verification, grants and stateVersion 12 unchanged.
 
 ## Unreleased — helper 0.3.1 build 4 (focus attribution, 2026-11-02)
 

@@ -457,6 +457,24 @@ function technicalFacts(state,target) {
     target:target?{bundle:target.bundle,pid:target.pid,snapshot:target.snapshot,windowId:target.windowId??null,window:target.window||null}:null
   };
 }
+/** Generic visible name when neither the target nor the grant has a human one. */
+const GENERIC_APP_NAME='Aplicación';
+/**
+ * The PiP's visible application name. Display only: it never decides
+ * authorization; callers pass a target that `fold()` already verified.
+ * Order: the observed name of the verified target, then a human grant name,
+ * then `GENERIC_APP_NAME`. A bundle id is never the title (a grant without a
+ * name falls back to its bundle in the status parser); it stays in
+ * `technical.target.bundle`.
+ */
+function displayAppName(target,grant) {
+  const human=(name,...bundles)=>{
+    const n=clean(name).trim();
+    return n&&!bundles.some(b=>typeof b==='string'&&b&&n===b)?n:null;
+  };
+  const bundles=[target?.bundle,grant?.bundle];
+  return human(target?.name,...bundles)||human(grant?.name,...bundles)||GENERIC_APP_NAME;
+}
 function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
   const base={visible:false,phase:'idle',status:'idle',tone:'muted',mode:'indicator',canRead:false,
     app:null,window:null,code:null,ageMs:null,frameAt:null,technical:null};
@@ -473,7 +491,7 @@ function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
   const model={...base,phase,status:PHASE_STATUS[phase]||'idle',tone:PHASE_TONE[phase]||'muted',
     mode,code:state.error||null,technical:technicalFacts(state,target),
     frameAt:Number.isFinite(state.frame?.at)?state.frame.at:null,
-    app:verified?grant.name:null,window:verified?target.window:null};
+    app:verified?displayAppName(target,grant):null,window:verified?target.window:null};
   // Nothing to supervise: no surface at all, whatever the phase says.
   if(!sessionId||activity<1||closed||phase==='idle') return model;
   // A phase that would show pixels or a name without current authority is demoted.
