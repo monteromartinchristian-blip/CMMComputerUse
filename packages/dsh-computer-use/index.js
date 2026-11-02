@@ -347,7 +347,7 @@ export function apply(ctx, config) {
     child.on('exit', () => { child = null; live = null; });
   };
   startStreamer();
-  ctx.sessionProjections.register({key:KEY,stateVersion:8,stateSchema,
+  ctx.sessionProjections.register({key:KEY,stateVersion:9,stateSchema,
     init:initialState,apply:fold,
     wire:{viewSchema:stateSchema,view:state=>state}});
   if (typeof ctx.effect === 'function') {

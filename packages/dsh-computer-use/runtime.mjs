@@ -152,11 +152,11 @@ export function parseStatus(text) {
   if (auth) { helper.loaded = auth[1] ? auth[1] === 'True' : null; helper.apps = Number(auth[2]); helper.default = token(auth[3]); }
   const effective = text.match(/^effective_mode: (\S+)/m); if (effective) helper.effectiveMode = token(effective[1]);
   const grants = [];
-  for (const m of text.matchAll(/^- authorized: ([^\n]+) \[([\w.-]+)\] scopes=([a-z,]+) windows=(\d+)$/gm)) {
+  for (const m of text.matchAll(/^- authorized:[ \u00a0]*([^\[\n]*?)[ \u00a0]*\[([\w.-]+)\] scopes=([a-z,]+) windows=(\d+)$/gm)) {
     const scopes = m[3].split(',').filter(s => s === 'observe' || s === 'control');
     // windows=0 means "any window" in the helper's policy (windowPatterns is
     // empty); it is a valid grant, not a missing one.
-    if (scopes.includes('observe')) grants.push({name:clean(m[1]), bundle:clean(m[2]), scopes});
+    if (scopes.includes('observe')) grants.push({name:clean(m[1])||clean(m[2]), bundle:clean(m[2]), scopes});
   }
   // Proof of a modern, policy-aware helper: it reported a deployment policy, an
   // effective mode and an authorization block, and its protocol is still v1.
@@ -241,7 +241,7 @@ export function fold(state, event) {
   if(call.name==='release') return {...next,target:null,frame:null};
   if(call.name==='observe') {
     const m=text.match(/^target: ([^\n]+) \[([\w.-]+)\] \((background|frontmost)\)$/m);
-    const grant=m&&state.grants.find(g=>g.bundle===m[2]&&(call.app===g.name||call.app===g.bundle));
+    const grant=m&&state.grants.find(g=>g.bundle===m[2]&&(call.app===g.name||call.app===g.bundle||call.app===clean(m[1])));
     if(state.bridge!=='compatible'||!grant) return {...next,target:null,frame:null,error:'UNVERIFIED_TARGET'};
     const identity=viewIdentity(text);
     if(!identity||identity.bundle!==grant.bundle||!['background','frontmost'].includes(m[3]))return {...next,target:null,frame:null,error:'UNVERIFIED_TARGET'};
@@ -251,7 +251,7 @@ export function fold(state, event) {
     if(m[3]!=='background')return {...next,target:null,frame:null,error:'TARGET_NOT_BACKGROUND',
       message:null,attempt:{name:'observe',at:next.lastAt,failed:true,code:'TARGET_NOT_BACKGROUND'}};
     return {...next,guiRevision:call.revision,
-      target:{name:grant.name,bundle:grant.bundle,window:identity.window,pid:identity.pid,snapshot:identity.snapshot,windowId:identity.window_id,background:m[3]==='background',scopes:grant.scopes,observedAt:next.lastAt},
+      target:{name:clean(m[1])||grant.name,bundle:grant.bundle,window:identity.window,pid:identity.pid,snapshot:identity.snapshot,windowId:identity.window_id,background:m[3]==='background',scopes:grant.scopes,observedAt:next.lastAt},
       frame:null,error:null,message:null,
       attempt:{name:'observe',at:next.lastAt,failed:false,code:null}};
   }
