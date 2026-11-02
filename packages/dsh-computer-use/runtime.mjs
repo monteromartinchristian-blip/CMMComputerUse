@@ -252,6 +252,14 @@ export function fold(state, event) {
   if (verifiedBreach||latchedBreach) return {...next,breach:true,target:null,frame:null,error:'BREACH',
     attempt:{name:call.name,at:next.lastAt,failed:true,code:'BREACH'}};
   if(state.breach) return next;
+  // The PERSON took the target to the front during the action: not a breach
+  // (no latch), but the observed target is no longer what the handles
+  // described, so it is dropped — the next GUI action needs a fresh observe.
+  const takeover=action && msg.isError === true
+    && /^USER_TAKEOVER: the person brought [^\n]* \(attribution=(user|ambiguous_external)\)\. Not a breach; nothing is latched\./m.test(text);
+  if(takeover) return {...next,target:null,frame:null,error:'USER_TAKEOVER',
+    message:'USER_TAKEOVER · re-observe',
+    attempt:{name:call.name,at:next.lastAt,failed:true,code:'USER_TAKEOVER'}};
   // Negative status is revocation evidence even when a newer capture is pending.
   if(call.revision!==state.revision&&call.name!=='status')return {...state,pending};
   if(msg.isError || /^REFUSED /m.test(text)) {

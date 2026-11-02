@@ -279,3 +279,39 @@ Qué traer: `claims`, `electron_environment`, `electron_press_control`
 (elemento elegido, `settings_evidence`, `navigation`, `closed`, cada press con
 `untouched`) y cualquier `INTERFERENCE_BREACH` / `witness_window_overlap` /
 `CURSOR`.
+
+
+## Gates A/B — atribución del foco (helper 0.3.1 build 4)
+
+Build staged nuevo (0.3.1 / 4) y carril aislado como siempre. Cierra
+notificaciones; Terminal delante.
+
+```bash
+cd ~/"CMM Desarrollo/CMM Computer Use"
+CMM_HELPER_BUILD_DIR="$PWD/build/stage-0.3.1" scripts/build-helper.sh
+codesign -dv --verbose=4 build/stage-0.3.1/CMMComputerUse.app 2>&1 | grep -E "Identifier|CDHash|TeamIdentifier"
+python3 scripts/verification/isolated-live.py all --human-takeover \
+  --staged-app build/stage-0.3.1/CMMComputerUse.app
+```
+
+- **Gate B (interactivo, antes del LIVE):** el script cuenta 3‑2‑1 y escribe
+  `CLICK NOW`; entonces haz **un clic real** con el ratón dentro de la ventana
+  «CMM Computer Use Fixture» (no en un botón). Nadie simula input. La acción
+  en curso (`press` de «Incrementar») no activa nada, así que si el fixture
+  pasa al frente, fuiste tú. Exige: `focus_became_target`, testigo HID
+  `available`, `attribution=user` (o `ambiguous_external`), `external_activity`,
+  **sin** `INTERFERENCE_BREACH`, `USER_TAKEOVER` informado, **sin latch** ni
+  entrada `latched` en la auditoría, el snapshot anterior rechazado
+  (`reason=expired`) y control de nuevo tras observar (sin rearm). Hasta 3
+  intentos si el clic cae fuera de la ventana de medida. Al terminar, vuelve
+  a hacer clic en Terminal.
+- **Gate A (último paso del LIVE, sin tocar nada):** el fixture se autoactiva
+  400 ms después del press; sin input humano debe seguir siendo
+  `attribution=action`, `INTERFERENCE_BREACH`, latch persistente
+  (`--breach-control`, como hasta ahora).
+
+Qué traer: las líneas `attribution:` y `USER_TAKEOVER:` de Gate B, el
+resumen `human_takeover` (B1–B10), la línea `attribution:` del breach de
+Gate A, y el CDHash del staged. Verifica también que en Gate B el testigo
+salió `available` sin conceder ningún permiso nuevo (si macOS pidiera
+Input Monitoring, para y avisa).

@@ -356,10 +356,14 @@ public struct BridgeEnvironment: Equatable, Sendable {
     public var focusedBundle: String
     public var topWindowBundle: String
     public var t: Double
+    /// Read-only physical-input witness at this sample (see
+    /// `BridgeHumanInputSample`). nil = no witness reading: fail closed.
+    public var humanInput: BridgeHumanInputSample?
 
     public init(
         frontmostApp: String, frontmostBundle: String, cursorX: Double, cursorY: Double,
-        focusedBundle: String = "", topWindowBundle: String = "", t: Double = 0
+        focusedBundle: String = "", topWindowBundle: String = "", t: Double = 0,
+        humanInput: BridgeHumanInputSample? = nil
     ) {
         self.frontmostApp = frontmostApp
         self.frontmostBundle = frontmostBundle
@@ -368,6 +372,7 @@ public struct BridgeEnvironment: Equatable, Sendable {
         self.focusedBundle = focusedBundle
         self.topWindowBundle = topWindowBundle
         self.t = t
+        self.humanInput = humanInput
     }
 
     /// Does any activation reading (cached frontmost or live AX focus) name
@@ -383,6 +388,129 @@ public struct BridgeEnvironment: Equatable, Sendable {
         let target = bundle.lowercased()
         return !target.isEmpty && topWindowBundle.lowercased() == target
     }
+}
+
+// MARK: - Human input witness (attribution of a focus change)
+
+/// One read-only reading of the PHYSICAL input state at a sample, taken by the
+/// helper from the combined hardware HID state. Ages are seconds since the
+/// last event of that type, as the HID state reports them (nil = no reading
+/// for that type). Only event types that can actually take focus are read:
+/// a mouse button going down, a key going down, a modifier change. Mouse
+/// MOVEMENT is deliberately absent: moving the pointer takes no focus, and
+/// it must never hide a breach.
+public struct BridgeHumanInputSample: Equatable, Sendable {
+    public var mouseDownAge: Double?
+    public var keyDownAge: Double?
+    public var flagsChangedAge: Double?
+    /// Command held at this sample (combined HID modifier state).
+    public var commandHeld: Bool
+
+    public init(mouseDownAge: Double? = nil, keyDownAge: Double? = nil,
+                flagsChangedAge: Double? = nil, commandHeld: Bool = false) {
+        self.mouseDownAge = mouseDownAge
+        self.keyDownAge = keyDownAge
+        self.flagsChangedAge = flagsChangedAge
+        self.commandHeld = commandHeld
+    }
+
+    /// A reading is usable only if every age is a finite, non-negative number.
+    public var isReliable: Bool {
+        [mouseDownAge, keyDownAge, flagsChangedAge].allSatisfy { age in
+            guard let age else { return true }
+            return age.isFinite && age >= 0
+        }
+    }
+}
+
+public enum BridgeHumanInputKind: String, Sendable {
+    case mouseDown = "mouse_down"
+    /// A key pressed while Command is held (⌘-Tab, ⌘-click style shortcuts).
+    /// Plain typing does not switch applications and is not counted.
+    case commandKeyDown = "command_key_down"
+    /// Command released: ⌘-Tab activates on release, possibly long after Tab.
+    case commandRelease = "command_release"
+}
+
+/// One physical input that can take focus, at a time on the samples' clock.
+public struct BridgeHumanInput: Equatable, Sendable {
+    public var at: Double
+    public var kind: BridgeHumanInputKind
+
+    public init(at: Double, kind: BridgeHumanInputKind) {
+        self.at = at
+        self.kind = kind
+    }
+}
+
+/// Who changed the focus onto the target (if it changed at all).
+public enum BridgeFocusAttribution: String, Sendable {
+    /// The target never came to the front during the measurement.
+    case none
+    /// It came to the front with no correlated physical input: the action did it.
+    case action
+    /// A physical input preceded the transition within the window: the person.
+    case user
+    /// A physical input lands within sampling resolution AFTER the first
+    /// sample that saw the transition: plausible, not provable. No latch.
+    case ambiguousExternal = "ambiguous_external"
+    /// No reliable witness reading: attribution impossible. Fail closed.
+    case unknown
+}
+
+/// Longest gap, in seconds, between a physical input and the first sample that
+/// sees the target in front for the input to count as the cause. 0.75 s covers
+/// a click (activation follows in a few to ~100 ms, an Electron app up to a few
+/// hundred) and a ⌘-Tab release, and is short enough that input from before the
+/// action — typing the command that started it — cannot hide a later raise.
+public let bridgeHumanFocusWindow: Double = 0.75
+
+/// Sampling resolution, in seconds: an input stamped up to this much AFTER the
+/// first sample that saw the transition may still be its cause (the HID clock
+/// and the sample clock are read a few ms apart; samples are ~5 ms + reads).
+/// Inside it, the answer is `ambiguousExternal`, never `user`.
+public let bridgeHumanFocusSkew: Double = 0.06
+
+/// Physical inputs that can take focus, reconstructed from the per-sample
+/// witness readings (each reading reports only the latest event per type).
+/// `available` is false unless EVERY sample carried a reliable reading.
+public func bridgeHumanActivationInputs(
+    _ sequence: [BridgeEnvironment]
+) -> (available: Bool, inputs: [BridgeHumanInput]) {
+    guard !sequence.isEmpty,
+          sequence.allSatisfy({ $0.humanInput?.isReliable == true })
+    else { return (false, []) }
+    var inputs: [BridgeHumanInput] = []
+    func add(_ at: Double, _ kind: BridgeHumanInputKind) {
+        if inputs.contains(where: { $0.kind == kind && abs($0.at - at) < 0.01 }) { return }
+        inputs.append(BridgeHumanInput(at: at, kind: kind))
+    }
+    for (index, sample) in sequence.enumerated() {
+        guard let reading = sample.humanInput else { continue }
+        let previous = index > 0 ? sequence[index - 1].humanInput : nil
+        if let age = reading.mouseDownAge { add(sample.t - age, .mouseDown) }
+        if let age = reading.keyDownAge, reading.commandHeld || previous?.commandHeld == true {
+            add(sample.t - age, .commandKeyDown)
+        }
+        if let age = reading.flagsChangedAge, previous?.commandHeld == true, !reading.commandHeld {
+            add(sample.t - age, .commandRelease)
+        }
+    }
+    return (true, inputs.sorted { $0.at < $1.at })
+}
+
+/// Attribute the target's first appearance in front (`targetFrontAt`, the
+/// first sample that saw it active or on top) to the action or the person.
+public func bridgeFocusAttribution(
+    targetFrontAt: Double?, witnessAvailable: Bool, inputs: [BridgeHumanInput],
+    window: Double = bridgeHumanFocusWindow, skew: Double = bridgeHumanFocusSkew
+) -> (attribution: BridgeFocusAttribution, input: BridgeHumanInput?, ageMs: Int?) {
+    guard let front = targetFrontAt else { return (.none, nil, nil) }
+    guard witnessAvailable else { return (.unknown, nil, nil) }
+    let correlated = inputs.filter { $0.at >= front - window && $0.at <= front + skew }
+    guard let latest = correlated.max(by: { $0.at < $1.at }) else { return (.action, nil, nil) }
+    let ageMs = Int(((front - latest.at) * 1000).rounded())
+    return (latest.at <= front ? .user : .ambiguousExternal, latest, ageMs)
 }
 
 // MARK: - Post-action observation window
@@ -763,6 +891,20 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
     public let targetFrontAtMs: Int?
     /// How long the measurement actually covered, in milliseconds.
     public let observedForMs: Int
+    /// Who brought the target in front (see `BridgeFocusAttribution`).
+    public let focusChangeAttribution: BridgeFocusAttribution
+    /// A reliable physical-input witness was available for every sample.
+    public let humanWitnessAvailable: Bool
+    /// A focus-capable physical input correlated with the transition.
+    public let humanInputDetected: Bool
+    public let humanInputKind: BridgeHumanInputKind?
+    /// ms from that input to the first sample that saw the target in front
+    /// (negative inside the skew = input stamped just after).
+    public let humanInputAgeMs: Int?
+    /// The person took over: element handles from before must not be reused.
+    public var requiresReobserve: Bool {
+        focusChangeAttribution == .user || focusChangeAttribution == .ambiguousExternal
+    }
 
     public init(
         verdict: BridgeInterferenceVerdict,
@@ -784,7 +926,12 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
         restored: Bool = false,
         windowRaisedOverPerson: Bool = false,
         targetFrontAtMs: Int? = nil,
-        observedForMs: Int = 0
+        observedForMs: Int = 0,
+        focusChangeAttribution: BridgeFocusAttribution = .none,
+        humanWitnessAvailable: Bool = false,
+        humanInputDetected: Bool = false,
+        humanInputKind: BridgeHumanInputKind? = nil,
+        humanInputAgeMs: Int? = nil
     ) {
         self.verdict = verdict
         self.frontmostBefore = frontmostBefore
@@ -806,6 +953,11 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
         self.windowRaisedOverPerson = windowRaisedOverPerson
         self.targetFrontAtMs = targetFrontAtMs
         self.observedForMs = observedForMs
+        self.focusChangeAttribution = focusChangeAttribution
+        self.humanWitnessAvailable = humanWitnessAvailable
+        self.humanInputDetected = humanInputDetected
+        self.humanInputKind = humanInputKind
+        self.humanInputAgeMs = humanInputAgeMs
     }
 
     /// Wire shape. Stable keys, no user content beyond application names.
@@ -831,8 +983,14 @@ public struct BridgeInterferenceReport: Equatable, Sendable {
             "restored": restored,
             "window_raised_over_person": windowRaisedOverPerson,
             "observed_for_ms": observedForMs,
+            "focus_change_attribution": focusChangeAttribution.rawValue,
+            "human_witness_available": humanWitnessAvailable,
+            "human_input_detected": humanInputDetected,
+            "requires_reobserve": requiresReobserve,
         ]
         if let targetFrontAtMs { wire["target_front_at_ms"] = targetFrontAtMs }
+        if let humanInputKind { wire["human_input_kind"] = humanInputKind.rawValue }
+        if let humanInputAgeMs { wire["human_input_age_ms"] = humanInputAgeMs }
         return wire
     }
 }
@@ -921,19 +1079,34 @@ public func bridgeInterferenceReport(
         }
     }
 
+    // Who brought the target in front? `focusBecameTarget` and
+    // `windowRaisedOverPerson` stay the observed FACTS; attribution decides
+    // whether they are this action's doing. A focus-capable physical input
+    // (mouse down, ⌘-key, ⌘ release) correlated with the first sample that
+    // saw the target in front means the person did it. No reliable witness =
+    // `unknown`, which keeps the pre-witness behaviour (fail closed).
+    let witness = bridgeHumanActivationInputs(sequence)
+    let attributed = bridgeFocusAttribution(
+        targetFrontAt: targetFrontAt, witnessAvailable: witness.available, inputs: witness.inputs)
+    let personTookFocus = attributed.attribution == .user || attributed.attribution == .ambiguousExternal
+
     // Attribution. The cursor cannot be ours without a posted event; a focus
-    // change is ours only when it lands on our own target.
+    // change is ours only when it lands on our own target AND no physical
+    // input explains it.
     let cursorMovedByAction = postsInput && cursorMoved
     let externalActivity = (cursorMoved && !postsInput)
         || (focusChanged && !focusBecameTarget && !windowRaisedOverPerson)
+        || personTookFocus
 
     // A breach is a promise broken by THIS action: an accessibility action in a
-    // no-interference mode that raised the application it acted on. Pointer or
-    // keyboard input is never permitted in those modes, so it cannot be the
-    // cause of a breach there.
+    // no-interference mode that raised the application it acted on, with no
+    // physical input to attribute it to the person (`action`), or with no way
+    // to tell (`unknown`). Pointer or keyboard input is never permitted in
+    // those modes, so it cannot be the cause of a breach there.
     let breach = mode.promisesNoInterference
         && actionClass == .accessibility
         && (focusBecameTarget || windowRaisedOverPerson)
+        && (attributed.attribution == .action || attributed.attribution == .unknown)
 
     let endpointsAgree = bridgeSameApplication(before, after)
         && abs(after.cursorX - before.cursorX) <= tolerance
@@ -960,7 +1133,12 @@ public func bridgeInterferenceReport(
         restored: sawSomething && endpointsAgree,
         windowRaisedOverPerson: windowRaisedOverPerson,
         targetFrontAtMs: targetFrontAt.map { Int(($0 * 1000).rounded()) },
-        observedForMs: Int(((sequence.last?.t ?? 0) - (sequence.first?.t ?? 0)) * 1000)
+        observedForMs: Int(((sequence.last?.t ?? 0) - (sequence.first?.t ?? 0)) * 1000),
+        focusChangeAttribution: attributed.attribution,
+        humanWitnessAvailable: witness.available,
+        humanInputDetected: personTookFocus,
+        humanInputKind: personTookFocus ? attributed.input?.kind : nil,
+        humanInputAgeMs: personTookFocus ? attributed.ageMs : nil
     )
 }
 

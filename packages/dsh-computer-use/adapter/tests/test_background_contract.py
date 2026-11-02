@@ -402,6 +402,37 @@ class ClaudeControlSurfaceTests(Case):
         self.assertEqual(_ax_access({"elements": [{"role": "AXTextArea", "value_settable": True}]}), "actionable")
 
 
+class HumanTakeoverTests(Case):
+    TAKEOVER = dict(BREACH_LEDGER, breach=False, external_activity=True, focus_became_target=True,
+                    focus_change_attribution="user", human_input_detected=True, human_input_kind="mouse_down",
+                    human_input_age_ms=42, human_witness_available=True, requires_reobserve=True)
+    sent = []
+
+    @staticmethod
+    def responder(request):
+        HumanTakeoverTests.sent.append(request)
+        return ok(request, {"ok": True, "message": "pressed", "interference": HumanTakeoverTests.TAKEOVER})
+
+    def setUp(self):
+        HumanTakeoverTests.sent = []
+        super().setUp()
+
+    def test_takeover_is_an_error_result_with_attribution_and_no_stop(self):
+        response = self.call("computer_use_press", {"element_id": 2, "snapshot": 5})
+        self.assertTrue(response["result"].get("isError"), "never a silent success")
+        text = text_of(response)
+        self.assertIn("attribution: focus_change_attribution=user human_input_detected=True "
+                      "human_input_kind=mouse_down human_input_age_ms=42 human_witness=available", text)
+        self.assertIn("USER_TAKEOVER: the person brought Claude to the front during this action (attribution=user).", text)
+        self.assertNotIn("STOP: breach", text)
+        self.assertNotIn("REFUSED INTERFERENCE_BREACH", text)
+
+    def test_16_no_automatic_retry(self):
+        self.call("computer_use_press", {"element_id": 2, "snapshot": 5})
+        self.assertEqual([f["operation"] for f in HumanTakeoverTests.sent], ["action.execute"],
+                         "one call, no retry, no implicit re-observe")
+
+
 class InstructionsTests(unittest.TestCase):
     def test_initialize_carries_the_no_bypass_policy(self):
         client = BridgeClient("/nonexistent/socket", policy="background")

@@ -300,6 +300,39 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   `window_chrome_guard`, `ax_scroll`, `ax_tree_enrichment`,
   `breach_latch: "persistent"`, `breach_rearm`.
 
+### Who moved the focus: action vs person (helper 0.3.1)
+
+Bug fixed: the person clicked the target while an AX action on it was
+settling; the ledger saw the target come to the front and latched a breach.
+`focus_became_target` and `window_raised_over_person` stay the observed
+FACTS; the breach now also needs the change to be attributable to the action.
+
+- **Witness (read-only).** Every sample queries the combined hardware HID
+  state (`CGEventSource.secondsSinceLastEventType(.hidSystemState, …)` for
+  left/right/other mouse-down, key-down and flags-changed, plus
+  `CGEventSource.flagsState(.hidSystemState)` for ⌘). Nothing is created,
+  posted or tapped; mouse MOVEMENT is not read. Focus-capable inputs: a mouse
+  button down; a key down while ⌘ is held (⌘-Tab — plain typing does not
+  switch apps); ⌘ released (⌘-Tab activates on release).
+- **Correlation.** With `f` = first sample that saw the target active or on
+  top (`target_front_at_ms`): an input in `[f − 0.75 s, f]` ⇒ `user`; in
+  `(f, f + 0.06 s]` (sampling resolution) ⇒ `ambiguous_external`; nothing ⇒
+  `action`; any sample without a reliable reading ⇒ `unknown`.
+- **Breach** only for `action` or `unknown` (fail closed without telemetry).
+  `user` / `ambiguous_external`: `external_activity=true`, `breach=false`, no
+  latch, no audit entry, and the helper invalidates the element handles: the
+  next element action answers `ACTION_FAILED reason=expired` until a fresh
+  `observation.describe`. Nothing is retried.
+- New ledger keys (old ones unchanged): `focus_change_attribution`
+  (`none|action|user|ambiguous_external|unknown`), `human_witness_available`,
+  `human_input_detected`, `human_input_kind`
+  (`mouse_down|command_key_down|command_release`), `human_input_age_ms`
+  (input → first in-front sample), `requires_reobserve`.
+- The adapter prints an `attribution:` line and, for a takeover, a
+  `USER_TAKEOVER:` line and an error result (never a silent success, never a
+  STOP line); the DSH projection drops the target (`USER_TAKEOVER`) without
+  setting `breach` (stateVersion 11).
+
 ### Breach latch and `breach.rearm`
 
 State lives next to the policy file (so `--policy-file` lanes are isolated):

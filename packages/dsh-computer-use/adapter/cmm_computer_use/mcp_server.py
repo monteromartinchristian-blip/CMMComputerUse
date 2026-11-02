@@ -860,6 +860,22 @@ def _render_set_value(evidence: Any) -> List[str]:
         evidence.get("previous_length", "none"), evidence.get("ax_error", "none"))]
 
 
+def _user_takeover_line(interference: Any) -> Optional[str]:
+    """The PERSON brought the target in front while the action ran: reported
+    loudly, never as a silent success, and never as a breach."""
+
+    if not isinstance(interference, dict) or interference.get("breach"):
+        return None
+    if interference.get("focus_change_attribution") not in ("user", "ambiguous_external"):
+        return None
+    return (
+        "USER_TAKEOVER: the person brought %s to the front during this action "
+        "(attribution=%s). Not a breach; nothing is latched. The previous snapshot is no "
+        "longer valid: observe again before any other action, and do not retry this one."
+        % (interference.get("frontmost_after") or "the target", interference.get("focus_change_attribution"))
+    )
+
+
 def _render_action(kind: str, result: Any) -> "tuple":
     """Render one successful action, and decide whether it stays a success.
 
@@ -890,6 +906,10 @@ def _render_action(kind: str, result: Any) -> "tuple":
             "STOP: breach recorded (policy=%s). Do not retry this action; report "
             "it and let the operator review the ledger." % interference.get("policy")
         )
+        return "\n".join(lines), True
+    takeover = _user_takeover_line(interference)
+    if takeover:
+        lines.append(takeover)
         return "\n".join(lines), True
     return "\n".join(lines), False
 
@@ -962,6 +982,18 @@ def _render_interference(interference: Any) -> List[str]:
                 interference.get("restored"),
             )
         )
+    if "focus_change_attribution" in interference:
+        lines.append(
+            "attribution: focus_change_attribution=%s human_input_detected=%s human_input_kind=%s "
+            "human_input_age_ms=%s human_witness=%s"
+            % (
+                interference.get("focus_change_attribution"),
+                interference.get("human_input_detected"),
+                interference.get("human_input_kind", "none"),
+                interference.get("human_input_age_ms", "none"),
+                "available" if interference.get("human_witness_available") else "unavailable",
+            )
+        )
     if "observed_for_ms" in interference or "window_raised_over_person" in interference:
         lines.append(
             "settle: observed_for_ms=%s target_front_at_ms=%s window_raised_over_person=%s"
@@ -1000,6 +1032,9 @@ def _render_refusal(error: BridgeError) -> Dict[str, Any]:
             "report it and let the operator review the ledger."
             % interference.get("policy")
         )
+    takeover = _user_takeover_line(interference)
+    if takeover:
+        lines.append(takeover)
     lines.append(NO_BYPASS_LINE)
     return _text("\n".join(lines), is_error=True)
 

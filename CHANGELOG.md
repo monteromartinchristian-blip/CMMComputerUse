@@ -7,6 +7,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The helper and the plugin version independently; this file tracks the plugin
 (`@cmm/dsh-computer-use`) and notes helper-visible changes explicitly.
 
+## Unreleased — helper 0.3.1 build 4 (focus attribution, 2026-11-02)
+
+### Fixed
+
+- **False breach when the person takes the focus.** A click on the target (or
+  ⌘-Tab to it) while an AX action on it was settling was latched as
+  `INTERFERENCE_BREACH`. The helper now reads a read-only HID witness
+  (seconds since the last mouse-down / ⌘-key / ⌘-release, combined hardware
+  state) and attributes the change: correlated input within 0.75 s before the
+  first in-front sample ⇒ `user` (no breach, no latch, snapshot invalidated,
+  re-observe required); within 60 ms after ⇒ `ambiguous_external` (same); none
+  ⇒ `action` (breach, as before); no reliable reading ⇒ `unknown` (breach,
+  fail closed). Mouse movement never counts.
+- Adapter renders `attribution:` and `USER_TAKEOVER:`; DSH projection drops
+  the target without a breach (stateVersion 11).
+
 ## Unreleased — helper 0.3.0 + plugin (background hardening, 2026-11-02)
 
 Fixes found in a live DeepSeek Harness session against Claude Desktop

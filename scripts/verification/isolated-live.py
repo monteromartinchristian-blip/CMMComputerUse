@@ -533,6 +533,118 @@ def phase_rearm_tests(lane: Lane) -> None:
     lane.save()
 
 
+def tool_text(result: Dict[str, Any]) -> str:
+    return "\n".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text")
+
+
+def takeover_verdict(text: str) -> Dict[str, Any]:
+    """Facts from one action result rendered by the adapter (pure; tested)."""
+
+    def flag(name: str) -> Optional[str]:
+        m = re.search(r"(?:^|[ :])%s=(\S+)" % name, text, re.M)
+        return m.group(1) if m else None
+
+    return {
+        "focus_became_target": flag("focus_became_target") == "True",
+        "attribution": flag("focus_change_attribution"),
+        "human_input_detected": flag("human_input_detected") == "True",
+        "human_input_kind": flag("human_input_kind"),
+        "human_input_age_ms": flag("human_input_age_ms"),
+        "human_witness": flag("human_witness"),
+        "external_activity": flag("external_activity") == "True",
+        "breach": "INTERFERENCE_BREACH" in text or "STOP: breach recorded" in text,
+        "user_takeover_line": bool(re.search(r"^USER_TAKEOVER: ", text, re.M)),
+    }
+
+
+def phase_human_takeover(lane: Lane, attempts: int = 3) -> None:
+    """Gate B — a REAL person takes the focus during an AX action.
+
+    Nothing here simulates input: the person clicks the fixture window with the
+    real mouse when told to. The action itself (`ui.press` of "Incrementar")
+    activates nothing, so if the fixture comes to the front during its
+    measurement, the person did it. Expected: focus_became_target, attribution
+    user (ambiguous_external is reported, also without latch), external
+    activity, NO breach, NO latch, and the previous snapshot refused until a
+    fresh observe."""
+
+    r: Dict[str, Any] = {}
+    lane.state.setdefault("results", {})["human_takeover"] = r
+    fixture = build_fixture(lane.path("takeover-fixture"))
+    state_file = lane.path("takeover-fixture/state.json")
+    run(["/usr/bin/open", "-g", "-n", "--env", "CMM_CU_FIXTURE_STATE=%s" % state_file, fixture])
+    for _ in range(100):
+        if os.path.exists(state_file):
+            break
+        time.sleep(0.1)
+    time.sleep(1.0)
+    client, reg = registry(lane)
+    attempt_log = []
+    try:
+        verdict, snap, element = None, None, None
+        for attempt in range(1, attempts + 1):
+            obs_text = tool_text(tool(reg, "computer_use_observe", {"app": lib.FIXTURE_BUNDLE_ID}))
+            if "(background)" not in obs_text:
+                say("The fixture is in front. Click once on your Terminal window, then wait.")
+                time.sleep(4.0)
+                continue
+            snap = re.search(r"^snapshot: (\d+)", obs_text, re.M)
+            element = re.search(r'^\[(\d+)\] \S+ "Incrementar"', obs_text, re.M)
+            if not (snap and element):
+                raise Gate("fixture observation has no 'Incrementar' element")
+            say("\n=== GATE B (attempt %d/%d) — real human takeover ===" % (attempt, attempts))
+            say("When you read CLICK NOW, click ONCE with the real mouse inside the window "
+                "'CMM Computer Use Fixture' (not on a button). Do nothing else.")
+            for n in (3, 2, 1):
+                say("  %d…" % n)
+                time.sleep(1.0)
+            say("  CLICK NOW")
+            text = tool_text(tool(reg, "computer_use_press",
+                                  {"element_id": int(element.group(1)), "snapshot": int(snap.group(1))}))
+            verdict = takeover_verdict(text)
+            attempt_log.append(dict(verdict, attempt=attempt))
+            say(text)
+            if verdict["focus_became_target"]:
+                break
+            say("The fixture did not come to the front during the action (click too early/late). Retrying.")
+            verdict = None
+        r_attempts = attempt_log
+        lane.state["human_takeover_attempts"] = r_attempts
+        if verdict is None:
+            raise Gate("human takeover inconclusive after %d attempts (no focus change during the action)" % attempts)
+        expect(verdict["focus_became_target"], "B1 fixture came to the front during the action", r, "focus_became_target")
+        expect(verdict["human_witness"] == "available", "B2 HID witness available (read-only)", r, "witness_available")
+        expect(verdict["human_input_detected"] and verdict["attribution"] in ("user", "ambiguous_external"),
+               "B3 correlated physical input detected (attribution=%s kind=%s age_ms=%s)"
+               % (verdict["attribution"], verdict["human_input_kind"], verdict["human_input_age_ms"]), r, "human_detected")
+        expect(verdict["external_activity"], "B4 external_activity=True", r, "external_activity")
+        expect(not verdict["breach"], "B5 no INTERFERENCE_BREACH", r, "no_breach")
+        expect(verdict["user_takeover_line"], "B6 reported as USER_TAKEOVER (not a silent success)", r, "reported")
+        status = probe(lane, "status")
+        expect(lib.FIXTURE_BUNDLE_ID not in status.stdout, "B7 no latch for the fixture (breach.status)", r, "no_latch")
+        audit_path = lane.path("breach-audit.jsonl")
+        audit = pathlib.Path(audit_path).read_text() if os.path.exists(audit_path) else ""
+        expect(not any(lib.FIXTURE_BUNDLE_ID in line and '"latched"' in line for line in audit.splitlines()),
+               "B8 no 'latched' audit entry for the fixture", r, "no_audit_latch")
+        stale = tool_text(tool(reg, "computer_use_press",
+                               {"element_id": int(element.group(1)), "snapshot": int(snap.group(1))}))
+        expect("REFUSED" in stale and "reason=expired" in stale,
+               "B9 the previous snapshot is refused (re-observe required)", r, "reobserve_required")
+        fresh = tool_text(tool(reg, "computer_use_observe", {"app": lib.FIXTURE_BUNDLE_ID}))
+        fsnap = re.search(r"^snapshot: (\d+)", fresh, re.M)
+        fel = re.search(r'^\[(\d+)\] \S+ "Incrementar"', fresh, re.M)
+        again = tool_text(tool(reg, "computer_use_press",
+                               {"element_id": int(fel.group(1)), "snapshot": int(fsnap.group(1))})) if fsnap and fel else ""
+        expect(bool(again) and "REFUSED" not in again and "INTERFERENCE_BREACH" not in again,
+               "B10 after a fresh observe, control works again (no rearm)", r, "control_after_reobserve")
+    finally:
+        client.close()
+        say("Gate B done. Click once on your Terminal window to give it the focus back.")
+        time.sleep(4.0)
+        stop_fixtures(lane)
+    lane.save()
+
+
 def phase_live(lane: Lane) -> None:
     results = lane.state.get("results", {})
     for prior in ("verify_tcc", "rearm_tests"):
@@ -612,7 +724,7 @@ def summarize(lane: Lane) -> None:
     the later phases proved."""
 
     say("══ lane summary")
-    for phase in ("prepare", "start", "verify_tcc", "rearm_tests", "live", "after_breach"):
+    for phase in ("prepare", "start", "verify_tcc", "rearm_tests", "human_takeover", "live", "after_breach"):
         results = lane.state.get("results", {}).get(phase)
         if results is None:
             say("  %-13s not run" % phase)
@@ -694,7 +806,7 @@ def phase_verify_production(evidence: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("phase", choices=["all", "prepare", "start", "verify-tcc", "rearm-tests", "live",
+    parser.add_argument("phase", choices=["all", "prepare", "start", "verify-tcc", "rearm-tests", "human-takeover", "live",
                                           "after-breach", "teardown", "verify-production"])
     parser.add_argument("--work", help="isolated lane directory (phases after prepare)")
     parser.add_argument("--evidence", help="evidence directory (verify-production)")
@@ -708,6 +820,8 @@ def main() -> int:
     parser.add_argument("--person-app", default="com.apple.Terminal",
                         help="the app that must be in front (environment precondition) during Claude steps")
     parser.add_argument("--no-live", action="store_true", help="all: stop after rearm-tests (no LIVE, no breach)")
+    parser.add_argument("--human-takeover", action="store_true",
+                        help="all: run Gate B (a REAL person clicks the fixture during an AX action) before the LIVE")
     parser.add_argument("--confirm-control", action="store_true",
                         help="after-breach phase alone: one fixture press after the rearm "
                              "(always on in `all`)")
@@ -721,6 +835,10 @@ def main() -> int:
                 phase_start(lane)
                 phase_verify_tcc(lane)
                 phase_rearm_tests(lane)
+                if args.human_takeover:
+                    # Gate B before the LIVE: Gate A (the deliberate, action-caused
+                    # breach) is the LIVE's last step and latches the fixture.
+                    phase_human_takeover(lane)
                 if not args.no_live:
                     # A failing LIVE check must not hide the recovery checks:
                     # after-breach ALWAYS runs (it fails on its own if no breach
@@ -753,6 +871,7 @@ def main() -> int:
         {"start": lambda: phase_start(lane),
          "verify-tcc": lambda: phase_verify_tcc(lane),
          "rearm-tests": lambda: phase_rearm_tests(lane),
+         "human-takeover": lambda: phase_human_takeover(lane),
          "live": lambda: phase_live(lane),
          "after-breach": lambda: phase_after_breach(lane, args.confirm_control),
          "teardown": lambda: phase_teardown(lane)}[args.phase]()

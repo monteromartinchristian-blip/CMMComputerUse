@@ -237,6 +237,7 @@ func topWindowOwnerBundle() -> String {
 func currentEnvironment(origin: Double? = nil) -> BridgeEnvironment {
     let front = NSWorkspace.shared.frontmostApplication
     let cursor = cursorLocation()
+    let human = humanInputSample()
     let now = ProcessInfo.processInfo.systemUptime
     return BridgeEnvironment(
         frontmostApp: front?.localizedName ?? "",
@@ -245,7 +246,33 @@ func currentEnvironment(origin: Double? = nil) -> BridgeEnvironment {
         cursorY: Double(cursor.y),
         focusedBundle: AXIsProcessTrusted() ? axFocusedApplicationBundle() : "",
         topWindowBundle: topWindowOwnerBundle(),
-        t: origin.map { now - $0 } ?? 0)
+        t: origin.map { now - $0 } ?? 0,
+        humanInput: human)
+}
+
+/// READ-ONLY witness of physical input, for attributing a focus change to
+/// the person rather than to an action (Shared: `bridgeFocusAttribution`).
+///
+/// It QUERIES the combined hardware HID state (`.hidSystemState`, the state of
+/// all hardware event sources) for the seconds since the last event of a few
+/// types, and the current modifier flags. It creates no event, posts nothing,
+/// installs no event tap, moves nothing; it is the same kind of reading an
+/// idle timer makes. Only focus-capable types are read — mouse button down,
+/// key down, modifier change — never mouse movement.
+///
+/// A reading that is not a finite, non-negative number makes the sample
+/// unreliable, and an unreliable sample anywhere in a measurement makes the
+/// attribution `unknown`: the report then keeps the strict behaviour.
+func humanInputSample() -> BridgeHumanInputSample {
+    let state = CGEventSourceStateID.hidSystemState
+    let mouseDown = [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        .map { CGEventSource.secondsSinceLastEventType(state, eventType: $0) }
+        .min()
+    return BridgeHumanInputSample(
+        mouseDownAge: mouseDown,
+        keyDownAge: CGEventSource.secondsSinceLastEventType(state, eventType: .keyDown),
+        flagsChangedAge: CGEventSource.secondsSinceLastEventType(state, eventType: .flagsChanged),
+        commandHeld: CGEventSource.flagsState(state).contains(.maskCommand))
 }
 
 // MARK: - Breach latch persistence and audit
@@ -2600,6 +2627,15 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 detail: "policy=\(mode.rawValue);reason=breach;kind=\(kind);action_ok=\(result["ok"] as? Bool == true)" + (breachID.isEmpty ? "" : ";breach_id=\(breachID)"))
             error["interference"] = report.dictionary()
             return (false, nil, error)
+        }
+        if report.requiresReobserve {
+            // The PERSON brought the target in front while this action ran:
+            // not a breach, nothing is latched. But the screen is no longer
+            // what the element handles described, so they are invalidated: the
+            // next element action is refused (`reason=expired`) until the
+            // client observes again. Never retried here.
+            observationCapturedAt = 0
+            log("USER_TAKEOVER kind=\(kind) attribution=\(report.focusChangeAttribution.rawValue) input=\(report.humanInputKind?.rawValue ?? "-") age_ms=\(report.humanInputAgeMs.map { String($0) } ?? "-") target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-")")
         }
         if result["unsupported"] as? Bool == true {
             var error = bridgeError(

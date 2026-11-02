@@ -36,6 +36,18 @@ print(json.dumps(r))`;
   return {text: rendered.content.map(b => b.text).join('\n'), isError: rendered.isError === true};
 }
 
+/** Render a helper SUCCESS result through the actual adapter code. */
+function adapterAction(kind, result) {
+  const script = `
+import json, sys
+sys.path.insert(0, ${JSON.stringify(join(ROOT, 'adapter'))})
+from cmm_computer_use.mcp_server import _render_action
+a = json.loads(sys.stdin.read())
+text, is_error = _render_action(a["kind"], a["result"])
+print(json.dumps({"text": text, "isError": is_error}))`;
+  return JSON.parse(execFileSync('python3', ['-I', '-c', script], {input: JSON.stringify({kind, result}), encoding: 'utf8'}));
+}
+
 const STATUS_NO_NAME = 'helper: cmm-computer-use protocol=1 pid=9\n' +
   'deployment_policy: background (this adapter asks for background)\n' +
   'accessibility: True\nscreen_recording: True\n' +
@@ -194,4 +206,79 @@ test('the DSH guard blocks bypasses only in sessions that used Computer Use', ()
   assert.match(guard(bypass), /osascript is not an allowed route in a Computer Use session/);
   assert.equal(guard({name: 'bash', arguments: {command: 'ls'}, agent: {session: {}}}), undefined);
   assert.equal(guard({name: prefix + 'observe', agent: {session: {}}}), undefined);
+});
+
+// ── person takes the focus during an action (attribution) ──────────────
+const TAKEOVER_LEDGER = {...LEDGER, breach: false, external_activity: true, focus_became_target: true,
+  focus_change_attribution: 'user', human_input_detected: true, human_input_kind: 'mouse_down',
+  human_input_age_ms: 42, human_witness_available: true, requires_reobserve: true};
+
+test('12 a breach attributed to the action still latches (attribution line does not break it)', () => {
+  const r = adapterRefusal('INTERFERENCE_BREACH', 'x', 'policy=background;reason=breach;kind=ui.press',
+    {...LEDGER, focus_change_attribution: 'action', human_input_detected: false, human_witness_available: true,
+      requires_reobserve: false});
+  assert.match(r.text, /^attribution: focus_change_attribution=action human_input_detected=False/m);
+  const s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
+  assert.equal(s.breach, true);
+});
+
+test('13/14 a human takeover is reported, is not a breach and latches nothing', () => {
+  const r = adapterAction('ui.press', {ok: true, message: 'pressed', interference: TAKEOVER_LEDGER});
+  assert.equal(r.isError, true, 'never a silent success');
+  assert.match(r.text, /^attribution: focus_change_attribution=user human_input_detected=True human_input_kind=mouse_down human_input_age_ms=42 human_witness=available$/m);
+  assert.match(r.text, /^USER_TAKEOVER: the person brought Claude to the front during this action \(attribution=user\)\. Not a breach; nothing is latched\./m);
+  assert.doesNotMatch(r.text, /STOP: breach/);
+  const s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
+  assert.equal(s.breach, false);
+  assert.equal(s.error, 'USER_TAKEOVER');
+  // the guard does not deny further Computer Use
+  const guard = installGuard(s);
+  assert.equal(guard({name: prefix + 'observe', agent: {session: {}}}), undefined);
+});
+
+test('13 an ambiguous external takeover does not latch either', () => {
+  const r = adapterAction('ui.press', {ok: true, message: 'pressed',
+    interference: {...TAKEOVER_LEDGER, focus_change_attribution: 'ambiguous_external'}});
+  const s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
+  assert.equal(s.breach, false);
+  assert.equal(s.error, 'USER_TAKEOVER');
+});
+
+test('15 after a takeover the observed target is gone: a fresh observe is required', () => {
+  const r = adapterAction('ui.press', {ok: true, message: 'pressed', interference: TAKEOVER_LEDGER});
+  let s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
+  assert.equal(s.target, null);
+  // A press now does not resurrect it; only an observation does.
+  s = result(call(s, 'press', {element_id: 2, snapshot: 5}),
+    'REFUSED ACTION_FAILED: The observation this element belongs to has expired; observe again. [policy=background;reason=expired;age=0s;snapshot=5]', true);
+  assert.equal(s.target, null);
+  assert.equal(s.error, 'expired');
+  s = observed(s);
+  assert.equal(s.target?.name, 'Claude');
+  assert.equal(s.breach, false);
+});
+
+test('15 a takeover on a FAILED action is reported the same way', () => {
+  const r = adapterRefusal('ACTION_FAILED', 'The element disappeared.', 'policy=background;reason=unknown_element',
+    TAKEOVER_LEDGER);
+  assert.match(r.text, /^USER_TAKEOVER: /m);
+  const s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
+  assert.equal(s.breach, false);
+  assert.equal(s.error, 'USER_TAKEOVER');
+});
+
+test('17 a takeover opens no bypass: scripting routes stay refused', () => {
+  const r = adapterAction('ui.press', {ok: true, message: 'pressed', interference: TAKEOVER_LEDGER});
+  const s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
+  const guard = installGuard(s);
+  assert.match(guard({name: 'bash', arguments: {command: 'osascript -e "tell application \\"Claude\\" to activate"'},
+    agent: {session: {}}}), /not an allowed route/);
+});
+
+test('a USER_TAKEOVER line cannot be forged into a breach and a breach cannot hide as a takeover', () => {
+  const breach = adapterRefusal('INTERFERENCE_BREACH', 'x', 'policy=background;reason=breach;kind=ui.press',
+    {...LEDGER, focus_change_attribution: 'action'});
+  assert.doesNotMatch(breach.text, /USER_TAKEOVER/);
+  const both = adapterAction('ui.press', {ok: true, message: 'pressed', interference: {...TAKEOVER_LEDGER, breach: true}});
+  assert.doesNotMatch(both.text, /USER_TAKEOVER/, 'breach wins: a breached ledger is never rendered as a takeover');
 });

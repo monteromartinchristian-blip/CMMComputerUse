@@ -38,7 +38,7 @@ PLIST="$APP_SRC/CMMComputerUse/Info.plist"
 APP_NAME="CMMComputerUse.app"
 APP_DISPLAY_NAME="CMM Computer Use"
 BUNDLE_ID="com.cmm.chat.computer-use"
-VERSION="${CMM_HELPER_VERSION:-0.3.0}"
+VERSION="${CMM_HELPER_VERSION:-0.3.1}"
 INSTALL_DIR="${CMM_BRIDGE_INSTALL_DIR:-$HOME/Applications}"
 APP="$INSTALL_DIR/$APP_NAME"
 BUILD_DIR="${CMM_HELPER_BUILD_DIR:-$REPO/build}"
@@ -79,7 +79,7 @@ plist_set CFBundleExecutable CMMComputerUse
 plist_set CFBundleName "$APP_DISPLAY_NAME"
 plist_set CFBundleDisplayName "$APP_DISPLAY_NAME"
 plist_set CFBundleShortVersionString "$VERSION"
-plist_set CFBundleVersion 3
+plist_set CFBundleVersion 4
 plist_set CFBundleDevelopmentRegion en
 
 # A staged bundle whose visible name or identity regressed must not be shipped.

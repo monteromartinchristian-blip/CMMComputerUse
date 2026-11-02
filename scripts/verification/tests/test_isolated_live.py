@@ -448,6 +448,65 @@ class AllFlowTests(unittest.TestCase):
         self.assertIn("phase_after_breach(", guarded)
 
 
+class HumanTakeoverGateTests(unittest.TestCase):
+    """Gate B's verdict parsing, against the REAL adapter rendering."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(VERIFY.parents[1] / "packages" / "dsh-computer-use" / "adapter"))
+        from cmm_computer_use.mcp_server import _render_action
+        spec = importlib.util.spec_from_file_location("isolated_live_gate", str(VERIFY / "isolated-live.py"))
+        cls.lane = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.lane)
+        cls.render = staticmethod(_render_action)
+
+    LEDGER = {"verdict": "focus_changed", "frontmost_before": "Terminal", "frontmost_after": "CMM Computer Use Fixture",
+              "cursor_moved": True, "policy": "background", "cursor_events_posted": False,
+              "cursor_moved_by_action": False, "sampled": 200, "transient_focus_changes": 1,
+              "transient_cursor_max_delta": 3.0, "restored": False, "observed_for_ms": 1400,
+              "target_front_at_ms": 512, "window_raised_over_person": True}
+
+    def verdict(self, **overrides):
+        ledger = dict(self.LEDGER, **overrides)
+        text, _ = self.render("ui.press", {"ok": True, "message": "pressed", "interference": ledger})
+        return self.lane.takeover_verdict(text)
+
+    def test_a_real_takeover_reads_as_gate_b_pass(self):
+        v = self.verdict(focus_became_target=True, external_activity=True, breach=False,
+                         focus_change_attribution="user", human_input_detected=True,
+                         human_input_kind="mouse_down", human_input_age_ms=38,
+                         human_witness_available=True, requires_reobserve=True)
+        self.assertEqual((v["focus_became_target"], v["attribution"], v["human_input_detected"],
+                          v["human_witness"], v["external_activity"], v["breach"], v["user_takeover_line"]),
+                         (True, "user", True, "available", True, False, True))
+        self.assertEqual((v["human_input_kind"], v["human_input_age_ms"]), ("mouse_down", "38"))
+
+    def test_gate_a_shape_is_never_read_as_a_takeover(self):
+        v = self.verdict(focus_became_target=True, external_activity=False, breach=True,
+                         focus_change_attribution="action", human_input_detected=False,
+                         human_witness_available=True, requires_reobserve=False)
+        self.assertTrue(v["breach"])
+        self.assertFalse(v["user_takeover_line"])
+        self.assertEqual(v["attribution"], "action")
+
+    def test_unavailable_witness_is_visible(self):
+        v = self.verdict(focus_became_target=True, breach=True, focus_change_attribution="unknown",
+                         human_input_detected=False, human_witness_available=False)
+        self.assertEqual((v["attribution"], v["human_witness"], v["breach"]), ("unknown", "unavailable", True))
+
+    def test_all_runs_gate_b_before_the_live_and_the_gate_never_synthesizes_input(self):
+        body = ORCHESTRATOR.split('"""', 2)[2]
+        block = body[body.index('if args.phase == "all":'):]
+        self.assertLess(block.index("phase_human_takeover(lane)"), block.index("phase_live(lane)"))
+        gate = body[body.index("def phase_human_takeover"):body.index("def phase_live")]
+        code = "\n".join(l.split("#", 1)[0] for l in gate.splitlines())
+        for forbidden in ("CGEvent", "osascript", "cliclick", "System Events", "pyautogui", "Quartz", "keystroke"):
+            self.assertNotIn(forbidden, code)
+        self.assertIn("CLICK NOW", gate)
+        tools = set(re.findall(r'"(computer_use_\w+)"', gate))
+        self.assertEqual(tools, {"computer_use_observe", "computer_use_press"})
+
+
 class OrchestratorSourceTests(unittest.TestCase):
     """What the lane may not do, pinned on its source."""
 
