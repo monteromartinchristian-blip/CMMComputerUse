@@ -83,6 +83,34 @@ class Driver:
         return text, is_error
 
 
+def scroll_verdict(text: str, is_error: bool, on_fixture: bool,
+                   state_before=None, state_after=None) -> dict:
+    """Judge one `computer_use_scroll` result.
+
+    The helper's verdict is the MEASURED effect (`scroll: … effect=moved`),
+    never the AX return code. On the fixture — an NSScrollView with a real
+    scroll bar — a verified scroll is mandatory and the fixture's own
+    `scroll_y` must have grown (second channel). Elsewhere, an explicit
+    CAPABILITY_UNSUPPORTED is an acceptable, honest answer.
+    """
+
+    verified = (not is_error) and bool(re.search(r"^scroll: route=(page_action|scroll_bar) effect=moved ", text, re.M))
+    untouched = "verdict=untouched" in text
+    ax_error = re.search(r"^scroll: .* ax_error=(-?\d+) ", text, re.M)
+    out = {"verified": verified, "untouched": untouched,
+           "ax_error_diagnostic": int(ax_error.group(1)) if ax_error else None,
+           "unsupported": is_error and "REFUSED CAPABILITY_UNSUPPORTED" in text}
+    if on_fixture:
+        grew = None
+        if state_before is not None and state_after is not None:
+            grew = state_after.get("scroll_y", -1) > state_before.get("scroll_y", -1)
+        out["fixture_scroll_y_grew"] = grew
+        out["ok"] = verified and untouched and grew is True
+    else:
+        out["ok"] = (verified and untouched) or out["unsupported"]
+    return out
+
+
 def element_id(text: str, predicate) -> int | None:
     for line in text.splitlines():
         m = re.match(r"^\[(\d+)\] (\S+) \"(.*)\" \(", line)
@@ -173,6 +201,8 @@ def main() -> int:
 
     d = Driver(args.socket)
     checks = {}
+    # Facts reported next to the checks; they never decide PASS/FAIL.
+    diagnostics = {}
 
     text, err = d.call("1 status", "computer_use_status")
     checks["status"] = (not err) and "effective_mode: background" in text and "- authorized:" in text
@@ -220,16 +250,17 @@ def main() -> int:
         state_before = fixture_state(args.fixture_state) if args.fixture_state else None
         text, err = d.call("6 scroll", "computer_use_scroll",
                            {"element_id": target_scroll, "snapshot": snap, "direction": "down"})
-        if err:
-            checks["scroll"] = "REFUSED CAPABILITY_UNSUPPORTED" in text
-        else:
-            checks["scroll"] = "verdict=untouched" in text
-            if state_before is not None:
-                time.sleep(0.3)
-                after = fixture_state(args.fixture_state) or {}
-                checks["scroll_effect"] = after.get("scroll_y", -1) > state_before.get("scroll_y", -1)
+        time.sleep(0.3)
+        state_after = fixture_state(args.fixture_state) if args.fixture_state else None
+        verdict = scroll_verdict(text, err, args.app == FIXTURE, state_before, state_after)
+        diagnostics["scroll"] = verdict
+        checks["scroll"] = verdict["ok"]
+        if args.app == FIXTURE:
+            checks["scroll_verified_by_helper"] = verdict["verified"]
+            checks["scroll_effect"] = verdict["fixture_scroll_y_grew"] is True
     else:
-        checks["scroll"] = None
+        # The fixture always has a scroll area: not finding one is a failure there.
+        checks["scroll"] = False if args.app == FIXTURE else None
 
     if args.electron_app:
         text, err = d.call("7 electron observe", "computer_use_observe", {"app": args.electron_app})
@@ -280,6 +311,7 @@ def main() -> int:
     checks["witness_quiet"] = quiet_ok
 
     report = {"person_bundle": person_bundle, "target": args.app, "checks": checks,
+              "diagnostics": diagnostics,
               "witness": verdicts, "steps": d.steps}
     pathlib.Path(args.report).write_text(json.dumps(report, indent=2, ensure_ascii=False))
     print("\n══ checks")

@@ -162,6 +162,40 @@ class ScrollTests(Case):
         self.assertEqual(len(ScrollTests.sent), 1, "an unsupported scroll is never retried another way")
 
 
+class ScrollEvidenceTests(Case):
+    @staticmethod
+    def responder(request):
+        params = request["arguments"]["params"]
+        if params["element_id"] == 5:
+            return ok(request, {"ok": True, "message": "scrolled down 1 page(s) via page_action (AX returned -25205; effect verified)",
+                                "scroll": {"route": "page_action", "effect": "moved", "ax_error": -25205,
+                                           "before": {"content_origin": 622}, "after": {"content_origin": 498},
+                                           "attempts": [{"route": "page_action", "effect": "moved", "ax_error": -25205,
+                                                         "before": {"content_origin": 622}, "after": {"content_origin": 498}}]},
+                                "interference": dict(BREACH_LEDGER, verdict="untouched", breach=False,
+                                                     focus_became_target=False, transient_focus_changes=0)})
+        error = failure(request, "ACTION_FAILED", "The scroll had no verifiable effect through accessibility.",
+                        "policy=background;kind=ui.scroll;reason=no_effect;role=AXScrollArea;routes=page_action,scroll_bar")
+        error["error"]["scroll"] = {"effect": "no_effect", "before": {"bar_value": 0.5}, "after": {"bar_value": 0.5},
+                                    "attempts": [{"route": "page_action", "effect": "unchanged"},
+                                                 {"route": "scroll_bar", "effect": "unchanged"}]}
+        return error
+
+    def test_ax_error_with_observed_effect_is_a_success_with_the_error_as_diagnostic(self):
+        response = self.call("computer_use_scroll", {"element_id": 5, "snapshot": 1, "direction": "down"})
+        self.assertFalse(response["result"].get("isError", False))
+        text = text_of(response)
+        self.assertIn("scroll: route=page_action effect=moved ax_error=-25205 before=origin=622 after=origin=498", text)
+
+    def test_no_verifiable_effect_is_a_failure_with_the_evidence(self):
+        response = self.call("computer_use_scroll", {"element_id": 6, "snapshot": 1, "direction": "down"})
+        self.assertTrue(response["result"].get("isError"))
+        text = text_of(response)
+        self.assertIn("reason=no_effect", text)
+        self.assertIn("scroll: route=none effect=no_effect", text)
+        self.assertIn("- attempt scroll_bar: effect=unchanged", text)
+
+
 class ElectronTreeTests(Case):
     @staticmethod
     def responder(request):

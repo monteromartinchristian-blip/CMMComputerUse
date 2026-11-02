@@ -89,6 +89,13 @@ check('fail("a reason is required")' in probe and 'fail("refusing the production
 check("var launched: NSRunningApplication?" not in main and "LaunchedAppBox()" in main,
       "Swift 6: appOpen no longer mutates a captured var in a @Sendable handler")
 
+scroll_start = main.index("func uiScroll(")
+scroll_body = main[scroll_start:main.index("\nfunc ", scroll_start + 10)]
+scroll_code = "\n".join(l.split("//", 1)[0] for l in scroll_body.splitlines())
+check(not re.search(r"CGEvent|scrollWheel|CGWarp|CGDisplayMoveCursor|\.post\(", scroll_code)
+      and "bridgeScrollEffect(" in scroll_code,
+      "ui.scroll: AX-only (no wheel/CGEvent/cursor) and verified by a measured postcondition")
+
 build = BUILD.read_text()
 shared = sorted(p.name for p in (REPO / "apps/macos/Shared").glob("*.swift"))
 missing = [name for name in shared if name not in build]

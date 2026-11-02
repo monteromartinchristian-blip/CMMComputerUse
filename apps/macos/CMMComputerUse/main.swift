@@ -1629,13 +1629,59 @@ func uiPress(_ params: [String: Any]) -> [String: Any] {
     return ["ok": true, "message": "pressed"]
 }
 
-/// Scroll one observed element with accessibility primitives only.
+/// AX position of an element along one axis, or nil when it has none.
+func axAxisPosition(_ element: AXUIElement, vertical: Bool) -> Double? {
+    guard let raw = axAttr(element, kAXPositionAttribute),
+          CFGetTypeID(raw) == AXValueGetTypeID()
+    else { return nil }
+    var point = CGPoint.zero
+    guard AXValueGetValue(raw as! AXValue, .cgPoint, &point) else { return nil }
+    return Double(vertical ? point.y : point.x)
+}
+
+/// Measure a scroll position with accessibility reads only (see
+/// `BridgeScrollProbe`): the scroll bar's value and the position of the first
+/// child that is not a scroll bar.
+func scrollProbe(_ element: AXUIElement, direction: BridgeScrollDirection) -> BridgeScrollProbe {
+    let vertical = direction.isVertical
+    let bar = axElement(element, vertical ? kAXVerticalScrollBarAttribute : kAXHorizontalScrollBarAttribute)
+    let value = bar.flatMap { (axAttr($0, kAXValueAttribute) as? NSNumber)?.doubleValue }
+    var origin: Double?
+    if let children = axAttr(element, kAXChildrenAttribute) as? [AXUIElement] {
+        for child in children.prefix(maxChildrenPerNode) {
+            if (axAttr(child, kAXRoleAttribute) as? String) == "AXScrollBar" { continue }
+            if let position = axAxisPosition(child, vertical: vertical) {
+                origin = position
+                break
+            }
+        }
+    }
+    return BridgeScrollProbe(barValue: value, contentOrigin: origin)
+}
+
+func scrollProbeDictionary(_ probe: BridgeScrollProbe) -> [String: Any] {
+    var d: [String: Any] = [:]
+    if let v = probe.barValue { d["bar_value"] = v }
+    if let o = probe.contentOrigin { d["content_origin"] = o }
+    return d
+}
+
+/// Scroll one observed element with accessibility primitives only, and
+/// VERIFY it.
 ///
-/// Routes, in order: a page action the element itself advertises
-/// (`AXScrollDownByPage`, …), then the element's own scroll bar value. A
-/// scroll-wheel event is never posted: it is global input aimed at the cursor.
-/// When neither route exists the result says so (`unsupported`), and dispatch
-/// turns it into `CAPABILITY_UNSUPPORTED`.
+/// The return code of an AX scroll action is not the outcome: a live run
+/// returned `AXScrollDownByPage failed (-25205)` while the content had moved
+/// (AXTextArea y 622 -> 498). So every route is judged by an observable
+/// postcondition (`bridgeScrollEffect`):
+///
+///   1. the element's own `AXScroll<Dir>ByPage`; moved in the requested
+///      direction = done, the AX error kept as `ax_error`;
+///   2. otherwise, if the element has a settable scroll bar, its AXValue,
+///      measured again;
+///   3. no AX route at all -> `unsupported` (CAPABILITY_UNSUPPORTED);
+///      routes tried but no verifiable effect -> failure with the reason.
+///
+/// Never a scroll-wheel event, never a cursor move, never CGEvent.
 func uiScroll(_ params: [String: Any]) -> [String: Any] {
     guard let (_, el) = resolveElement(params: params) else {
         return ["ok": false, "message": "The referenced UI element is no longer on screen."]
@@ -1653,32 +1699,83 @@ func uiScroll(_ params: [String: Any]) -> [String: Any] {
     let role = (axAttr(el, kAXRoleAttribute) as? String) ?? "AXUnknown"
     let bar = axElement(el, direction.isVertical
         ? kAXVerticalScrollBarAttribute : kAXHorizontalScrollBarAttribute)
-    switch bridgeScrollPlan(
+    let barSettable = scrollBarSettable(bar)
+    let plan = bridgeScrollPlan(
         direction: direction, actions: actions, role: role,
-        hasScrollBar: bar != nil, scrollBarSettable: scrollBarSettable(bar)) {
-    case .pageAction(let name):
-        for _ in 0..<pages {
-            let err = AXUIElementPerformAction(el, name as CFString)
-            if err != .success {
-                return ["ok": false, "message": "\(name) failed (\(err.rawValue))"]
-            }
-        }
-        Thread.sleep(forTimeInterval: 0.15)
-        return ["ok": true, "message": "scrolled \(direction.rawValue) \(pages) page(s) via \(name)"]
-    case .scrollBarValue:
-        guard let bar else { return ["ok": false, "message": "scroll bar vanished"] }
-        let current = (axAttr(bar, kAXValueAttribute) as? NSNumber)?.doubleValue ?? 0
-        let target = bridgeScrollBarTarget(current: current, direction: direction, pages: pages)
-        let err = AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString, NSNumber(value: target))
-        if err != .success {
-            return ["ok": false, "message": "scroll bar AXValue failed (\(err.rawValue))"]
-        }
-        Thread.sleep(forTimeInterval: 0.15)
-        return ["ok": true, "message": String(format: "scrolled %@ via scroll bar %.2f -> %.2f", direction.rawValue, current, target)]
-    case .unsupported(let reason):
+        hasScrollBar: bar != nil, scrollBarSettable: barSettable)
+    if case .unsupported(let reason) = plan {
         return ["ok": false, "unsupported": true,
                 "message": "This element offers no accessibility scroll primitive; background mode will not post a scroll-wheel event.",
                 "detail": "reason=\(reason);role=\(role)"]
+    }
+
+    let initial = scrollProbe(el, direction: direction)
+    var attempts: [[String: Any]] = []
+    var step: BridgeScrollStep = .tryScrollBar
+    var current = initial
+
+    if case .pageAction(let name) = plan {
+        var firstError: Int32?
+        for _ in 0..<pages {
+            let err = AXUIElementPerformAction(el, name as CFString)
+            if err != .success && firstError == nil { firstError = err.rawValue }
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+        let after = scrollProbe(el, direction: direction)
+        let effect = bridgeScrollEffect(direction: direction, before: current, after: after)
+        var attempt: [String: Any] = [
+            "route": "page_action", "action": name, "effect": effect.rawValue,
+            "before": scrollProbeDictionary(current), "after": scrollProbeDictionary(after)]
+        if let firstError { attempt["ax_error"] = Int(firstError) }
+        attempts.append(attempt)
+        step = bridgeScrollAfterPageAction(
+            effect: effect, axError: firstError, scrollBarAvailable: bar != nil && barSettable)
+        current = after
+    }
+
+    if step == .tryScrollBar, let bar, barSettable {
+        let value = (axAttr(bar, kAXValueAttribute) as? NSNumber)?.doubleValue ?? 0
+        let target = bridgeScrollBarTarget(current: value, direction: direction, pages: pages)
+        let err = AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString, NSNumber(value: target))
+        Thread.sleep(forTimeInterval: 0.2)
+        let after = scrollProbe(el, direction: direction)
+        let effect = bridgeScrollEffect(direction: direction, before: current, after: after)
+        let axError: Int32? = err == .success ? nil : err.rawValue
+        var attempt: [String: Any] = [
+            "route": "scroll_bar", "target": target, "effect": effect.rawValue,
+            "before": scrollProbeDictionary(current), "after": scrollProbeDictionary(after)]
+        if let axError { attempt["ax_error"] = Int(axError) }
+        attempts.append(attempt)
+        step = bridgeScrollAfterScrollBar(effect: effect, axError: axError)
+        current = after
+    }
+
+    var scroll: [String: Any] = [
+        "direction": direction.rawValue, "pages": pages,
+        "before": scrollProbeDictionary(initial), "after": scrollProbeDictionary(current),
+        "attempts": attempts,
+    ]
+    switch step {
+    case .done(let route, let axError):
+        scroll["route"] = route
+        scroll["effect"] = "moved"
+        if let axError { scroll["ax_error"] = Int(axError) }
+        let note = axError.map { " (AX returned \($0); effect verified)" } ?? ""
+        return ["ok": true, "scroll": scroll,
+                "message": "scrolled \(direction.rawValue) \(pages) page(s) via \(route)\(note)"]
+    case .failed(let reason):
+        scroll["effect"] = reason
+        let errors = attempts.compactMap { $0["ax_error"] as? Int }.map { String($0) }.joined(separator: ",")
+        return ["ok": false, "scroll": scroll,
+                "message": "The scroll had no verifiable effect through accessibility.",
+                "detail": "reason=\(reason);role=\(role);routes=\(attempts.compactMap { $0["route"] as? String }.joined(separator: ","))"
+                    + (errors.isEmpty ? "" : ";ax_error=\(errors)")]
+    case .tryScrollBar:
+        // Page action without effect and no settable scroll bar is .failed
+        // above; reaching here means no route ran at all.
+        return ["ok": false, "unsupported": true, "scroll": scroll,
+                "message": "This element offers no accessibility scroll primitive; background mode will not post a scroll-wheel event.",
+                "detail": "reason=no_route;role=\(role)"]
     }
 }
 
@@ -2296,6 +2393,7 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 message: result["message"] as? String ?? "The action is not supported for this element.",
                 detail: "policy=\(mode.rawValue);kind=\(kind);" + (result["detail"] as? String ?? ""))
             error["interference"] = report.dictionary()
+            if let scroll = result["scroll"] { error["scroll"] = scroll }
             return (false, nil, error)
         }
         if result["ok"] as? Bool == true {
@@ -2307,8 +2405,10 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         // is evidence, not a decoration on success.
         var error = bridgeError(
             code: kind == "app.open" ? "COMPUTER_TARGET_UNAVAILABLE" : "ACTION_FAILED",
-            message: result["message"] as? String ?? "The computer action could not be executed.")
+            message: result["message"] as? String ?? "The computer action could not be executed.",
+            detail: (result["detail"] as? String).map { "policy=\(mode.rawValue);kind=\(kind);" + $0 } ?? "")
         error["interference"] = report.dictionary()
+        if let scroll = result["scroll"] { error["scroll"] = scroll }
         return (false, nil, error)
     default:
         return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "Unknown operation: \(operation)"))

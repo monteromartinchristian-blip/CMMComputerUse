@@ -510,6 +510,97 @@ public func bridgeScrollBarTarget(
     return max(0, min(1, current + sign * step))
 }
 
+// MARK: - Scroll postcondition
+
+/// What can be measured about a scroll position through accessibility only,
+/// along the axis of the requested direction.
+///
+/// - `barValue`: the scroll bar's AXValue (0…1, grows downward/rightward);
+///   the preferred indicator when the element has one.
+/// - `contentOrigin`: screen position (AX, top-left origin) of the scrolled
+///   content's first non-scroll-bar child; it moves the OPPOSITE way to the
+///   scroll (scrolling down moves content up, so y decreases).
+public struct BridgeScrollProbe: Equatable, Sendable {
+    public var barValue: Double?
+    public var contentOrigin: Double?
+
+    public init(barValue: Double? = nil, contentOrigin: Double? = nil) {
+        self.barValue = barValue
+        self.contentOrigin = contentOrigin
+    }
+
+    public var isMeasurable: Bool { barValue != nil || contentOrigin != nil }
+}
+
+public enum BridgeScrollEffect: String, Sendable {
+    case moved
+    case unchanged
+    case wrongDirection = "wrong_direction"
+    case unmeasurable
+}
+
+/// Did the scroll actually happen, in the requested direction?
+///
+/// The scroll bar value decides when both samples have it; otherwise the
+/// content position does. `barEpsilon` is in value units, `pointEpsilon` in
+/// points: sub-pixel noise is not a scroll.
+public func bridgeScrollEffect(
+    direction: BridgeScrollDirection, before: BridgeScrollProbe, after: BridgeScrollProbe,
+    barEpsilon: Double = 0.001, pointEpsilon: Double = 1.0
+) -> BridgeScrollEffect {
+    let forward = direction == .down || direction == .right
+    if let b = before.barValue, let a = after.barValue {
+        let delta = a - b
+        if abs(delta) <= barEpsilon { return .unchanged }
+        return (delta > 0) == forward ? .moved : .wrongDirection
+    }
+    if let b = before.contentOrigin, let a = after.contentOrigin {
+        let delta = a - b
+        if abs(delta) <= pointEpsilon { return .unchanged }
+        return (delta < 0) == forward ? .moved : .wrongDirection
+    }
+    return .unmeasurable
+}
+
+/// The next step of `ui.scroll`, decided from the measured effect.
+public enum BridgeScrollStep: Equatable, Sendable {
+    /// The scroll happened. `axError` is kept as a diagnostic when the AX
+    /// call reported an error although the effect is observable.
+    case done(route: String, axError: Int32?)
+    /// The page action had no verifiable effect; try the scroll bar value.
+    case tryScrollBar
+    /// No route produced a verifiable effect.
+    case failed(reason: String)
+}
+
+/// After the element's own page action: done when the effect is observable
+/// in the requested direction, whatever the AX return code said; otherwise
+/// the AX-only scroll bar fallback when there is one.
+public func bridgeScrollAfterPageAction(
+    effect: BridgeScrollEffect, axError: Int32?, scrollBarAvailable: Bool
+) -> BridgeScrollStep {
+    if effect == .moved { return .done(route: "page_action", axError: axError) }
+    if scrollBarAvailable { return .tryScrollBar }
+    return .failed(reason: bridgeScrollFailureReason(effect))
+}
+
+/// After setting the scroll bar value: done only when observable.
+public func bridgeScrollAfterScrollBar(
+    effect: BridgeScrollEffect, axError: Int32?
+) -> BridgeScrollStep {
+    if effect == .moved { return .done(route: "scroll_bar", axError: axError) }
+    return .failed(reason: bridgeScrollFailureReason(effect))
+}
+
+func bridgeScrollFailureReason(_ effect: BridgeScrollEffect) -> String {
+    switch effect {
+    case .moved: return "none"
+    case .unchanged: return "no_effect"
+    case .wrongDirection: return "wrong_direction"
+    case .unmeasurable: return "scroll_unverifiable"
+    }
+}
+
 public enum BridgeInterferenceVerdict: String, Sendable {
     case untouched
     case focusChanged = "focus_changed"

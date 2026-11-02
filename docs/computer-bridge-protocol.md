@@ -249,6 +249,17 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   → `CAPABILITY_UNSUPPORTED`
   `detail=…;reason=scroll_area_without_scrollbar|scrollbar_not_settable|not_scrollable|invalid_direction;role=…`.
   `AXScrollArea` elements are listed with `scrollable` / `scroll_unsupported`.
+  **Verified postcondition** (2026-11-02, after a live run where
+  `AXScrollDownByPage` returned -25205 although the content had moved): the
+  AX return code is not the outcome. The helper measures the scroll bar value
+  (preferred) or the content's first child position before and after. Moved
+  in the requested direction = success, any AX error kept as
+  `scroll.ax_error`; no effect after the page action = the AX-only scroll bar
+  fallback, measured again; no verifiable effect = `ACTION_FAILED`
+  `detail=…;reason=no_effect|wrong_direction|scroll_unverifiable;routes=…;ax_error=…`.
+  Success and failure carry `scroll = {route, effect, ax_error?, before,
+  after, attempts[]}` (`result.scroll` / `error.scroll`). Element-action
+  `ACTION_FAILED` frames now carry the helper's `detail`.
 - **Accessibility tree materialization.** When the observed window has fewer
   than 24 AX nodes, the helper sets `AXManualAccessibility=true` on the
   (already `observe`-authorized) application element — the attribute Electron

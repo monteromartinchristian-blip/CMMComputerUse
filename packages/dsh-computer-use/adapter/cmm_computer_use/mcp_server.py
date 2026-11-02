@@ -764,6 +764,7 @@ def _render_action(kind: str, result: Any) -> "tuple":
     if not isinstance(result, dict):
         return "%s: done" % kind, False
     lines = ["%s: %s" % (kind, result.get("message", "done"))]
+    lines.extend(_render_scroll(result.get("scroll")))
     interference = result.get("interference")
     lines.extend(_render_interference(interference))
     if isinstance(interference, dict) and interference.get("breach"):
@@ -782,6 +783,34 @@ def _render_action(kind: str, result: Any) -> "tuple":
         )
         return "\n".join(lines), True
     return "\n".join(lines), False
+
+
+def _probe_text(probe: Any) -> str:
+    if not isinstance(probe, dict) or not probe:
+        return "unmeasured"
+    parts = []
+    if "bar_value" in probe:
+        parts.append("bar=%.3f" % float(probe["bar_value"]))
+    if "content_origin" in probe:
+        parts.append("origin=%.0f" % float(probe["content_origin"]))
+    return ",".join(parts)
+
+
+def _render_scroll(scroll: Any) -> List[str]:
+    """`ui.scroll` evidence: the verdict is the MEASURED effect, not the AX
+    return code; an AX error next to `effect=moved` is a diagnostic."""
+
+    if not isinstance(scroll, dict):
+        return []
+    lines = ["scroll: route=%s effect=%s ax_error=%s before=%s after=%s" % (
+        scroll.get("route", "none"), scroll.get("effect"), scroll.get("ax_error", "none"),
+        _probe_text(scroll.get("before")), _probe_text(scroll.get("after")))]
+    for attempt in (scroll.get("attempts") or [])[:4]:
+        if isinstance(attempt, dict):
+            lines.append("- attempt %s: effect=%s ax_error=%s %s -> %s" % (
+                attempt.get("route"), attempt.get("effect"), attempt.get("ax_error", "none"),
+                _probe_text(attempt.get("before")), _probe_text(attempt.get("after"))))
+    return lines
 
 
 def _render_interference(interference: Any) -> List[str]:
@@ -852,6 +881,7 @@ def _render_refusal(error: BridgeError) -> Dict[str, Any]:
             (" [%s]" % error.detail) if error.detail else "",
         )
     ]
+    lines.extend(_render_scroll(getattr(error, "scroll", None)))
     interference = getattr(error, "interference", None)
     lines.extend(_render_interference(interference))
     if isinstance(interference, dict) and interference.get("breach"):

@@ -153,12 +153,16 @@ class BridgeError(Exception):
         code: str = "ACTION_FAILED",
         detail: str = "",
         interference: Optional[Dict[str, Any]] = None,
+        scroll: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.code = code if code in ERROR_CODES else "ACTION_FAILED"
         self.detail = detail
         self.interference = interference if isinstance(interference, dict) else None
+        #: `ui.scroll` evidence (routes tried, measured before/after, AX errors)
+        #: when the helper attached it to a failure.
+        self.scroll = scroll if isinstance(scroll, dict) else None
 
     def as_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -358,11 +362,13 @@ class BridgeClient:
         message = error.get("message") if isinstance(error, dict) else None
         detail = error.get("detail") if isinstance(error, dict) else ""
         interference = error.get("interference") if isinstance(error, dict) else None
+        scroll = error.get("scroll") if isinstance(error, dict) else None
         raise BridgeError(
             str(message or "The computer bridge refused %s." % operation),
             code=str(code or "ACTION_FAILED"),
             detail=str(detail or "")[:500],
             interference=interference,
+            scroll=scroll,
         )
 
     # ── contract ──────────────────────────────────────────────────────
