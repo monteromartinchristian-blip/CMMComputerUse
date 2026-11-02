@@ -225,14 +225,16 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   window (`CGWindowListCopyWindowInfo`, no title or pixels). Any reading that
   names the target counts. An unreadable reading is "unknown", never a
   transition.
-- **Fail closed.** A breach turns the call into
-  `INTERFERENCE_BREACH` (`detail=policy=…;reason=breach;kind=…;action_ok=…`,
-  ledger in `error.interference`), even when the action itself "succeeded";
-  the helper asks the person's previous frontmost app back
-  (`interference.focus_restore = {attempted, accepted, succeeded,
-  frontmost_now}`, best effort, as measured) and **latches** the target:
-  later control actions on it answer `ACTION_FAILED`
-  `detail=policy=…;reason=breach;target=<bundle>` until the helper restarts.
+- **Fail closed and stop.** A breach turns the call into
+  `INTERFERENCE_BREACH`
+  (`detail=policy=…;reason=breach;kind=…;action_ok=…;breach_id=<uuid>`, ledger
+  in `error.interference`), even when the action itself "succeeded". The
+  helper does **not** re-activate the person's previous application: that
+  would be a second interference caused by Computer Use. It **latches** the
+  target durably (see "Breach latch" below): later control actions on it
+  answer `ACTION_FAILED`
+  `detail=policy=…;reason=breach;target=<bundle>;breach_id=<uuid>` until CMM
+  Console rearms it. A restart does not clear it.
 - **Window controls refused up front.** `ui.press` on an element whose subrole
   is `AXCloseButton`, `AXMinimizeButton`, `AXZoomButton` or
   `AXFullScreenButton` answers `CAPABILITY_UNSUPPORTED`
@@ -258,7 +260,45 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
 - New ledger fields: `window_raised_over_person`, `target_front_at_ms`
   (offset of the first sample with the target in front), `observed_for_ms`.
   New `bridge.ping` capabilities: `post_action_settle`, `breach_fail_closed`,
-  `window_chrome_guard`, `ax_scroll`, `ax_tree_enrichment`.
+  `window_chrome_guard`, `ax_scroll`, `ax_tree_enrichment`,
+  `breach_latch: "persistent"`, `breach_rearm`.
+
+### Breach latch and `breach.rearm`
+
+State lives next to the policy file (so `--policy-file` lanes are isolated):
+
+- `breach-latch.json` (0600): `{"version":1,"breaches":[{id, target_bundle,
+  target_name, client_id, kind, policy, at, verdict, focus_became_target,
+  window_raised_over_person, target_front_at_ms?}]}`. No window titles, no
+  element text. Missing file = nothing latched. **Unreadable or malformed =
+  every control action refused** (`reason=breach_latch_invalid;cause=…`).
+- `breach-audit.jsonl` (0600, append-only): one line per `latched`,
+  `latch_write_failed`, `rearmed`, `rearm_refused`, `reset_invalid`,
+  `cleared_outside_console` (a breach that vanished from the file without a
+  rearm, detected on `policy.reload`). Lines carry `actor_client_id` and
+  `actor_signing_id` (the peer's code-signing identifier) and the reason.
+
+| Operation | Arguments | Result |
+|---|---|---|
+| `breach.status` | `{}` | `{state: ok\|invalid, invalid_reason?, breaches[], latch_path, audit_path, rearm}` — diagnostics, no client needed (like `policy.status`) |
+| `breach.rearm` | `{breach_id, reason}` or `{reset_invalid_state: true, reason}` | `{rearmed, audit}` / `{reset, audit}` |
+
+`breach.rearm` is accepted only when ALL hold, else `APPROVAL_REJECTED` /
+`ACTION_FAILED` with the `detail` shown:
+
+1. the policy is version 2 (`auth=rearm_requires_client_identity`);
+2. the peer matched a client by code signature (`auth=client_not_authorized`);
+3. that client's entry has `"admin": ["breach.rearm"]` (`auth=rearm_not_granted`);
+4. it is not the client whose action caused the breach (`auth=self_rearm_not_permitted`);
+5. `reason` is non-empty after sanitizing, ≤ 500 chars (`reason=rearm_reason_missing`);
+6. `breach_id` names an open breach (`reason=breach_id_missing|unknown_breach`);
+   `reset_invalid_state` only when the file is invalid (`reason=latch_state_valid`).
+
+The rearm is written to disk BEFORE it takes effect; if the write fails the
+breach stays latched (`reason=latch_write_failed`). The MCP adapter has no
+tool and no client method that issues `breach.rearm`; `computer_use_status`
+only lists open latches. A DSH session that recorded a breach stays denied
+for that session even after a rearm; a new session starts clean.
 
 ## Per-application authorization (deny by default)
 

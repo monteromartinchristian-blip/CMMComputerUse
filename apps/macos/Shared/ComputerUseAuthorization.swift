@@ -123,15 +123,21 @@ public struct BridgeClientGrant: Equatable, Sendable {
     /// can do nothing with one.
     public var apps: [String]
     public var scopes: Set<BridgeScope>
+    /// Administrative operations this client may issue (`"admin"` in the
+    /// policy), from the closed set `bridgeAdminOperations`. Empty by default:
+    /// an agent client is never an administrator unless the policy says so.
+    public var adminOperations: Set<String>
 
     public init(
         clientID: String, requirement: String,
-        apps: [String] = [], scopes: Set<BridgeScope> = []
+        apps: [String] = [], scopes: Set<BridgeScope> = [],
+        adminOperations: Set<String> = []
     ) {
         self.clientID = clientID
         self.requirement = requirement
         self.apps = apps
         self.scopes = scopes
+        self.adminOperations = adminOperations
     }
 
     /// Does this client cover that application? Exact bundle id or exact display
@@ -260,8 +266,18 @@ public struct BridgeAuthorizationPolicy: Equatable, Sendable {
                 scopes.insert(scope)
             }
         }
+        var admin: Set<String> = []
+        if let rawAdmin = client["admin"] {
+            guard let list = rawAdmin as? [String] else { return nil }
+            for entry in list {
+                // Closed set: a typo must not silently grant (or drop) authority.
+                guard bridgeAdminOperations.contains(entry) else { return nil }
+                admin.insert(entry)
+            }
+        }
         return BridgeClientGrant(
-            clientID: identifier, requirement: requirement, apps: apps, scopes: scopes)
+            clientID: identifier, requirement: requirement, apps: apps, scopes: scopes,
+            adminOperations: admin)
     }
 
     private static func parseGrant(_ app: [String: Any]) -> BridgeAppGrant? {

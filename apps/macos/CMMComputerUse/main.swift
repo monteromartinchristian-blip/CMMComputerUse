@@ -152,11 +152,10 @@ nonisolated(unsafe) var elementRoles: [Int: String] = [:]
 /// AX subrole per element id, captured with the role: it is what identifies
 /// window controls (AXZoomButton, …) that background mode never presses.
 nonisolated(unsafe) var elementSubroles: [Int: String] = [:]
-/// Target bundles that produced a verified interference breach in a
-/// no-interference mode since this helper started. Control actions against
-/// them are refused until the helper restarts (an operator act): fail-closed,
-/// and independent of any client-side latch.
-nonisolated(unsafe) var breachLatchedTargets: Set<String> = []
+/// Open breaches (Shared/ComputerUseBreachLatch.swift). Persisted next to the
+/// policy file, loaded at start and on `policy.reload`; a restart does NOT
+/// clear it. Only `breach.rearm` from an administrator client does.
+nonisolated(unsafe) var breachLatch: BridgeBreachLatchLoad = .loaded(BridgeBreachLatchState())
 /// What each handle is bound to (application, process, window). Cleared with
 /// the element table; re-validated before every action.
 nonisolated(unsafe) var elementContexts: [Int: BridgeElementContext] = [:]
@@ -240,6 +239,152 @@ func currentEnvironment(origin: Double? = nil) -> BridgeEnvironment {
         focusedBundle: AXIsProcessTrusted() ? axFocusedApplicationBundle() : "",
         topWindowBundle: topWindowOwnerBundle(),
         t: origin.map { now - $0 } ?? 0)
+}
+
+// MARK: - Breach latch persistence and audit
+
+/// Same directory as the policy file, so an isolated verification lane
+/// (`--policy-file`) gets an isolated latch too.
+func breachStateDirectory() -> URL {
+    URL(fileURLWithPath: policyFilePath()).deletingLastPathComponent()
+}
+func breachLatchPath() -> URL { breachStateDirectory().appendingPathComponent("breach-latch.json") }
+func breachAuditPath() -> URL { breachStateDirectory().appendingPathComponent("breach-audit.jsonl") }
+
+func loadBreachLatchFromDisk() -> BridgeBreachLatchLoad {
+    let path = breachLatchPath().path
+    guard FileManager.default.fileExists(atPath: path) else {
+        return bridgeLoadBreachLatch(data: nil)
+    }
+    guard let data = FileManager.default.contents(atPath: path) else {
+        return .invalid(reason: "unreadable")
+    }
+    return bridgeLoadBreachLatch(data: data)
+}
+
+/// Atomic write, owner-only. Returns false when the latch could not be made
+/// durable; the in-memory latch still holds (fail closed) and the failure is
+/// audited.
+@discardableResult
+func saveBreachLatch(_ state: BridgeBreachLatchState) -> Bool {
+    let url = breachLatchPath()
+    do {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try state.encoded().write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return true
+    } catch {
+        log("breach latch write failed: \(error.localizedDescription)")
+        return false
+    }
+}
+
+/// Append one line to the audit log (append-only, owner-only).
+func appendBreachAudit(_ entry: [String: Any]) {
+    let url = breachAuditPath()
+    guard var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
+    line.append(0x0A)
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: url.path) {
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                attributes: [.posixPermissions: 0o700])
+        fm.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+    }
+    guard let handle = FileHandle(forWritingAtPath: url.path) else {
+        log("breach audit unavailable: \(url.path)")
+        return
+    }
+    defer { try? handle.close() }
+    handle.seekToEndOfFile()
+    handle.write(line)
+}
+
+/// Reload the latch from disk, auditing breaches that vanished without a
+/// rearm (the file was edited or deleted by hand).
+func reloadBreachLatch() {
+    let previous = breachLatch.state
+    breachLatch = loadBreachLatchFromDisk()
+    if let previous, let current = breachLatch.state {
+        for record in bridgeBreachesClearedOutside(before: previous, after: current) {
+            appendBreachAudit(bridgeBreachAuditEntry(
+                event: "cleared_outside_console", at: Date().timeIntervalSince1970,
+                record: record, actorClientID: nil, actorSigningID: nil, reason: nil))
+            log("breach \(record.id) for \(record.targetBundle) cleared outside breach.rearm")
+        }
+    }
+    if case .invalid(let reason) = breachLatch {
+        log("breach latch invalid (\(reason)): control suspended until reset from CMM Console")
+    }
+}
+
+func breachStatus() -> [String: Any] {
+    var result: [String: Any] = [
+        "latch_path": breachLatchPath().path,
+        "audit_path": breachAuditPath().path,
+        "rearm": "breach.rearm from a v2 client granted admin [\"breach.rearm\"]",
+    ]
+    switch breachLatch {
+    case .loaded(let state):
+        result["state"] = "ok"
+        result["breaches"] = state.records.map { $0.dictionary() }
+    case .invalid(let reason):
+        result["state"] = "invalid"
+        result["invalid_reason"] = reason
+        result["breaches"] = [[String: Any]]()
+    }
+    return result
+}
+
+/// `breach.rearm`: the explicit, audited unlock. Never reachable from the
+/// adapter's tool catalog; CMM Console calls it with its own signed identity.
+func breachRearm(arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    let decision = bridgeRearmDecision(
+        arguments: arguments, client: currentClient,
+        clientAuthorization: authorization.clientAuthorization, load: breachLatch)
+    let now = Date().timeIntervalSince1970
+    let actor = currentClient?.clientID
+    let signing = currentPeer?.identifier
+    switch decision {
+    case .refused(let refusal):
+        appendBreachAudit(bridgeBreachAuditEntry(
+            event: "rearm_refused", at: now, record: nil, actorClientID: actor,
+            actorSigningID: signing, reason: nil, extra: ["detail": refusal.detail]))
+        return (false, nil, refusalFrame(refusal))
+    case .resetInvalid(let reason):
+        let empty = BridgeBreachLatchState()
+        guard saveBreachLatch(empty) else {
+            return (false, nil, bridgeError(code: "ACTION_FAILED",
+                message: "The latch file could not be rewritten.", detail: "reason=latch_write_failed"))
+        }
+        breachLatch = .loaded(empty)
+        let entry = bridgeBreachAuditEntry(
+            event: "reset_invalid", at: now, record: nil, actorClientID: actor,
+            actorSigningID: signing, reason: reason)
+        appendBreachAudit(entry)
+        log("breach latch reset by \(actor ?? "?")")
+        return (true, ["reset": true, "audit": entry], nil)
+    case .rearm(let record, let reason):
+        guard var state = breachLatch.state else {
+            return (false, nil, bridgeError(code: "ACTION_FAILED",
+                message: "The latch file cannot be read.", detail: "reason=breach_latch_invalid"))
+        }
+        state.remove(id: record.id)
+        guard saveBreachLatch(state) else {
+            // Not durable means not rearmed: the breach stays latched.
+            return (false, nil, bridgeError(code: "ACTION_FAILED",
+                message: "The rearm could not be written; the breach stays latched.",
+                detail: "reason=latch_write_failed;breach_id=\(record.id)"))
+        }
+        breachLatch = .loaded(state)
+        let entry = bridgeBreachAuditEntry(
+            event: "rearmed", at: now, record: record, actorClientID: actor,
+            actorSigningID: signing, reason: reason)
+        appendBreachAudit(entry)
+        log("breach \(record.id) for \(record.targetBundle) rearmed by \(actor ?? "?")")
+        return (true, ["rearmed": record.dictionary(), "audit": entry], nil)
+    }
 }
 
 /// Resolve the per-request mode, narrowing the deployment's own mode with it.
@@ -1188,6 +1333,7 @@ func authorizationStatus() -> [String: Any] {
                 "client_id": client.clientID,
                 "apps": client.apps.count,
                 "scopes": client.scopes.map { $0.rawValue }.sorted(),
+                "admin": client.adminOperations.sorted(),
                 // The requirement text is policy, not a secret, but it is also
                 // long; a host gets its digest and the load-time verdict instead.
                 "requirement_present": !client.requirement.isEmpty,
@@ -1797,37 +1943,6 @@ func elementChromeRefusal(
     return bridgeWindowChromeRefusal(kind: kind, subrole: subrole, mode: mode)
 }
 
-/// After a breach, ask the application the person had in front to come back.
-///
-/// Best effort and reported as measured: macOS may decline an activation
-/// requested by a process that is not itself active. Only ever the person's
-/// OWN previous application, never a guess, and never when the target was
-/// already in front before the action.
-func restorePersonFocus(
-    before: BridgeEnvironment, targetBundle: String?, origin: Double
-) -> [String: Any] {
-    let previousBundle = before.frontmostBundle
-    guard !previousBundle.isEmpty, let targetBundle,
-          previousBundle.lowercased() != targetBundle.lowercased(),
-          let previous = NSRunningApplication.runningApplications(
-              withBundleIdentifier: previousBundle).first
-    else { return ["attempted": false] }
-    let accepted = previous.activate()
-    let deadline = ProcessInfo.processInfo.systemUptime + 1.0
-    var now = currentEnvironment(origin: origin)
-    while ProcessInfo.processInfo.systemUptime < deadline,
-          !(now.frontmostBundle == previousBundle && now.focusedBundle != targetBundle) {
-        Thread.sleep(forTimeInterval: 0.05)
-        now = currentEnvironment(origin: origin)
-    }
-    return [
-        "attempted": true,
-        "accepted": accepted,
-        "frontmost_now": now.frontmostApp,
-        "succeeded": now.frontmostBundle == previousBundle,
-    ]
-}
-
 /// The cached-frame read, factored out of `dispatch`.
 ///
 /// The socket path serves this WITHOUT the global dispatch lock. It touches no
@@ -1907,6 +2022,10 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 "window_chrome_guard": true,
                 "ax_scroll": true,
                 "ax_tree_enrichment": true,
+                // Breaches latch durably (survive restart) and are cleared only
+                // by an audited `breach.rearm` from an admin client.
+                "breach_latch": "persistent",
+                "breach_rearm": true,
                 // A live window stream (ScreenCaptureKit SCStream). The host
                 // uses this to decide between the mirror and the per-request
                 // capture fallback instead of discovering it by failing.
@@ -1927,6 +2046,11 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         ], nil)
     case "policy.status":
         return (true, authorizationStatus(), nil)
+    case "breach.status":
+        // Diagnostics, like policy.status: which targets are suspended and why.
+        return (true, breachStatus(), nil)
+    case "breach.rearm":
+        return breachRearm(arguments: arguments)
     case "policy.requirements.check":
         // Read-only: compiles requirement strings and evaluates them against
         // code objects. It cannot write, reload or grant anything, which is why
@@ -1939,6 +2063,7 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         // process was launched with.
         authorization = loadAuthorizationPolicy()
         applyDeploymentModes()
+        reloadBreachLatch()
         return (true, authorizationStatus(), nil)
     case "permissions.status":
         return (true, permissionStatus(), nil)
@@ -2083,14 +2208,15 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
             log("refused \(kind) window chrome")
             return (false, nil, refusalFrame(refusal))
         }
-        if mode.promisesNoInterference, let targetBundle,
-           breachLatchedTargets.contains(targetBundle.lowercased()),
-           bridgeActionClass(kind: kind) == .accessibility, kind != "wait", kind != "finish" {
-            log("refused \(kind) breach latch target=\(targetBundle)")
-            return (false, nil, bridgeError(
-                code: "ACTION_FAILED",
-                message: "An earlier action on this application took the person's focus; control is suspended until the helper is restarted.",
-                detail: "policy=\(mode.rawValue);reason=breach;target=\(targetBundle)"))
+        // The latch is persistent and independent of the mode a request asks
+        // for: a target that breached stays suspended until CMM Console rearms
+        // it. A latch file that cannot be trusted suspends ALL control.
+        let isControl = bridgeActionClass(kind: kind) == .accessibility
+            && kind != "wait" && kind != "finish"
+        if let refusal = bridgeLatchRefusal(
+            load: breachLatch, targetBundle: targetBundle, isControl: isControl, mode: mode) {
+            log("refused \(kind) breach latch: \(refusal.detail)")
+            return (false, nil, refusalFrame(refusal))
         }
         let actionClass = bridgeActionClass(kind: kind) ?? .accessibility
         let origin = ProcessInfo.processInfo.systemUptime
@@ -2119,20 +2245,40 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
             actionClass: actionClass, mode: mode,
             targetBundle: targetBundle)
         if report.breach {
-            // The action ran; the promise did not hold. FAIL CLOSED: the call
-            // is reported as a failure (never as success with a footnote), the
-            // target is latched, and the person's own application is asked
-            // back to the front.
+            // The action ran; the promise did not hold. FAIL CLOSED and STOP:
+            // the call is a failure (never success with a footnote) and the
+            // target is latched, durably and audited. Nothing is activated to
+            // "undo" it: re-activating the person's previous application would
+            // be a second interference caused by Computer Use.
             log("INTERFERENCE_BREACH kind=\(kind) verdict=\(report.verdict.rawValue) transient=\(report.transientFocusChanges) restored=\(report.restored) before=\(report.frontmostBefore) after=\(report.frontmostAfter) target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-") observed_for_ms=\(report.observedForMs)")
-            if let targetBundle { breachLatchedTargets.insert(targetBundle.lowercased()) }
-            var ledger = report.dictionary()
-            ledger["focus_restore"] = restorePersonFocus(
-                before: before, targetBundle: targetBundle, origin: origin)
+            var breachID = ""
+            if let targetBundle {
+                let record = BridgeBreachRecord(
+                    id: UUID().uuidString.lowercased(), targetBundle: targetBundle,
+                    targetName: (params["element_id"] as? NSNumber)
+                        .flatMap { elementContexts[$0.intValue]?.appName } ?? "",
+                    clientID: currentClient?.clientID ?? "", kind: kind, policy: mode.rawValue,
+                    at: Date().timeIntervalSince1970, verdict: report.verdict.rawValue,
+                    focusBecameTarget: report.focusBecameTarget,
+                    windowRaisedOverPerson: report.windowRaisedOverPerson,
+                    targetFrontAtMs: report.targetFrontAtMs)
+                breachID = record.id
+                // An invalid latch already suspends everything; keep it invalid.
+                if var state = breachLatch.state {
+                    state.latch(record)
+                    breachLatch = .loaded(state)
+                    let durable = saveBreachLatch(state)
+                    appendBreachAudit(bridgeBreachAuditEntry(
+                        event: durable ? "latched" : "latch_write_failed",
+                        at: record.at, record: record, actorClientID: record.clientID,
+                        actorSigningID: currentPeer?.identifier, reason: nil))
+                }
+            }
             var error = bridgeError(
                 code: "INTERFERENCE_BREACH",
-                message: "The action brought the target application in front of the person's work in a mode that promised no interference.",
-                detail: "policy=\(mode.rawValue);reason=breach;kind=\(kind);action_ok=\(result["ok"] as? Bool == true)")
-            error["interference"] = ledger
+                message: "The action brought the target application in front of the person's work in a mode that promised no interference. Control of it is suspended until CMM Console rearms it.",
+                detail: "policy=\(mode.rawValue);reason=breach;kind=\(kind);action_ok=\(result["ok"] as? Bool == true)" + (breachID.isEmpty ? "" : ";breach_id=\(breachID)"))
+            error["interference"] = report.dictionary()
             return (false, nil, error)
         }
         if result["unsupported"] as? Bool == true {
@@ -2549,6 +2695,7 @@ func parseLaunchArguments() -> (
 launchMode = launchArguments.mode
 authorization = loadAuthorizationPolicy()
 applyDeploymentModes()
+reloadBreachLatch()
 log("policy=\(deploymentMode.rawValue) launch=\(launchMode.rawValue) authorization_apps=\(authorization.grants.count) loaded=\(authorization.loaded)")
 
 warmWindowServerConnection()

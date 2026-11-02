@@ -16,8 +16,9 @@
 #   scripts/verification/live-background-e2e.sh [--electron-app <bundle>] [--breach-control]
 #
 # --breach-control presses the fixture's self-activating button. The helper then
-# latches the fixture until it is restarted: run it last, then restart the
-# helper (launchctl kickstart -k gui/$UID/<label>).
+# latches the fixture DURABLY (a restart does not clear it) until CMM Console
+# rearms it with `breach.rearm` (docs/architecture/
+# CMM-Console-Breach-Rearm-Cambio-Requerido-20261102.md). Run it last.
 set -euo pipefail
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "macOS only" >&2; exit 2; }

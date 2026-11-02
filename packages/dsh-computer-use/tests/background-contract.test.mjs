@@ -104,12 +104,21 @@ test('a window ordered over the person (no activation) is also a verified breach
   assert.equal(s.ledger.window_raised_over_person, true);
 });
 
-test('the helper latch refusal (reason=breach) latches DSH too', () => {
+test('the helper latch refusal (reason=breach, breach_id) latches DSH too', () => {
   const r = adapterRefusal('ACTION_FAILED',
-    'An earlier action on this application took the person\'s focus; control is suspended until the helper is restarted.',
-    `policy=background;reason=breach;target=${CLAUDE}`, null);
+    'An earlier action on this application took the person\'s focus; control is suspended until it is rearmed from CMM Console.',
+    `policy=background;reason=breach;target=${CLAUDE};breach_id=0b8c6a3e-1f2d-4c5b-9a7e-2d1c0b9a8f7e`, null);
   const s = result(call(ready(), 'press', {element_id: 1, snapshot: 5}), r.text, true);
   assert.equal(s.breach, true);
+});
+
+test('an invalid latch file is a refusal, not a session breach', () => {
+  const r = adapterRefusal('ACTION_FAILED',
+    'The breach latch file cannot be read; control is suspended until CMM Console resets it.',
+    'policy=background;reason=breach_latch_invalid;cause=not_json', null);
+  const s = result(call(ready(), 'press', {element_id: 1, snapshot: 5}), r.text, true);
+  assert.equal(s.breach, false);
+  assert.equal(s.error, 'breach_latch_invalid');
 });
 
 test('an untouched ledger is not a breach, and a non-breach failure is not latched', () => {

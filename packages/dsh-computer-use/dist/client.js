@@ -252,7 +252,7 @@ function fold(state, event) {
     && /^STOP: breach recorded(?: on a failed action)? \(policy=background\)\. Do not retry(?: this action; report it and let the operator review the ledger\.|; report it and let the operator review the ledger\.)$/m.test(text);
   // The helper's own latch: it refuses a target that already breached.
   const latchedBreach=action && msg.isError === true
-    && /^REFUSED ACTION_FAILED: [^\n]*\[policy=background;reason=breach;target=[\w.-]+\]$/m.test(text);
+    && /^REFUSED ACTION_FAILED: [^\n]*\[policy=\w+;reason=breach;target=[\w.-]+(?:;breach_id=[\w-]+)?\]$/m.test(text);
   if (verifiedBreach||latchedBreach) return {...next,breach:true,target:null,frame:null,error:'BREACH',
     attempt:{name:call.name,at:next.lastAt,failed:true,code:'BREACH'}};
   if(state.breach) return next;
@@ -260,7 +260,7 @@ function fold(state, event) {
   if(call.revision!==state.revision&&call.name!=='status')return {...state,pending};
   if(msg.isError || /^REFUSED /m.test(text)) {
     const code=text.match(/^REFUSED ([A-Z_]+)/m)?.[1];
-    const reason=text.match(/(?:^|[; =])reason=(app_not_granted|window_changed|pid_changed|expired|global_input_not_scoped|breach)(?:[; \n\]]|$)/m)?.[1];
+    const reason=text.match(/(?:^|[; =])reason=(app_not_granted|window_changed|pid_changed|expired|global_input_not_scoped|breach_latch_invalid|breach)(?:[; \n\]]|$)/m)?.[1];
     const known=['APPROVAL_REJECTED','ACTION_FAILED','CAPABILITY_UNSUPPORTED','TIMEOUT','UNAVAILABLE','COMPUTER_RUNTIME_UNAVAILABLE','COMPUTER_PERMISSION_DENIED','COMPUTER_TARGET_UNAVAILABLE','INTERFERENCE_BREACH'];
     const statusFailure=call.name==='status';
     const failure=reason||(known.includes(code)?code:'REFUSED');

@@ -56,6 +56,7 @@ The audit token is used rather than the pid because a pid can be recycled betwee
 | `requirement` | Code-signing designated requirement. The only load-bearing field. |
 | `apps` | Exact bundle ids or exact display names. **Empty means none.** |
 | `scopes` | `observe` and/or `control`. |
+| `admin` | Optional administrative operations, closed set: `["breach.rearm"]`. Grant it to CMM Console only, never to an agent client. An unknown value refuses the whole document. |
 
 Enforcement is the intersection:
 

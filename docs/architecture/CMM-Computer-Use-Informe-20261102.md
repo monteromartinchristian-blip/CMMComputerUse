@@ -60,11 +60,18 @@ Corrección (`apps/macos/Shared/ComputerUsePolicy.swift`, `main.swift`):
   layer-0 más frontal (`CGWindowList`, sin títulos ni píxeles). Cualquiera que
   nombre al target cuenta; una lectura ilegible es "desconocida", no transición.
 - **Ventana elevada sin activación** (`window_raised_over_person`) también es breach.
-- **Fail-closed**: un breach devuelve `INTERFERENCE_BREACH` aunque la acción
-  "funcionara"; intento medido de devolver el foco a la app previa
-  (`focus_restore`); **latch en el helper** por bundle hasta reinicio
-  (`reason=breach`); **latch sticky en DSH** (ya existía; ahora también por
-  ventana elevada y por el latch del helper).
+- **Fail-closed y stop**: un breach devuelve `INTERFERENCE_BREACH` aunque la
+  acción "funcionara". **No** se reactiva la app anterior (decisión del
+  usuario, 2.ª iteración: sería una segunda interferencia de Computer Use).
+- **Latch persistente y auditable** (2.ª iteración): `breach-latch.json` junto a
+  la política, sobrevive al reinicio; sólo `breach.rearm` desde un cliente v2
+  identificado por firma con `admin: ["breach.rearm"]` (CMM Console), con
+  motivo, y nunca el cliente que causó el breach; auditoría append-only en
+  `breach-audit.jsonl`; archivo corrupto ⇒ se suspende todo control. El lado
+  Console está **pendiente**: ver
+  `CMM-Console-Breach-Rearm-Cambio-Requerido-20261102.md`.
+- **Latch sticky en DSH** por sesión (ya existía; ahora también por ventana
+  elevada y por el latch del helper, con `breach_id`).
 - Nuevos campos: `target_front_at_ms`, `observed_for_ms`.
 
 **Controles de ventana**: sí, deben rechazarse preventivamente. Zoom y pantalla
@@ -126,14 +133,22 @@ Adaptador / plugin:
 
 Verificación LIVE: `scripts/verification/{live-background-e2e.sh,live_background_e2e.py,focus-monitor.swift}`, `examples/fixture/main.swift`.
 
+2.ª iteración (B y C): `apps/macos/Shared/ComputerUseBreachLatch.swift` (nuevo),
+`apps/macos/Shared/ComputerUseAuthorization.swift` (`admin`),
+`apps/macos/CMMComputerUseTests/BreachLatchTests.swift` (nuevo),
+`scripts/verification/check-helper-source.py` (nuevo), `scripts/build-helper.sh`,
+`docs/client-authentication.md`, `docs/architecture/CMM-Console-Breach-Rearm-Cambio-Requerido-20261102.md`,
+`docs/architecture/CMM-Computer-Use-Validacion-Mac-20261102.md`.
+
 Docs: `docs/computer-bridge-protocol.md`, `docs/architecture.md`, `packages/dsh-computer-use/README.md`, `CHANGELOG.md`, `packages/dsh-computer-use/CHANGELOG.md`, este informe, el documento de CMM Skills.
 
 ## 3. Tests ejecutados (Linux, esta sesión)
 
 | Suite | Resultado |
 |---|---|
-| `node --test tests/*.test.mjs` | **105/105** (94 previos + 11 nuevos) |
-| Adaptador `python3 -m unittest discover -s tests` | **68/68** (61 previos + 7 nuevos) |
+| `node --test tests/*.test.mjs` | **106/106** (94 previos + 12 nuevos) |
+| Adaptador `python3 -m unittest discover -s tests` | **70/70** (61 previos + 9 nuevos) |
+| `scripts/verification/check-helper-source.py` | **8/8** (y detecta un `activate()` insertado a propósito) |
 | `node scripts/verify-manifest.mjs` | **OK** (fallaba en el snapshot por `dist` obsoleto) |
 | Mutación: romper la regex de breach por ventana elevada | 1 test falla, como debe |
 | `tests/test_patch.py` | **no ejecutable**: necesita `/usr/bin/ruby` (falla igual en el snapshot) |
@@ -142,6 +157,10 @@ Docs: `docs/computer-bridge-protocol.md`, `docs/architecture.md`, `packages/dsh-
 
 Los tests de breach del lado DSH usan el **texto renderizado por el adaptador
 Python real**, no copias: el acoplamiento regex↔redacción está probado.
+
+El orden de validación en el Mac está en
+`CMM-Computer-Use-Validacion-Mac-20261102.md` (Node/Python/manifest →
+XcodeGen + Swift 6 + XCTest → build staged sin instalar → sólo entonces LIVE).
 
 ## 4. Evidencia LIVE
 
@@ -174,9 +193,12 @@ visto también por el testigo. Requiere política con
    a propósito); el testigo independiente lo detectaría.
 3. **Falsos positivos de breach**: si la persona cambia a la app target durante
    la ventana de asentamiento, se atribuye a la acción y se latchea (sesgo
-   fail-closed deliberado). El latch del helper sólo se limpia reiniciándolo.
-4. **Restauración de foco** puede ser rechazada por la activación cooperativa de
-   macOS 14+; se informa medido, no se asume.
+   fail-closed deliberado). Ahora el latch es persistente: un falso positivo
+   exige un rearm desde Console.
+4. **Sin UX de desbloqueo todavía**: hasta que CMM Console implemente
+   `breach.rearm`, un breach real deja esa app sin control. Es deliberado (el
+   reinicio no desbloquea); el único escape es editar `breach-latch.json` a
+   mano, que queda auditado como `cleared_outside_console` al recargar.
 5. **Latencia**: cada acción tarda ≥ 0,8 s más; muestras más caras (AX +
    CGWindowList cada ~5 ms durante ≤ 2 s).
 6. **`AXManualAccessibility`** deja el árbol activo en la app target; no

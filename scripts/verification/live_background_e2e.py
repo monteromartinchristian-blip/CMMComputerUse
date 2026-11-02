@@ -160,7 +160,7 @@ def main() -> int:
     parser.add_argument("--fixture-state", default=os.environ.get("CMM_CU_FIXTURE_STATE", ""))
     parser.add_argument("--electron-app", default="", help="e.g. com.anthropic.claudefordesktop")
     parser.add_argument("--breach-control", action="store_true",
-                        help="press the fixture's self-activating button (latches the fixture until helper restart)")
+                        help="press the fixture's self-activating button (latches the fixture until CMM Console rearms it)")
     parser.add_argument("--monitor", required=True, help="JSONL written by focus-monitor")
     parser.add_argument("--report", required=True)
     args = parser.parse_args()
@@ -252,6 +252,10 @@ def main() -> int:
                              {"element_id": trigger, "snapshot": snap}, quiet=False)
         checks["breach_latched"] = err2 and "reason=breach" in text2
         checks["dsh_latched"] = dsh_fold(d.transcript).get("breach") is True
+        checks["no_focus_restore"] = "focus_restore" not in text
+        status, _ = d.call("9d status shows latch", "computer_use_status", quiet=False)
+        checks["latch_visible"] = bool(re.search(r"^breach_latch: state=ok open=[1-9]", status, re.M)) \
+            and "rearm from CMM Console" in status
 
     # Let the witness cover the tail of the last step, then judge.
     time.sleep(TAIL + 0.2)

@@ -76,6 +76,7 @@ OPERATION_TIMEOUTS = {
     "apps.list": 10.0,
     "observation.describe": 20.0,
     "observation.release": 10.0,
+    "breach.status": 10.0,
     "observation.capture_screen": 30.0,
     "action.execute": 60.0,
 }
@@ -434,6 +435,13 @@ class BridgeClient:
         """The deployment's allowlist as diagnostics (never window content)."""
 
         return self.request("policy.status")
+
+    def breach_status(self) -> Any:
+        """Open breach latches, read-only. There is deliberately no rearm here:
+        clearing a latch is CMM Console's audited operation, under its own
+        signed identity, never the agent's."""
+
+        return self.request("breach.status")
 
     def reload_policy(self) -> Any:
         """Re-read the allowlist from disk (the user's own file)."""

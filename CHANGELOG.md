@@ -20,9 +20,10 @@ Fixes found in a live DeepSeek Harness session against Claude Desktop
   and read only the cached `NSWorkspace.frontmostApplication`. It now samples
   through a bounded post-action settle window (0.8–2 s) and reads the live AX
   focused application and the window server's front-most window too.
-- **A breach is fail-closed.** It returns `INTERFERENCE_BREACH` (never success
-  with a warning), asks the person's previous app back, and latches the target
-  in the helper until restart; DSH latches the session (stateVersion 10).
+- **A breach is fail-closed and stops.** It returns `INTERFERENCE_BREACH`
+  (never success with a warning) and does not re-activate anything. The target
+  is latched durably (`breach-latch.json`, survives restart) and audited
+  (`breach-audit.jsonl`); DSH latches the session (stateVersion 10).
 - PiP shows the observed application name (e.g. `Claude`), never the bundle
   id, for CMM Console grants without `name` (empty, NBSP, `windows=0`).
 - `dist/client.js` was stale against `runtime.mjs` in the snapshot
@@ -30,6 +31,9 @@ Fixes found in a live DeepSeek Harness session against Claude Desktop
 
 ### Added
 
+- `breach.status` and `breach.rearm`: the only unlock of a latched breach, for a
+  v2 client granted `"admin": ["breach.rearm"]` (CMM Console), with a reason,
+  never by the client that caused it. The Console side is not implemented yet.
 - `ui.scroll` / `computer_use_scroll`: accessibility-only scrolling (page
   action or scroll-bar value) or `CAPABILITY_UNSUPPORTED`. The global wheel
   tool is renamed `computer_use_pointer_scroll` (unrestricted only).

@@ -564,7 +564,34 @@ def _render_status(client: BridgeClient) -> str:
                 policy.get("policy_mode"),
             )
         )
+    lines.extend(_render_breach_latch(client))
     return "\n".join(lines)
+
+
+def _render_breach_latch(client: BridgeClient) -> List[str]:
+    """Open breaches, read-only. Rearming is CMM Console's, never the agent's:
+    this adapter has no tool and no client method that can clear a latch."""
+
+    read = getattr(client, "breach_status", None)
+    if read is None:
+        return []
+    try:
+        latch = _read_with_retry(read)
+    except BridgeError:
+        return []  # a helper without the latch endpoint
+    if not isinstance(latch, dict):
+        return []
+    breaches = latch.get("breaches") or []
+    lines = ["breach_latch: state=%s open=%d" % (latch.get("state"), len(breaches))]
+    for breach in breaches[:10]:
+        lines.append(
+            "- latched: %s [%s] breach_id=%s kind=%s — rearm from CMM Console"
+            % (breach.get("target_name") or breach.get("target_bundle"),
+               breach.get("target_bundle"), breach.get("id"), breach.get("kind"))
+        )
+    if latch.get("state") == "invalid":
+        lines.append("- all control suspended: the latch file is invalid; reset it from CMM Console")
+    return lines
 
 
 def _render_apps(result: Any) -> str:
@@ -805,12 +832,6 @@ def _render_interference(interference: Any) -> List[str]:
                 interference.get("target_front_at_ms", "none"),
                 interference.get("window_raised_over_person"),
             )
-        )
-    restore = interference.get("focus_restore")
-    if isinstance(restore, dict) and restore.get("attempted"):
-        lines.append(
-            "focus_restore: accepted=%s succeeded=%s frontmost_now=%s"
-            % (restore.get("accepted"), restore.get("succeeded"), restore.get("frontmost_now"))
         )
     return lines
 

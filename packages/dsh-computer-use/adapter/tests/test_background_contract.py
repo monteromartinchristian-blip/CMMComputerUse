@@ -55,8 +55,6 @@ BREACH_LEDGER = {
     "window_raised_over_person": False,
     "observed_for_ms": 1130,
     "target_front_at_ms": 620,
-    "focus_restore": {"attempted": True, "accepted": True, "succeeded": True,
-                      "frontmost_now": "DeepSeek Harness"},
 }
 
 
@@ -90,7 +88,7 @@ class BreachFailClosedTests(Case):
         return failure(
             request, "INTERFERENCE_BREACH",
             "The action brought the target application in front of the person's work in a mode that promised no interference.",
-            "policy=background;reason=breach;kind=ui.press;action_ok=true",
+            "policy=background;reason=breach;kind=ui.press;action_ok=true;breach_id=3f2a",
             interference=BREACH_LEDGER)
 
     def test_breach_is_an_error_with_stop_and_settle_evidence(self):
@@ -105,7 +103,10 @@ class BreachFailClosedTests(Case):
                       "report it and let the operator review the ledger.", text)
         self.assertIn("settle: observed_for_ms=1130 target_front_at_ms=620 "
                       "window_raised_over_person=False", text)
-        self.assertIn("focus_restore: accepted=True succeeded=True", text)
+        # Decision 2026-11-02: no automatic focus restoration after a breach —
+        # re-activating the previous app would be a second interference.
+        self.assertNotIn("focus_restore", text)
+        self.assertIn("breach_id=3f2a", text)
         self.assertIn("Do not work around this", text)
 
     def test_breach_code_is_part_of_the_error_grammar(self):
@@ -127,7 +128,7 @@ class ScrollTests(Case):
         return ok(request, {"ok": True, "message": "scrolled down 2 page(s) via AXScrollDownByPage",
                             "interference": dict(BREACH_LEDGER, verdict="untouched", breach=False,
                                                  focus_became_target=False, frontmost_after="DeepSeek Harness",
-                                                 transient_focus_changes=0, focus_restore=None)})
+                                                 transient_focus_changes=0)})
 
     def setUp(self):
         ScrollTests.sent = []
@@ -194,6 +195,37 @@ class ElectronTreeTests(Case):
         for line in text.splitlines():
             if line.startswith("[") and "window-control" in line:
                 self.assertNotIn(") pressable", line)
+
+
+class BreachLatchStatusTests(Case):
+    @staticmethod
+    def responder(request):
+        op = request["operation"]
+        if op == "bridge.ping":
+            return ok(request, {"bridge": "cmm-computer-use", "protocol": 1, "pid": 1,
+                                "bundle_id": "com.cmm.chat.computer-use", "policy": "background"})
+        if op == "permissions.status":
+            return ok(request, {"accessibility": True, "screen_recording": True, "detail": ""})
+        if op == "policy.status":
+            return ok(request, {"apps": [{"name": "", "bundle_id": CLAUDE, "scopes": ["control", "observe"],
+                                          "windows": 0}],
+                                "effective_mode": "background", "launch_mode": "background",
+                                "policy_mode": "background"})
+        if op == "breach.status":
+            return ok(request, {"state": "ok", "breaches": [
+                {"id": "3f2a", "target_bundle": CLAUDE, "target_name": "Claude", "kind": "ui.press"}]})
+        return failure(request, "CAPABILITY_UNSUPPORTED", "unexpected")
+
+    def test_status_reports_open_latches_and_the_console_unlock_path(self):
+        text = text_of(self.call("computer_use_status"))
+        self.assertIn("breach_latch: state=ok open=1", text)
+        self.assertIn("- latched: Claude [%s] breach_id=3f2a kind=ui.press — rearm from CMM Console" % CLAUDE, text)
+
+    def test_the_agent_has_no_way_to_rearm(self):
+        names = {t["name"] for t in self.registry.tools()}
+        self.assertFalse(any("rearm" in n or "breach" in n for n in names))
+        self.assertFalse(any("rearm" in m for m in dir(BridgeClient)))
+        self.assertNotIn("breach.rearm", ACTION_KINDS)
 
 
 class InstructionsTests(unittest.TestCase):
