@@ -226,7 +226,7 @@ test('13/14 a human takeover is reported, is not a breach and latches nothing', 
   const r = adapterAction('ui.press', {ok: true, message: 'pressed', interference: TAKEOVER_LEDGER});
   assert.equal(r.isError, true, 'never a silent success');
   assert.match(r.text, /^attribution: focus_change_attribution=user human_input_detected=True human_input_kind=mouse_down human_input_age_ms=42 human_witness=available$/m);
-  assert.match(r.text, /^USER_TAKEOVER: the person brought Claude to the front during this action \(attribution=user\)\. Not a breach; nothing is latched\./m);
+  assert.match(r.text, /^USER_TAKEOVER: the person brought the target application to the front during this action \(attribution=user\)\. Not a breach; nothing is latched\./m);
   assert.doesNotMatch(r.text, /STOP: breach/);
   const s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
   assert.equal(s.breach, false);
@@ -234,6 +234,20 @@ test('13/14 a human takeover is reported, is not a breach and latches nothing', 
   // the guard does not deny further Computer Use
   const guard = installGuard(s);
   assert.equal(guard({name: prefix + 'observe', agent: {session: {}}}), undefined);
+});
+
+test('14 the takeover line never names the final frontmost app, and DSH still reads it', () => {
+  // Gate B: the person clicked the target; Terminal was in front again at the end.
+  const r = adapterAction('ui.press', {ok: true, message: 'pressed',
+    interference: {...TAKEOVER_LEDGER, frontmost_after: 'Terminal'}});
+  const line = r.text.split('\n').find(l => l.startsWith('USER_TAKEOVER:'));
+  assert.ok(line);
+  assert.doesNotMatch(line, /Terminal/);
+  assert.match(line, /the target application/);
+  assert.equal(r.isError, true);
+  const s = result(call(ready(), 'press', {element_id: 2, snapshot: 5}), r.text, true);
+  assert.equal(s.error, 'USER_TAKEOVER');
+  assert.equal(s.breach, false);
 });
 
 test('13 an ambiguous external takeover does not latch either', () => {

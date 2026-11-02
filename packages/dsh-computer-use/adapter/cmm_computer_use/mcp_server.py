@@ -868,11 +868,15 @@ def _user_takeover_line(interference: Any) -> Optional[str]:
         return None
     if interference.get("focus_change_attribution") not in ("user", "ambiguous_external"):
         return None
+    # Never name the app from `frontmost_after`: that is the state at the END
+    # of the settle window (the person may already be back in Terminal), not
+    # the application whose transition was attributed to the person. The
+    # ledger carries no canonical target name, so it is named generically.
     return (
-        "USER_TAKEOVER: the person brought %s to the front during this action "
-        "(attribution=%s). Not a breach; nothing is latched. The previous snapshot is no "
+        "USER_TAKEOVER: the person brought the target application to the front during this "
+        "action (attribution=%s). Not a breach; nothing is latched. The previous snapshot is no "
         "longer valid: observe again before any other action, and do not retry this one."
-        % (interference.get("frontmost_after") or "the target", interference.get("focus_change_attribution"))
+        % interference.get("focus_change_attribution")
     )
 
 

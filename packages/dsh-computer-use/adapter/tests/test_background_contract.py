@@ -423,9 +423,26 @@ class HumanTakeoverTests(Case):
         text = text_of(response)
         self.assertIn("attribution: focus_change_attribution=user human_input_detected=True "
                       "human_input_kind=mouse_down human_input_age_ms=42 human_witness=available", text)
-        self.assertIn("USER_TAKEOVER: the person brought Claude to the front during this action (attribution=user).", text)
+        self.assertIn("USER_TAKEOVER: the person brought the target application to the front during this action "
+                      "(attribution=user).", text)
         self.assertNotIn("STOP: breach", text)
         self.assertNotIn("REFUSED INTERFERENCE_BREACH", text)
+
+    def test_takeover_never_names_the_final_frontmost_as_the_target(self):
+        # Gate B on the Mac: the person clicked the target, but by the end of
+        # the settle window Terminal was in front again.
+        from cmm_computer_use.mcp_server import _render_action
+        ledger = dict(self.TAKEOVER, frontmost_after="Terminal")
+        text, is_error = _render_action("ui.press", {"ok": True, "message": "pressed", "interference": ledger})
+        line = [l for l in text.splitlines() if l.startswith("USER_TAKEOVER:")]
+        self.assertEqual(len(line), 1)
+        self.assertNotIn("Terminal", line[0])
+        self.assertIn("the person brought the target application to the front during this action", line[0])
+        self.assertIn("(attribution=user)", line[0])
+        self.assertIn("Not a breach; nothing is latched.", line[0])
+        self.assertIn("observe again before any other action, and do not retry this one.", line[0])
+        self.assertTrue(is_error, "classification unchanged: a takeover is an error result")
+        self.assertNotIn("STOP: breach", text)
 
     def test_16_no_automatic_retry(self):
         self.call("computer_use_press", {"element_id": 2, "snapshot": 5})
