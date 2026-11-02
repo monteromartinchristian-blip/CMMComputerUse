@@ -721,13 +721,32 @@ def _scroll_flag(element: Dict[str, Any]) -> str:
     return " not-scrollable(%s)" % (element.get("scroll_unsupported") or "unsupported")
 
 
-def _render_ax_tree(observation: Dict[str, Any]) -> List[str]:
-    """State whether the accessibility tree is usable, never imply it is.
+_TEXT_INPUT_ROLES = ("AXTextField", "AXTextArea", "AXComboBox", "AXSearchField")
 
-    ``chrome_only`` is the Electron/Chromium failure seen with Claude Desktop:
-    only the title-bar buttons are exposed. The helper already tried the
-    supported enrichment (``AXManualAccessibility``) and verified the result;
-    when that did not help, the answer is an explicit capability gap.
+
+def _ax_access(observation: Dict[str, Any]) -> str:
+    """actionable | readable | unavailable (the helper's, or derived the same
+    way from the lists for a helper that does not report it)."""
+
+    access = observation.get("ax_access")
+    if access in ("actionable", "readable", "unavailable"):
+        return access
+    elements = [e for e in (observation.get("elements") or []) if isinstance(e, dict)]
+    controls = [e for e in elements if not e.get("window_chrome")]
+    if any(e.get("pressable") or e.get("scrollable") or e.get("role") in _TEXT_INPUT_ROLES for e in controls):
+        return "actionable"
+    if observation.get("content") or controls:
+        return "readable"
+    return "unavailable"
+
+
+def _render_ax_tree(observation: Dict[str, Any]) -> List[str]:
+    """State what the tree offers, and never more.
+
+    `readable` (content, no controls — e.g. Claude/Electron's AXWebArea and
+    headings) is enough to observe and is NOT `unavailable`; it is also not
+    evidence that the window can be operated. `unavailable` (window controls
+    only, or nothing) is the explicit capability gap AX_TREE_UNAVAILABLE.
     """
 
     lines: List[str] = []
@@ -742,8 +761,19 @@ def _render_ax_tree(observation: Dict[str, Any]) -> List[str]:
                 enrichment.get("nodes_after"),
             )
         )
-    tree = observation.get("ax_tree")
-    if tree in ("chrome_only", "empty"):
+    access = _ax_access(observation)
+    counts = observation.get("ax_counts") if isinstance(observation.get("ax_counts"), dict) else {}
+    lines.append("ax_access: %s content=%s elements=%s actionable=%s window_controls=%s" % (
+        access,
+        counts.get("content", len(observation.get("content") or [])),
+        counts.get("elements", len(observation.get("elements") or [])),
+        counts.get("actionable", "?"),
+        counts.get("window_controls", "?"),
+    ))
+    if access == "readable":
+        lines.append("readable only: this window can be observed; it exposes no control to operate.")
+    elif access == "unavailable":
+        tree = observation.get("ax_tree")
         lines.append(
             "AX_TREE_UNAVAILABLE: this window exposes %s through accessibility; its "
             "content cannot be read or operated by CMM Computer Use. %s"

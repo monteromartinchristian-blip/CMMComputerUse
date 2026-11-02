@@ -885,14 +885,19 @@ func walk(
             direction: .down, actions: actions, role: role,
             hasScrollBar: verticalBar != nil,
             scrollBarSettable: scrollBarSettable(verticalBar))
+        var scrollable = false
         if role == "AXScrollArea" || scrollPlan != .unsupported(reason: "not_scrollable") {
             if case .unsupported(let reason) = scrollPlan {
                 entry["scrollable"] = false
                 entry["scroll_unsupported"] = reason
             } else {
                 entry["scrollable"] = true
+                scrollable = true
             }
         }
+        entry["actionable"] = bridgeElementIsActionable(
+            role: role, pressable: actions.contains("AXPress"), scrollable: scrollable,
+            windowChrome: bridgeIsWindowChrome(subrole: subrole))
         traversal.elements.append(entry)
     } else if !interactiveRoles.contains(role),
               traversal.content.count < maxContentNodes,
@@ -1132,6 +1137,18 @@ func buildDescription(
         && traversal.elements.allSatisfy { ($0["window_chrome"] as? Bool) == true }
     let empty = traversal.elements.isEmpty && traversal.content.isEmpty
     result["ax_tree"] = chromeOnly ? "chrome_only" : (empty ? "empty" : "ok")
+    // Readable is not actionable: observing a window is not controlling it.
+    let observed = traversal.elements.map {
+        BridgeObservedElement(windowChrome: ($0["window_chrome"] as? Bool) == true,
+                              actionable: ($0["actionable"] as? Bool) == true)
+    }
+    result["ax_access"] = bridgeAXAccess(contentCount: traversal.content.count, elements: observed).rawValue
+    result["ax_counts"] = [
+        "content": traversal.content.count,
+        "elements": traversal.elements.count,
+        "actionable": observed.filter { $0.actionable }.count,
+        "window_controls": observed.filter { $0.windowChrome }.count,
+    ]
     if let error { result["screenshot_error"] = error }
     return result
 }

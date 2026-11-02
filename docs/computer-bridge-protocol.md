@@ -266,8 +266,14 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   documents for third-party assistive clients — polls up to 2 s, and reports
   `ax_enrichment = {mechanism, state: not_needed|already_enabled|enabled|enabled_still_sparse|unsupported|failed|not_trusted, nodes_before, nodes_after, ax_error?}`.
   `AXEnhancedUserInterface` is NOT used (it changes window management). Every
-  observation states `ax_tree: ok|chrome_only|empty`; the adapter renders
-  `chrome_only`/`empty` as `AX_TREE_UNAVAILABLE`.
+  observation states `ax_tree: ok|chrome_only|empty` and — readable is not
+  actionable — `ax_access: actionable|readable|unavailable` with
+  `ax_counts {content, elements, actionable, window_controls}`; each element
+  carries `actionable` (non-window-control and pressable, a text input, or
+  verified scrollable). The adapter prints `ax_access: …` and renders only
+  `unavailable` as `AX_TREE_UNAVAILABLE`; `readable` (e.g. Claude/Electron's
+  AXWebArea and headings, no control) can be observed and is not evidence of
+  control.
 - New ledger fields: `window_raised_over_person`, `target_front_at_ms`
   (offset of the first sample with the target in front), `observed_for_ms`.
   New `bridge.ping` capabilities: `post_action_settle`, `breach_fail_closed`,

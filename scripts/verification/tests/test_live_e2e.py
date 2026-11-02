@@ -47,5 +47,33 @@ class ScrollVerdictTests(unittest.TestCase):
         self.assertTrue(e2e.scroll_verdict(unsupported, True, False)["ok"])
 
 
+class ElectronVerdictTests(unittest.TestCase):
+    CLAUDE = ("target: Claude [com.anthropic.claudefordesktop] (background)\n"
+              "ax_access: readable content=4 elements=0 actionable=0 window_controls=0\n"
+              "readable only: this window can be observed; it exposes no control to operate.\n"
+              'readable content (4, read-only):\n- AXWebArea "Nuevo chat - Claude"\n'
+              "interactive elements: none detected\n")
+
+    def test_the_live_claude_observation_passes_the_readable_gate(self):
+        v = e2e.electron_verdict(self.CLAUDE, False)
+        self.assertTrue(v["readable"])
+        self.assertFalse(v["actionable"])
+        self.assertFalse(v["unavailable"])
+        self.assertFalse(v["control_proven"], "observing is never proof of control")
+
+    def test_unavailable_and_errors_fail_the_gate(self):
+        chrome = ("ax_access: unavailable content=0 elements=3 actionable=0 window_controls=3\n"
+                  "AX_TREE_UNAVAILABLE: this window exposes only its window controls\n")
+        self.assertFalse(e2e.electron_verdict(chrome, False)["readable"])
+        self.assertTrue(e2e.electron_verdict(chrome, False)["unavailable"])
+        self.assertFalse(e2e.electron_verdict("REFUSED APPROVAL_REJECTED: x", True)["readable"])
+        self.assertFalse(e2e.electron_verdict("no ax_access line at all", False)["readable"])
+
+    def test_actionable_is_readable_and_reported_but_not_control(self):
+        v = e2e.electron_verdict("ax_access: actionable content=10 elements=5 actionable=5 window_controls=3\n", False)
+        self.assertTrue(v["readable"] and v["actionable"])
+        self.assertFalse(v["control_proven"])
+
+
 if __name__ == "__main__":
     unittest.main()

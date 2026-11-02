@@ -230,3 +230,36 @@ final class BackgroundInterferenceTests: XCTestCase {
         XCTAssertEqual(bridgeScrollBarTarget(current: 0.0, direction: .down, pages: 99), 1.0)
     }
 }
+
+/// Readable is not actionable (Shared/ComputerUsePolicy.swift, "What an
+/// observation offers").
+final class AXAccessTests: XCTestCase {
+    func testLiveClaudeShapeIsReadable() {
+        // AXWindow / AXGroup / AXWebArea / AXHeading as content, no control.
+        XCTAssertEqual(bridgeAXAccess(contentCount: 4, elements: []), .readable)
+    }
+
+    func testWindowControlsOnlyIsUnavailable() {
+        let chrome = Array(repeating: BridgeObservedElement(windowChrome: true, actionable: false), count: 3)
+        XCTAssertEqual(bridgeAXAccess(contentCount: 0, elements: chrome), .unavailable)
+        XCTAssertEqual(bridgeAXAccess(contentCount: 0, elements: []), .unavailable)
+    }
+
+    func testAnyRealControlIsActionable() {
+        XCTAssertEqual(bridgeAXAccess(contentCount: 0, elements: [
+            BridgeObservedElement(windowChrome: true, actionable: false),
+            BridgeObservedElement(windowChrome: false, actionable: true),
+        ]), .actionable)
+        XCTAssertEqual(bridgeAXAccess(contentCount: 0, elements: [
+            BridgeObservedElement(windowChrome: false, actionable: false),
+        ]), .readable, "a non-control element is readable, not actionable")
+    }
+
+    func testElementActionability() {
+        XCTAssertTrue(bridgeElementIsActionable(role: "AXButton", pressable: true, scrollable: false, windowChrome: false))
+        XCTAssertTrue(bridgeElementIsActionable(role: "AXTextField", pressable: false, scrollable: false, windowChrome: false))
+        XCTAssertTrue(bridgeElementIsActionable(role: "AXScrollArea", pressable: false, scrollable: true, windowChrome: false))
+        XCTAssertFalse(bridgeElementIsActionable(role: "AXButton", pressable: true, scrollable: false, windowChrome: true))
+        XCTAssertFalse(bridgeElementIsActionable(role: "AXScrollArea", pressable: false, scrollable: false, windowChrome: false))
+    }
+}

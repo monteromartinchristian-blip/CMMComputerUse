@@ -458,6 +458,53 @@ public func bridgeWindowChromeRefusal(
         detail: "policy=\(mode.rawValue);kind=ui.press;reason=window_chrome;subrole=\(subrole)")
 }
 
+// MARK: - What an observation offers
+
+/// What an observed window offers through accessibility, kept apart:
+///
+/// - `actionable`: at least one non-window-control element that can be acted
+///   on (pressable, a text input, or a verified-scrollable area);
+/// - `readable`: no such control, but there is readable content (or
+///   non-control elements) — enough to OBSERVE, not to operate;
+/// - `unavailable`: nothing but window controls, or nothing at all.
+///
+/// A live Claude (Electron) observation exposed AXWindow, AXGroup, AXWebArea
+/// and AXHeading and no control: that is `readable`, not `unavailable`, and
+/// not evidence that the application can be controlled.
+public enum BridgeAXAccess: String, Sendable {
+    case actionable
+    case readable
+    case unavailable
+}
+
+public struct BridgeObservedElement: Equatable, Sendable {
+    public var windowChrome: Bool
+    public var actionable: Bool
+
+    public init(windowChrome: Bool, actionable: Bool) {
+        self.windowChrome = windowChrome
+        self.actionable = actionable
+    }
+}
+
+/// Roles whose value `ui.set_value` may set (secure fields are refused by the
+/// action itself).
+public let bridgeTextInputRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+
+public func bridgeElementIsActionable(
+    role: String, pressable: Bool, scrollable: Bool, windowChrome: Bool
+) -> Bool {
+    guard !windowChrome else { return false }
+    return pressable || scrollable || bridgeTextInputRoles.contains(role)
+}
+
+public func bridgeAXAccess(contentCount: Int, elements: [BridgeObservedElement]) -> BridgeAXAccess {
+    if elements.contains(where: { $0.actionable && !$0.windowChrome }) { return .actionable }
+    let nonChrome = elements.filter { !$0.windowChrome }.count
+    if contentCount > 0 || nonChrome > 0 { return .readable }
+    return .unavailable
+}
+
 // MARK: - Accessibility-only scrolling
 
 public enum BridgeScrollDirection: String, CaseIterable, Sendable {

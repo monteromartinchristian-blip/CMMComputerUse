@@ -111,6 +111,20 @@ def scroll_verdict(text: str, is_error: bool, on_fixture: bool,
     return out
 
 
+def electron_verdict(text: str, is_error: bool) -> dict:
+    """Observe-only verdict for an Electron app (the isolated policy grants it
+    `observe` only). `readable` is the gate; `actionable` is a diagnostic and
+    does NOT mean the app can be controlled — real control stays unproven."""
+
+    m = re.search(r"^ax_access: (actionable|readable|unavailable) ", text, re.M)
+    access = m.group(1) if m else None
+    readable = (not is_error) and access in ("readable", "actionable") and "AX_TREE_UNAVAILABLE" not in text
+    return {"access": access, "readable": readable,
+            "actionable": (not is_error) and access == "actionable",
+            "unavailable": access == "unavailable" or "AX_TREE_UNAVAILABLE" in text,
+            "control_proven": False}
+
+
 def element_id(text: str, predicate) -> int | None:
     for line in text.splitlines():
         m = re.match(r"^\[(\d+)\] (\S+) \"(.*)\" \(", line)
@@ -264,9 +278,11 @@ def main() -> int:
 
     if args.electron_app:
         text, err = d.call("7 electron observe", "computer_use_observe", {"app": args.electron_app})
-        elements = len(re.findall(r"^\[\d+\] ", text, re.M))
-        checks["electron_tree"] = (not err) and ("AX_TREE_UNAVAILABLE" in text or elements > 3)
-        checks["electron_tree_useful"] = (not err) and "AX_TREE_UNAVAILABLE" not in text and elements > 3
+        verdict = electron_verdict(text, err)
+        checks["electron_observe_readable"] = verdict["readable"]
+        # Diagnostic only: an actionable tree is not proof of control, and the
+        # isolated policy grants this app `observe` only.
+        diagnostics["electron"] = verdict
 
     folded = dsh_fold(d.transcript)
     checks["bypass_guard"] = all(folded.get("bypass") or [None])
@@ -319,6 +335,10 @@ def main() -> int:
     for key, value in checks.items():
         print("  %-22s %s" % (key, "PASS" if value is True else ("n/a" if value is None else "FAIL")))
         failed |= value is False
+    if diagnostics:
+        print("══ diagnostics (never decide PASS/FAIL)")
+        for key, value in diagnostics.items():
+            print("  %-22s %s" % (key, json.dumps(value, ensure_ascii=False)[:300]))
     print("report: %s" % args.report)
     return 1 if failed else 0
 

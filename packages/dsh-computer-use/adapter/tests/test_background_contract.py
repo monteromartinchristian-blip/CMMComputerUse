@@ -262,6 +262,51 @@ class BreachLatchStatusTests(Case):
         self.assertNotIn("breach.rearm", ACTION_KINDS)
 
 
+class ReadableVersusActionableTests(Case):
+    """The live Claude observation: AXWindow / AXGroup / AXWebArea / AXHeading
+    and no control. Readable, not unavailable, not actionable."""
+
+    CLAUDE_LIVE = {
+        "frontmost_app": "DeepSeek Harness", "frontmost_bundle": "com.deepseek.harness",
+        "target_app": "Claude", "target_bundle": CLAUDE, "target_pid": 777,
+        "target_window": "Claude", "target_window_id": 41, "target_is_frontmost": False,
+        "windows": [], "elements": [], "snapshot": 9, "captured_at": 1.0, "screenshot_scope": "none",
+        "content": [{"role": "AXWindow", "text": "Claude"}, {"role": "AXGroup", "text": "Claude"},
+                    {"role": "AXWebArea", "text": "Nuevo chat - Claude"}, {"role": "AXHeading", "text": "Claude"}],
+        "ax_tree": "ok", "ax_access": "readable",
+        "ax_counts": {"content": 4, "elements": 0, "actionable": 0, "window_controls": 0},
+    }
+    observation = CLAUDE_LIVE
+
+    @staticmethod
+    def responder(request):
+        return ok(request, ReadableVersusActionableTests.observation)
+
+    def test_claude_live_shape_is_readable_not_unavailable(self):
+        text = text_of(self.call("computer_use_observe", {"app": CLAUDE}))
+        self.assertIn("ax_access: readable content=4 elements=0 actionable=0", text)
+        self.assertIn("readable only", text)
+        self.assertNotIn("AX_TREE_UNAVAILABLE", text)
+
+    def test_older_helper_without_ax_access_is_derived_the_same_way(self):
+        legacy = {k: v for k, v in self.CLAUDE_LIVE.items() if k not in ("ax_access", "ax_counts")}
+        ReadableVersusActionableTests.observation = legacy
+        try:
+            text = text_of(self.call("computer_use_observe", {"app": CLAUDE}))
+        finally:
+            ReadableVersusActionableTests.observation = self.CLAUDE_LIVE
+        self.assertIn("ax_access: readable content=4", text)
+        self.assertNotIn("AX_TREE_UNAVAILABLE", text)
+
+    def test_actionable_and_unavailable(self):
+        from cmm_computer_use.mcp_server import _ax_access
+        self.assertEqual(_ax_access({"elements": [{"role": "AXButton", "pressable": True}]}), "actionable")
+        self.assertEqual(_ax_access({"elements": [{"role": "AXTextField"}]}), "actionable")
+        self.assertEqual(_ax_access({"elements": [{"role": "AXButton", "pressable": True, "window_chrome": True}]}),
+                         "unavailable")
+        self.assertEqual(_ax_access({"elements": [], "content": []}), "unavailable")
+
+
 class InstructionsTests(unittest.TestCase):
     def test_initialize_carries_the_no_bypass_policy(self):
         client = BridgeClient("/nonexistent/socket", policy="background")
