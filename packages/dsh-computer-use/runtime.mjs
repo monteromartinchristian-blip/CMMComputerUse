@@ -453,15 +453,15 @@ function technicalFacts(state,target) {
     target:target?{bundle:target.bundle,pid:target.pid,snapshot:target.snapshot,windowId:target.windowId??null,window:target.window||null}:null
   };
 }
-/** Generic visible name when neither the target nor the grant has a human one. */
-export const GENERIC_APP_NAME='Aplicación';
 /**
- * The PiP's visible application name. Display only: it never decides
- * authorization; callers pass a target that `fold()` already verified.
- * Order: the observed name of the verified target, then a human grant name,
- * then `GENERIC_APP_NAME`. A bundle id is never the title (a grant without a
+ * The PiP's visible application name, or null when there is no human one.
+ * Display only: it never decides authorization; callers pass a target that
+ * `fold()` already verified. Order: the observed name of the verified target,
+ * then a human grant name. A bundle id is never the title (a grant without a
  * name falls back to its bundle in the status parser); it stays in
- * `technical.target.bundle`.
+ * `technical.target.bundle`. With no human name the model sets
+ * `appGeneric=true` and the client shows its localized `appGeneric` string:
+ * the runtime never picks a language.
  */
 export function displayAppName(target,grant) {
   const human=(name,...bundles)=>{
@@ -469,11 +469,11 @@ export function displayAppName(target,grant) {
     return n&&!bundles.some(b=>typeof b==='string'&&b&&n===b)?n:null;
   };
   const bundles=[target?.bundle,grant?.bundle];
-  return human(target?.name,...bundles)||human(grant?.name,...bundles)||GENERIC_APP_NAME;
+  return human(target?.name,...bundles)||human(grant?.name,...bundles);
 }
 export function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
   const base={visible:false,phase:'idle',status:'idle',tone:'muted',mode:'indicator',canRead:false,
-    app:null,window:null,code:null,ageMs:null,frameAt:null,technical:null};
+    app:null,appGeneric:false,window:null,code:null,ageMs:null,frameAt:null,technical:null};
   if(!state||typeof state!=='object') return base;
   const own=!!view&&view.sessionId===sessionId;
   const activity=activityRevision(state);
@@ -488,11 +488,12 @@ export function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
     mode,code:state.error||null,technical:technicalFacts(state,target),
     frameAt:Number.isFinite(state.frame?.at)?state.frame.at:null,
     app:verified?displayAppName(target,grant):null,window:verified?target.window:null};
+  model.appGeneric=verified&&!model.app;
   // Nothing to supervise: no surface at all, whatever the phase says.
   if(!sessionId||activity<1||closed||phase==='idle') return model;
   // A phase that would show pixels or a name without current authority is demoted.
   if(!verified&&['frame-live','frame-stale','observed-no-frame','expired'].includes(phase))
-    return {...model,visible:true,phase:'error',status:'error',tone:'error',app:null,window:null,technical:technicalFacts(state,null)};
+    return {...model,visible:true,phase:'error',status:'error',tone:'error',app:null,appGeneric:false,window:null,technical:technicalFacts(state,null)};
   const pending=Object.values(state.pending||{}).at(-1)?.name;
   const busy=pending==='status'?'connecting':pending==='press'||pending==='set_value'?'interacting'
     :pending==='observe'||pending==='capture_window'?'observing':null;

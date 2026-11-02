@@ -5,6 +5,7 @@
   },
   "panel": {
     "title": "Computer Use",
+    "appGeneric": "Aplicación",
     "idle": "Inactivo",
     "connecting": "Conectando",
     "observing": "Observando",

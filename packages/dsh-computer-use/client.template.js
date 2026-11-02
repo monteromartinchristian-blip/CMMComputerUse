@@ -184,7 +184,9 @@ window.__ModuleLoader__.load({
           if(name==='close')setDetails(false);
         };
         if(!model.visible||currentSession()!==sessionId)return null;
-        const title=model.app||t('title');
+        // Never a bundle id: a verified target without a human name gets the
+        // localized generic name; no verified target, the plugin title.
+        const title=model.app||t(model.appGeneric?'appGeneric':'title');
         // The mirror can be live before any capture is admitted: the label has
         // to follow what is on screen, not the admission state alone.
         const shownPhase=displayPhase(model.phase,{mirrorLive:liveOk&&!liveBroken});

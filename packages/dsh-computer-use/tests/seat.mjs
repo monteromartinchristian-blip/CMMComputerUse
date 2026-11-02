@@ -4,7 +4,10 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-export function seat(state) {
+// `lang` ('en' | 'es'): resolve t() with the dictionaries the client really
+// registers. Without it t() returns the key, as every existing test expects.
+export function seat(state,{lang}={}) {
+  const dictionaries={};
   let definition, entry, slots=[], cursor=0, effects=[], effectCursor=0, effectSlots=[], writes=0;
   let current=state;
   const react={
@@ -39,7 +42,7 @@ export function seat(state) {
     setInterval:(fn,ms)=>{intervals.push({fn,ms});return intervals.length},clearInterval(){},
     fetch:async()=>({json:async()=>liveFeed.current})});
   const selected={byId:{a:{id:'a',retainedBy:{mainView:1}}}};
-  const ctx={effect:fn=>fn(),locale:{register:()=>()=>{},bind:()=>k=>k,subscribe:()=>()=>{},getSnapshot:()=>0},
+  const ctx={effect:fn=>fn(),locale:{register:(_ns,l,dict)=>{dictionaries[l]=dict;return()=>{}},bind:()=>k=>lang?(dictionaries[lang]?.[k]??k):k,subscribe:()=>()=>{},getSnapshot:()=>0},
     slots:{inject:(_name,fn)=>fn(),register:(_opts,view)=>{entry=view;return()=>{}}},
     sessions:{list:{getSnapshot:()=>selected},binding:()=>({session:{projections:{faceOf:()=>({getSnapshot:()=>current,subscribe:()=>()=>{}})},readAttachment:()=>{throw Error('control invoked attachment authority')}}})},
     layout:{panelInfo:{getSnapshot:()=>({activePanelId:null})}}};

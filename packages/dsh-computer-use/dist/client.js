@@ -457,15 +457,15 @@ function technicalFacts(state,target) {
     target:target?{bundle:target.bundle,pid:target.pid,snapshot:target.snapshot,windowId:target.windowId??null,window:target.window||null}:null
   };
 }
-/** Generic visible name when neither the target nor the grant has a human one. */
-const GENERIC_APP_NAME='Aplicación';
 /**
- * The PiP's visible application name. Display only: it never decides
- * authorization; callers pass a target that `fold()` already verified.
- * Order: the observed name of the verified target, then a human grant name,
- * then `GENERIC_APP_NAME`. A bundle id is never the title (a grant without a
+ * The PiP's visible application name, or null when there is no human one.
+ * Display only: it never decides authorization; callers pass a target that
+ * `fold()` already verified. Order: the observed name of the verified target,
+ * then a human grant name. A bundle id is never the title (a grant without a
  * name falls back to its bundle in the status parser); it stays in
- * `technical.target.bundle`.
+ * `technical.target.bundle`. With no human name the model sets
+ * `appGeneric=true` and the client shows its localized `appGeneric` string:
+ * the runtime never picks a language.
  */
 function displayAppName(target,grant) {
   const human=(name,...bundles)=>{
@@ -473,11 +473,11 @@ function displayAppName(target,grant) {
     return n&&!bundles.some(b=>typeof b==='string'&&b&&n===b)?n:null;
   };
   const bundles=[target?.bundle,grant?.bundle];
-  return human(target?.name,...bundles)||human(grant?.name,...bundles)||GENERIC_APP_NAME;
+  return human(target?.name,...bundles)||human(grant?.name,...bundles);
 }
 function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
   const base={visible:false,phase:'idle',status:'idle',tone:'muted',mode:'indicator',canRead:false,
-    app:null,window:null,code:null,ageMs:null,frameAt:null,technical:null};
+    app:null,appGeneric:false,window:null,code:null,ageMs:null,frameAt:null,technical:null};
   if(!state||typeof state!=='object') return base;
   const own=!!view&&view.sessionId===sessionId;
   const activity=activityRevision(state);
@@ -492,11 +492,12 @@ function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
     mode,code:state.error||null,technical:technicalFacts(state,target),
     frameAt:Number.isFinite(state.frame?.at)?state.frame.at:null,
     app:verified?displayAppName(target,grant):null,window:verified?target.window:null};
+  model.appGeneric=verified&&!model.app;
   // Nothing to supervise: no surface at all, whatever the phase says.
   if(!sessionId||activity<1||closed||phase==='idle') return model;
   // A phase that would show pixels or a name without current authority is demoted.
   if(!verified&&['frame-live','frame-stale','observed-no-frame','expired'].includes(phase))
-    return {...model,visible:true,phase:'error',status:'error',tone:'error',app:null,window:null,technical:technicalFacts(state,null)};
+    return {...model,visible:true,phase:'error',status:'error',tone:'error',app:null,appGeneric:false,window:null,technical:technicalFacts(state,null)};
   const pending=Object.values(state.pending||{}).at(-1)?.name;
   const busy=pending==='status'?'connecting':pending==='press'||pending==='set_value'?'interacting'
     :pending==='observe'||pending==='capture_window'?'observing':null;
@@ -525,7 +526,7 @@ function overlayPosition(position,frame,card) {
     y:Math.max(minY,Math.min(maxY,position?.y??minY))};
 }
 
-    const dictionaries={"en":{"title":"Computer Use","idle":"Idle","connecting":"Connecting","observing":"Observing","interacting":"Interacting","waiting":"Waiting for the first capture…","live":"Live","paused":"Paused","pausedBadge":"View paused","expired":"Waiting for a new capture…","expiredHint":"The previous capture expired","denied":"Not authorized","incompatible":"Not compatible","error":"Error","errorWindow":"Can't show the window","errorPermission":"Permission not verified","errorBreach":"Session locked for safety","errorHint":"Open Details for the technical state","details":"Details","windowFrame":"Authorized window capture","windowUnavailable":"Capture unavailable","loading":"Loading view…","updated":"Updated","helper":"Helper","authorization":"Authorization","permissions":"Permissions","policy":"Policy","target":"Target","errorCode":"Error code","technical":"Technical message","openView":"Open view","move":"Move view · drag or use arrow keys","expand":"Expand","shrink":"Shrink","collapse":"Collapse","closeView":"Close view"},"es":{"title":"Computer Use","idle":"Inactivo","connecting":"Conectando","observing":"Observando","interacting":"Interactuando","waiting":"Esperando primera captura…","live":"Activo","paused":"En pausa","pausedBadge":"Vista pausada","expired":"Esperando nueva captura…","expiredHint":"La captura anterior ha caducado","denied":"No autorizado","incompatible":"No compatible","error":"Error","errorWindow":"No se puede mostrar la ventana","errorPermission":"Permiso no verificado","errorBreach":"Sesión bloqueada por seguridad","errorHint":"Abre Detalles para ver el estado técnico","details":"Detalles","windowFrame":"Captura de la ventana autorizada","windowUnavailable":"Captura no disponible","loading":"Cargando vista…","updated":"Actualizado hace","helper":"Helper","authorization":"Autorización","permissions":"Permisos","policy":"Política","target":"Objetivo","errorCode":"Código de error","technical":"Mensaje técnico","openView":"Abrir vista","move":"Mover vista · arrastra o usa las flechas","expand":"Ampliar","shrink":"Reducir","collapse":"Plegar","closeView":"Cerrar vista"}};
+    const dictionaries={"en":{"title":"Computer Use","appGeneric":"Application","idle":"Idle","connecting":"Connecting","observing":"Observing","interacting":"Interacting","waiting":"Waiting for the first capture…","live":"Live","paused":"Paused","pausedBadge":"View paused","expired":"Waiting for a new capture…","expiredHint":"The previous capture expired","denied":"Not authorized","incompatible":"Not compatible","error":"Error","errorWindow":"Can't show the window","errorPermission":"Permission not verified","errorBreach":"Session locked for safety","errorHint":"Open Details for the technical state","details":"Details","windowFrame":"Authorized window capture","windowUnavailable":"Capture unavailable","loading":"Loading view…","updated":"Updated","helper":"Helper","authorization":"Authorization","permissions":"Permissions","policy":"Policy","target":"Target","errorCode":"Error code","technical":"Technical message","openView":"Open view","move":"Move view · drag or use arrow keys","expand":"Expand","shrink":"Shrink","collapse":"Collapse","closeView":"Close view"},"es":{"title":"Computer Use","appGeneric":"Aplicación","idle":"Inactivo","connecting":"Conectando","observing":"Observando","interacting":"Interactuando","waiting":"Esperando primera captura…","live":"Activo","paused":"En pausa","pausedBadge":"Vista pausada","expired":"Esperando nueva captura…","expiredHint":"La captura anterior ha caducado","denied":"No autorizado","incompatible":"No compatible","error":"Error","errorWindow":"No se puede mostrar la ventana","errorPermission":"Permiso no verificado","errorBreach":"Sesión bloqueada por seguridad","errorHint":"Abre Detalles para ver el estado técnico","details":"Detalles","windowFrame":"Captura de la ventana autorizada","windowUnavailable":"Captura no disponible","loading":"Cargando vista…","updated":"Actualizado hace","helper":"Helper","authorization":"Autorización","permissions":"Permisos","policy":"Política","target":"Objetivo","errorCode":"Código de error","technical":"Mensaje técnico","openView":"Abrir vista","move":"Mover vista · arrastra o usa las flechas","expand":"Ampliar","shrink":"Reducir","collapse":"Plegar","closeView":"Cerrar vista"}};
         const ns='cmm-computer-use', empty=initialState();
     // Every measurement and pointer interaction belongs to this overlay only.
     // The card is sized so the window frame, not the chrome, fills the PiP.
@@ -706,7 +707,9 @@ function overlayPosition(position,frame,card) {
           if(name==='close')setDetails(false);
         };
         if(!model.visible||currentSession()!==sessionId)return null;
-        const title=model.app||t('title');
+        // Never a bundle id: a verified target without a human name gets the
+        // localized generic name; no verified target, the plugin title.
+        const title=model.app||t(model.appGeneric?'appGeneric':'title');
         // The mirror can be live before any capture is admitted: the label has
         // to follow what is on screen, not the admission state alone.
         const shownPhase=displayPhase(model.phase,{mirrorLive:liveOk&&!liveBroken});

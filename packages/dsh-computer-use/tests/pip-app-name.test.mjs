@@ -1,17 +1,24 @@
 // PiP visible application name (bug: the title read
 // `com.anthropic.claudefordesktop` although the observe had verified
 // `target.name = "Claude"`). The bundle id is never the title; it stays in the
-// technical facts. Authorization / verification / phase are not touched.
+// technical facts. With no human name the runtime only marks `appGeneric`; the
+// client resolves it with the plugin's own locale dictionaries
+// (es "Aplicación", en "Application"). Verification / phase / canRead are not
+// touched.
 import test from 'node:test';
+import fs from 'node:fs';
 import assert from 'node:assert/strict';
-import {initialState, fold, pipPresentation, displayAppName, GENERIC_APP_NAME} from '../runtime.mjs';
+import {initialState, fold, pipPresentation, displayAppName} from '../runtime.mjs';
+import {seat, nodes, text} from './seat.mjs';
 
 const PREFIX = 'mcp__cmm-computer-use__computer_use_';
 const CLAUDE = 'com.anthropic.claudefordesktop';
+const LANGS = ['es', 'en'];
+const GENERIC = {es: 'Aplicación', en: 'Application'};
 let seq = 0;
-const call = (s, name, args = {}) => fold(s, {type: 'assistant/message', seq: ++seq, time: 1000,
+const call = (s, name, args = {}) => fold(s, {type: 'assistant/message', seq: ++seq, time: Date.now(),
   data: {message: {content: [{type: 'tool-call', id: String(seq), name: PREFIX + name, arguments: JSON.stringify(args)}]}}});
-const result = (s, text) => fold(s, {type: 'tool/result', seq: ++seq, time: 1000,
+const result = (s, text) => fold(s, {type: 'tool/result', seq: ++seq, time: Date.now(),
   data: {message: {source: {callId: Object.keys(s.pending).at(-1)}, isError: false, content: [{type: 'text', text}]}}});
 
 /** A CMM Console grant, optionally without a human name (the real case). */
@@ -27,59 +34,88 @@ const observe = (s, name = 'Claude') => result(call(s, 'observe', {app: CLAUDE})
   `cmm_view: {"bundle":"${CLAUDE}","pid":777,"snapshot":5,"window":"Claude","window_id":41}`);
 const session = (grantName = '', targetName = 'Claude') =>
   observe(result(call(initialState(), 'status'), status(grantName)), targetName);
-const model = s => pipPresentation(s, {sessionId: 'a', view: {sessionId: 'a', mode: 'mini'}, now: 1000});
+const VIEW = {sessionId: 'a', mode: 'mini'};
+const model = s => pipPresentation(s, {sessionId: 'a', view: VIEW});
 
-test('1. grant without a human name: the verified target name is the title', () => {
+/** The title the real client draws (compact header) in a language. */
+const shownTitle = (state, lang) => {
+  const tree = seat(state, {lang}).draw(VIEW);
+  const titles = nodes(tree, 'span').filter(n => n.props.className === 'cmm-cu-title');
+  assert.equal(titles.length, 1, 'one header title');
+  return {title: text(titles[0]).trim(), all: text(tree)};
+};
+
+test('the locale dictionaries carry the generic name in both languages', () => {
+  for (const lang of LANGS) {
+    const panel = JSON.parse(fs.readFileSync(new URL(`../locale/${lang}.json`, import.meta.url))).panel;
+    assert.equal(panel.appGeneric, GENERIC[lang]);
+  }
+});
+
+test('1. target.name=Claude is the title in both languages (grant without a human name)', () => {
   const s = session('');
   assert.equal(s.grants[0].name, CLAUDE, 'precondition: the parser fell back to the bundle');
   assert.equal(s.target.name, 'Claude');
-  assert.equal(s.target.bundle, CLAUDE);
   const m = model(s);
   assert.equal(m.app, 'Claude');
-  assert.notEqual(m.app, CLAUDE);
+  assert.equal(m.appGeneric, false);
+  for (const lang of LANGS) assert.equal(shownTitle(s, lang).title, 'Claude', lang);
 });
 
-test('2. target without a name, grant with a human name: the grant name', () => {
+test('2. a human grant name is the fallback in both languages', () => {
   assert.equal(displayAppName({name: '', bundle: CLAUDE}, {name: 'Claude Desktop', bundle: CLAUDE}), 'Claude Desktop');
   assert.equal(displayAppName({bundle: CLAUDE}, {name: 'Claude Desktop', bundle: CLAUDE}), 'Claude Desktop');
-});
-
-test('3. target without a name and grant.name == bundle: generic name', () => {
-  assert.equal(GENERIC_APP_NAME, 'Aplicación');
-  assert.equal(displayAppName({name: '', bundle: CLAUDE}, {name: CLAUDE, bundle: CLAUDE}), 'Aplicación');
-  assert.equal(displayAppName({name: '   ', bundle: CLAUDE}, {name: '', bundle: CLAUDE}), 'Aplicación');
-});
-
-test('4. target.name == target.bundle is never the title', () => {
-  assert.equal(displayAppName({name: CLAUDE, bundle: CLAUDE}, {name: 'Claude', bundle: CLAUDE}), 'Claude');
-  assert.equal(displayAppName({name: CLAUDE, bundle: CLAUDE}, {name: CLAUDE, bundle: CLAUDE}), 'Aplicación');
   // Through the real fold: the helper reported the bundle as the name.
-  const m = model(session('', CLAUDE));
-  assert.equal(m.app, 'Aplicación');
-  assert.notEqual(m.app, CLAUDE);
+  const s = session('Claude Desktop', CLAUDE);
+  assert.equal(model(s).app, 'Claude Desktop');
+  for (const lang of LANGS) assert.equal(shownTitle(s, lang).title, 'Claude Desktop', lang);
 });
 
-test('5. unverified: no name at all, as before', () => {
-  const s = session('');
-  assert.equal(model({...s, bridge: 'incompatible'}).app, null);
-  assert.equal(model({...s, target: {...s.target, background: false}}).app, null);
-  assert.equal(model({...s, grants: []}).app, null);
+test('3. no human name: es "Aplicación", en "Application"; the runtime picks no language', () => {
+  assert.equal(displayAppName({name: '', bundle: CLAUDE}, {name: CLAUDE, bundle: CLAUDE}), null);
+  assert.equal(displayAppName({name: '   ', bundle: CLAUDE}, {name: '', bundle: CLAUDE}), null);
+  const s = session('', CLAUDE);
+  const m = model(s);
+  assert.equal(m.app, null);
+  assert.equal(m.appGeneric, true);
+  for (const lang of LANGS) assert.equal(shownTitle(s, lang).title, GENERIC[lang], lang);
+  const runtime = fs.readFileSync(new URL('../runtime.mjs', import.meta.url), 'utf8');
+  assert.ok(!runtime.includes('Aplicación') && !runtime.includes("'Application'"), 'no language in the runtime');
 });
 
-test('6. the technical facts keep the exact bundle id', () => {
-  const m = model(session(''));
-  assert.equal(m.technical.target.bundle, CLAUDE);
+test('4. the bundle id never appears as the visible title', () => {
+  assert.equal(displayAppName({name: CLAUDE, bundle: CLAUDE}, {name: 'Claude', bundle: CLAUDE}), 'Claude');
+  for (const s of [session(''), session('', CLAUDE), session('Claude Desktop', CLAUDE)])
+    for (const lang of LANGS) {
+      const {title, all} = shownTitle(s, lang);
+      assert.notEqual(title, CLAUDE);
+      assert.ok(!all.includes(CLAUDE), `no bundle id in the compact PiP (${lang})`);
+    }
 });
 
-test('7. canRead, phase, verification and grants are unchanged by the name', () => {
-  const unnamed = session('');
-  const named = session('Claude');
-  const a = model(unnamed), b = model(named);
-  assert.equal(b.app, 'Claude');
+test('5. technical.target.bundle keeps the exact bundle id', () => {
+  for (const s of [session(''), session('', CLAUDE)]) assert.equal(model(s).technical.target.bundle, CLAUDE);
+});
+
+test('6. unverified: no visible app and no generic marker', () => {
+  const s = session('', CLAUDE);
+  for (const bad of [{...s, bridge: 'incompatible'}, {...s, target: {...s.target, background: false}}, {...s, grants: []}]) {
+    const m = model(bad);
+    assert.equal(m.app, null);
+    assert.equal(m.appGeneric, false);
+  }
+  const idle = pipPresentation(initialState(), {sessionId: 'a', view: VIEW});
+  assert.equal(idle.app, null);
+  assert.equal(idle.appGeneric, false);
+});
+
+test('7. phase, canRead, verification and grants are unchanged by the name', () => {
+  const generic = session('', CLAUDE), named = session('Claude', 'Claude');
+  const a = model(generic), b = model(named);
   for (const key of ['visible', 'phase', 'status', 'tone', 'mode', 'canRead', 'window', 'code', 'ageMs', 'frameAt'])
     assert.deepEqual(a[key], b[key], key);
   assert.deepEqual(a.technical, b.technical);
-  assert.deepEqual(unnamed.target, {...named.target, name: unnamed.target.name});
-  assert.deepEqual(unnamed.grants.map(g => [g.bundle, g.scopes]), [[CLAUDE, ['control', 'observe']]]);
-  assert.equal(unnamed.grants[0].name, CLAUDE, 'grant parsing unchanged');
+  assert.deepEqual(generic.target, {...named.target, name: generic.target.name});
+  assert.deepEqual(generic.grants.map(g => [g.bundle, g.scopes]), [[CLAUDE, ['control', 'observe']]]);
+  assert.equal(session('').grants[0].name, CLAUDE, 'grant parsing unchanged');
 });
