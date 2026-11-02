@@ -154,7 +154,11 @@ class CodesignOnMacTests(unittest.TestCase):
         try:
             app = os.path.join(work, "Probe.app")
             os.makedirs(os.path.join(app, "Contents", "MacOS"))
-            shutil.copy2("/usr/bin/true", os.path.join(app, "Contents", "MacOS", "Probe"))
+            # copyfile + chmod, never copy2: copy2 also copies the system
+            # binary's flags (chflags), which macOS refuses for /usr/bin.
+            probe = os.path.join(app, "Contents", "MacOS", "Probe")
+            shutil.copyfile("/usr/bin/true", probe)
+            os.chmod(probe, 0o755)
             pathlib.Path(app, "Contents", "Info.plist").write_text(
                 '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'
                 "<key>CFBundleIdentifier</key><string>com.cmm.computer-use.codesign-test</string>"
@@ -301,6 +305,11 @@ class OrchestratorSourceTests(unittest.TestCase):
         teardown = code[code.index("def phase_teardown"):code.index("def phase_verify_production")]
         self.assertIn('if exe.startswith(lane.work + "/"):', teardown)
         self.assertNotIn("pkill", code)
+
+    def test_tests_never_copy2_a_system_binary(self):
+        # copy2 carries BSD flags over; macOS refuses chflags on /usr/bin copies.
+        own = pathlib.Path(__file__).read_text()
+        self.assertNotRegex(own, r"copy2\(\s*[\"']/usr/bin/")
 
     def test_sources_parse_as_python_39(self):
         for path in (VERIFY / "isolated-live.py", VERIFY / "isolated_live_lib.py",
