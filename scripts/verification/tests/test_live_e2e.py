@@ -414,5 +414,220 @@ class PerStepTargetTests(unittest.TestCase):
         self.assertFalse(e2e.quiet_step_ok(v))
 
 
+def claude_view(settings_open=False, tab="General", close_button=True, extra_settings=False, breach=False):
+    """A Claude observation as the helper would return it."""
+    elements = [
+        {"element_id": 1, "role": "AXButton", "subrole": "AXCloseButton", "title": "cerrar", "value": "",
+         "x": 8, "y": 8, "width": 14, "height": 16, "pressable": True, "window_chrome": True, "actionable": False},
+        {"element_id": 2, "role": "AXButton", "title": "Nuevo chat", "value": "", "x": 20, "y": 60,
+         "width": 120, "height": 28, "pressable": True, "actionable": True},
+        {"element_id": 3, "role": "AXPopUpButton", "title": "Ajustes", "value": "", "x": 20, "y": 900,
+         "width": 120, "height": 28, "pressable": True, "actionable": True},
+    ]
+    if extra_settings:
+        elements.append({"element_id": 4, "role": "AXButton", "title": "Ajustes", "value": "", "x": 300,
+                         "y": 900, "width": 80, "height": 28, "pressable": True, "actionable": True})
+        elements.append({"element_id": 5, "role": "AXButton", "title": "Ajustes", "value": "", "x": 400,
+                         "y": 900, "width": 80, "height": 28, "pressable": True, "actionable": True})
+    content = [{"role": "AXWebArea", "text": "Nuevo chat - Claude"}, {"role": "AXHeading", "text": "Claude Code"}]
+    if settings_open:
+        for i, title in enumerate(("General", "Cuenta", "Privacidad", "Apariencia")):
+            elements.append({"element_id": 10 + i, "role": "AXRadioButton", "title": title, "value": "",
+                             "x": 200, "y": 100 + 30 * i, "width": 120, "height": 24,
+                             "pressable": True, "actionable": True})
+        if close_button:
+            elements.append({"element_id": 20, "role": "AXButton", "title": "Cerrar", "value": "", "x": 900,
+                             "y": 80, "width": 24, "height": 24, "pressable": True, "actionable": True})
+        content = [{"role": "AXHeading", "text": tab}] + (
+            [{"role": "AXStaticText", "text": "Nombre completo"}, {"role": "AXStaticText", "text": "Correo"},
+             {"role": "AXStaticText", "text": "Cerrar sesión"}] if tab == "Cuenta" else
+            [{"role": "AXStaticText", "text": "Tema"}, {"role": "AXStaticText", "text": "Idioma"},
+             {"role": "AXStaticText", "text": "Atajos"}])
+    obs = claude_observation()
+    obs.update(elements=elements, content=content, snapshot=30, ax_access="actionable")
+    return obs
+
+
+class SettingsPressDriver:
+    """Plays a Claude that opens Settings on AXPress of 'Ajustes'."""
+
+    UNTOUCHED = ("interference: verdict=untouched cursor_moved=False policy=background\n"
+                 "attributable: cursor_events_posted=False cursor_moved_by_action=False "
+                 "focus_became_target=False external_activity=False\n")
+
+    def __init__(self, extra_settings=False, breach_on_settings=False, opens=True, close_button=True):
+        self.calls = []
+        self.open = False
+        self.tab = "General"
+        self.extra = extra_settings
+        self.breach_on_settings = breach_on_settings
+        self.opens = opens
+        self.close_button = close_button
+
+    def view(self, element_filter=""):
+        return _render_observation(claude_view(self.open, self.tab, self.close_button, self.extra), element_filter)
+
+    def call(self, step, tool, args, quiet=True, target=None):
+        self.calls.append((step, tool, dict(args), quiet, target))
+        if tool == "computer_use_observe":
+            return self.view(args.get("filter", "")), False
+        element = args["element_id"]
+        if element == 3:
+            if self.breach_on_settings:
+                return ("REFUSED INTERFERENCE_BREACH: raised [policy=background;reason=breach;kind=ui.press]\n"
+                        + self.UNTOUCHED.replace("untouched", "focus_changed")), True
+            self.open = self.opens
+        elif element == 11:
+            self.tab = "Cuenta"
+        elif element == 20:
+            self.open = False
+        return "ui.press: pressed\n" + self.UNTOUCHED, False
+
+
+class PressControlTests(unittest.TestCase):
+    def test_open_settings_navigate_and_close_is_proven(self):
+        d = SettingsPressDriver()
+        out = e2e.run_press_control(d, CLAUDE)
+        self.assertTrue(out["attempted"])
+        self.assertEqual(out["settings_element"], {"role": "AXPopUpButton", "title": "Ajustes"})
+        self.assertTrue(out["settings_opened"], out.get("settings_evidence"))
+        self.assertGreaterEqual(len(out["settings_evidence"]["new_markers"]), 2)
+        self.assertEqual(out["navigation"]["label"], "Cuenta")
+        self.assertTrue(out["navigation"]["changed"])
+        self.assertTrue(out["closed"])
+        self.assertTrue(all(quiet and target == CLAUDE for _, _, _, quiet, target in d.calls))
+        pressed = [args["element_id"] for _, tool, args, _, _ in d.calls if tool == "computer_use_press"]
+        self.assertEqual(pressed, [3, 11, 20], "Settings, a tab, close — never a window control, never a toggle")
+        self.assertNotIn(1, pressed)
+        tools = {tool for _, tool, _, _, _ in d.calls}
+        self.assertEqual(tools, {"computer_use_observe", "computer_use_press"})
+        claims = e2e.control_claims({"readable": True, "actionable": True}, {"attempted": False},
+                                    None, press=out, witness_ok_for_press=True, environment={"ok": True})
+        self.assertEqual((claims["observe_proven"], claims["actionable"], claims["press_control_proven"],
+                          claims["control_proven"], claims["background_noninterference_proven"]),
+                         (True, True, True, True, True))
+        self.assertFalse(claims["set_value_control_proven"])
+
+    def test_no_settings_control_is_an_honest_gap_and_nothing_is_pressed(self):
+        d = SettingsPressDriver()
+        d.view = lambda element_filter="": _render_observation(claude_observation(), element_filter)
+        out = e2e.run_press_control(d, CLAUDE)
+        self.assertFalse(out["attempted"])
+        self.assertEqual(out["reason"], "settings_control_not_found")
+        self.assertNotIn("computer_use_press", [tool for _, tool, _, _, _ in d.calls])
+
+    def test_ambiguous_settings_is_never_guessed(self):
+        d = SettingsPressDriver(extra_settings=True)
+        out = e2e.run_press_control(d, CLAUDE)
+        # Three "Ajustes": one AXPopUpButton, two AXButtons -> ambiguous.
+        self.assertFalse(out["attempted"])
+        self.assertEqual(out["reason"], "settings_control_ambiguous")
+        self.assertNotIn("computer_use_press", [tool for _, tool, _, _, _ in d.calls])
+
+    def test_a_breach_stops_after_the_first_press(self):
+        d = SettingsPressDriver(breach_on_settings=True)
+        out = e2e.run_press_control(d, CLAUDE)
+        self.assertTrue(out["breach"])
+        self.assertEqual(out["reason"], "breach_stop")
+        self.assertEqual([tool for _, tool, _, _, _ in d.calls][-1], "computer_use_press",
+                         "nothing after the breach: no re-observe, no retry")
+        claims = e2e.control_claims({"readable": True, "actionable": True}, {}, None, press=out,
+                                    witness_ok_for_press=False, environment={"ok": True})
+        self.assertFalse(claims["press_control_proven"])
+        self.assertFalse(claims["background_noninterference_proven"])
+
+    def test_a_press_that_opens_nothing_is_not_control(self):
+        out = e2e.run_press_control(SettingsPressDriver(opens=False), CLAUDE)
+        self.assertTrue(out["attempted"])
+        self.assertFalse(out["settings_opened"])
+        self.assertEqual(out["reason"], "settings_not_observed")
+        claims = e2e.control_claims({"readable": True, "actionable": True}, {}, None, press=out,
+                                    witness_ok_for_press=True, environment={"ok": True})
+        self.assertFalse(claims["press_control_proven"])
+
+    def test_no_close_button_leaves_settings_open_and_says_so(self):
+        out = e2e.run_press_control(SettingsPressDriver(close_button=False), CLAUDE)
+        self.assertIsNone(out["closed"])
+        self.assertTrue(out["settings_opened"])
+
+    def test_a_noisy_witness_withholds_press_control(self):
+        out = e2e.run_press_control(SettingsPressDriver(), CLAUDE)
+        claims = e2e.control_claims({"readable": True, "actionable": True}, {}, None, press=out,
+                                    witness_ok_for_press=False, environment={"ok": True})
+        self.assertFalse(claims["press_control_proven"])
+        self.assertFalse(claims["control_proven"])
+        self.assertFalse(claims["background_noninterference_proven"])
+
+
+class LabelPickingTests(unittest.TestCase):
+    def test_exact_label_and_window_controls_are_never_candidates(self):
+        text = _render_observation(claude_view())
+        element, status, _ = e2e.pick_labeled(text, e2e.SETTINGS_LABELS)
+        self.assertEqual((element["id"], status), (3, "exact"))
+        chrome_only = claude_view()
+        chrome_only["elements"] = [dict(chrome_only["elements"][0], title="Ajustes")]
+        self.assertEqual(e2e.pick_labeled(_render_observation(chrome_only), e2e.SETTINGS_LABELS)[1], "not_found")
+
+    def test_semantic_match_only_when_unique(self):
+        view = claude_view()
+        view["elements"][2]["title"] = "Ajustes…"
+        self.assertEqual(e2e.pick_labeled(_render_observation(view), e2e.SETTINGS_LABELS)[1], "exact")
+        view["elements"][2]["title"] = "Abrir ajustes"
+        self.assertEqual(e2e.pick_labeled(_render_observation(view), e2e.SETTINGS_LABELS)[1], "semantic")
+        view["elements"][1]["title"] = "Ajustes de chat"
+        self.assertEqual(e2e.pick_labeled(_render_observation(view), e2e.SETTINGS_LABELS)[1], "ambiguous")
+
+
+class EnvironmentPreconditionTests(unittest.TestCase):
+    PERSON = "com.apple.Terminal"
+
+    def rows(self, front=None, move_at=None, n=160, now=100.0):
+        return [{"t": now - 1.59 + i * 0.01, "front": front or self.PERSON, "top": self.PERSON,
+                 "x": 10.0 + (5.0 if move_at is not None and i >= move_at else 0.0), "y": 10.0} for i in range(n)]
+
+    def test_quiet_terminal_passes(self):
+        v = e2e.environment_quiet(self.rows(), 100.0, self.PERSON)
+        self.assertTrue(v["ok"])
+
+    def test_the_last_run_state_fails_explicitly(self):
+        v = e2e.environment_quiet(self.rows(front="com.apple.UserNotificationCenter"), 100.0, self.PERSON)
+        self.assertEqual((v["ok"], v["reason"]), (False, "frontmost_not_person"))
+        v = e2e.environment_quiet(self.rows(move_at=80), 100.0, self.PERSON)
+        self.assertEqual((v["ok"], v["reason"]), (False, "cursor_moving"))
+        v = e2e.environment_quiet(self.rows(n=10), 100.0, self.PERSON)
+        self.assertEqual((v["ok"], v["reason"]), (False, "witness_samples_insufficient"))
+
+    def test_waits_for_one_quiet_window_bounded(self):
+        clock = {"now": 100.0}
+        windows = [self.rows(front="com.apple.UserNotificationCenter", now=101.5), self.rows(now=103.0)]
+        with mock.patch.object(e2e, "read_monitor", side_effect=windows), \
+             mock.patch.object(e2e, "uptime", side_effect=[101.5, 103.0]), \
+             mock.patch.object(e2e.time, "sleep", lambda s: clock.update(now=clock["now"] + s)):
+            out = e2e.wait_for_quiet_environment("/m", self.PERSON)
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["attempts"]), 2)
+        noisy = [self.rows(move_at=10, now=101.5)] * 3
+        with mock.patch.object(e2e, "read_monitor", side_effect=noisy), \
+             mock.patch.object(e2e, "uptime", side_effect=[101.5, 101.5, 101.5]), \
+             mock.patch.object(e2e.time, "sleep", lambda s: None):
+            out = e2e.wait_for_quiet_environment("/m", self.PERSON)
+        self.assertEqual((out["ok"], out["reason"], len(out["attempts"])), (False, "environment_not_quiet", 3))
+
+    def test_environment_failure_blocks_the_control_claims(self):
+        claims = e2e.control_claims({"readable": True, "actionable": True}, {}, None,
+                                    press={"attempted": False, "reason": "environment_not_quiet"},
+                                    environment={"ok": False})
+        self.assertFalse(claims["control_proven"])
+        self.assertEqual(claims["control_unproven_reason"], "environment_not_quiet")
+
+    def test_main_checks_the_environment_before_the_first_claude_step(self):
+        source = (VERIFY / "live_background_e2e.py").read_text()
+        main = source[source.index("def main() -> int:"):]
+        self.assertLess(main.index("wait_for_quiet_environment(args.monitor, args.person_app)"),
+                        main.index('"7 electron observe"'))
+        self.assertIn("if args.electron_app and args.electron_control and environment and environment[\"ok\"]:", main)
+        self.assertIn('checks["electron_control_environment_quiet"] = environment["ok"]', main)
+
+
 if __name__ == "__main__":
     unittest.main()

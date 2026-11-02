@@ -293,7 +293,9 @@ def phase_prepare(args) -> Lane:
     if args.electron_control and not args.electron_app:
         raise Gate("--electron-control needs --electron-app")
     lane.state.update(work=lane.work, electron_app=args.electron_app or "",
-                      electron_control=bool(args.electron_control), results={})
+                      electron_control=bool(args.electron_control),
+                      electron_composer_test=bool(args.electron_composer_test),
+                      person_app=args.person_app, results={})
 
     snap = production_snapshot()
     pathlib.Path(lane.path("production-before.json")).write_text(json.dumps(snap, indent=2, sort_keys=True))
@@ -543,7 +545,9 @@ def phase_live(lane: Lane) -> None:
     if lane.state.get("electron_app"):
         cmd += ["--electron-app", lane.state["electron_app"]]
         if lane.state.get("electron_control"):
-            cmd += ["--electron-control"]
+            cmd += ["--electron-control", "--person-app", lane.state.get("person_app") or "com.apple.Terminal"]
+            if lane.state.get("electron_composer_test"):
+                cmd += ["--electron-composer-test"]
     cmd += ["--breach-control"]  # the controlled breach is the e2e's LAST step
     say("== LIVE: %s" % " ".join(cmd))
     proc = subprocess.run(cmd, env=env)
@@ -697,8 +701,12 @@ def main() -> int:
     parser.add_argument("--staged-app", default=str(REPO / "build/stage-20261102/CMMComputerUse.app"))
     parser.add_argument("--electron-app", default="")
     parser.add_argument("--electron-control", action="store_true",
-                        help="grant the Electron app `control` in the TEMPORARY policy and run the reversible "
-                             "composer test (set a test text without sending it, verify, restore)")
+                        help="grant the Electron app `control` in the TEMPORARY policy and prove control with "
+                             "reversible AXPresses (open Settings, prove it by AX content, switch tab, close)")
+    parser.add_argument("--electron-composer-test", action="store_true",
+                        help="with --electron-control: also the optional composer set_value test")
+    parser.add_argument("--person-app", default="com.apple.Terminal",
+                        help="the app that must be in front (environment precondition) during Claude steps")
     parser.add_argument("--no-live", action="store_true", help="all: stop after rearm-tests (no LIVE, no breach)")
     parser.add_argument("--confirm-control", action="store_true",
                         help="after-breach phase alone: one fixture press after the rearm "

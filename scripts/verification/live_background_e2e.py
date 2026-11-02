@@ -223,32 +223,292 @@ def find_same_input(text: str, composer: dict):
     return None
 
 
-def control_claims(observe: dict, control: dict, witness_ok_for_control) -> dict:
-    """The four claims, kept apart and never inferred from one another.
+# ── AXPress control proof (Claude Desktop) ───────────────────────────
+
+ELEMENT_LINE = re.compile(r'^\[(\d+)\] (\S+) "(.*)" \((-?\d+),(-?\d+) (\d+)x(\d+)\)(.*)$', re.M)
+SETTINGS_LABELS = ("ajustes", "settings", "configuración", "configuracion")
+NAV_LABELS = ("cuenta", "account", "general")
+CLOSE_LABELS = ("cerrar", "close")
+#: Words that a settings view shows and a chat view normally does not.
+SETTINGS_MARKERS = ("general", "cuenta", "account", "privacidad", "privacy", "apariencia", "appearance",
+                    "perfil", "profile", "facturación", "billing", "capacidades", "capabilities",
+                    "conectores", "connectors", "desarrollador", "developer", "extensiones", "extensions",
+                    "notificaciones", "notifications")
+
+
+def elements_of(text: str) -> list:
+    """Interactive elements as the adapter rendered them."""
+
+    out = []
+    for m in ELEMENT_LINE.finditer(text):
+        flags = m.group(8)
+        chrome = "window-control" in flags
+        out.append({"id": int(m.group(1)), "role": m.group(2), "title": m.group(3),
+                    "x": int(m.group(4)), "y": int(m.group(5)), "w": int(m.group(6)), "h": int(m.group(7)),
+                    "pressable": flags.startswith(" pressable") and not chrome, "window_chrome": chrome})
+    return out
+
+
+def normalized_label(title: str) -> str:
+    return re.sub(r"(\u2026|\.\.\.|:)\s*$", "", (title or "").strip()).strip().casefold()
+
+
+def pick_labeled(text: str, labels) -> tuple:
+    """Exactly ONE pressable, non-window-control element whose title IS one of
+    `labels` (exact, normalized), else whose title contains one as a word.
+    Returns (element|None, status, matches) with status exact | semantic |
+    ambiguous | not_found. Ambiguity is never resolved by guessing."""
+
+    candidates = [e for e in elements_of(text) if e["pressable"] and not e["window_chrome"]]
+    labels = tuple(l.casefold() for l in labels)
+    exact = [e for e in candidates if normalized_label(e["title"]) in labels]
+    if len(exact) > 1:
+        preferred = [e for e in exact if e["role"] in ("AXButton", "AXMenuItem")]
+        exact = preferred if len(preferred) == 1 else exact
+    if len(exact) == 1:
+        return exact[0], "exact", exact
+    if len(exact) > 1:
+        return None, "ambiguous", exact
+    semantic = [e for e in candidates if len(e["title"]) <= 40 and any(
+        re.search(r"(^|\W)%s(\W|$)" % re.escape(l), normalized_label(e["title"])) for l in labels)]
+    if len(semantic) == 1:
+        return semantic[0], "semantic", semantic
+    return None, ("ambiguous" if semantic else "not_found"), semantic
+
+
+def settings_markers(text: str) -> set:
+    """Settings-view words present as element titles or readable content."""
+
+    found = set()
+    for line in text.splitlines():
+        m = re.match(r'^(?:\[\d+\] \S+|- \S+) "(.*?)"', line)
+        if not m:
+            continue
+        label = normalized_label(m.group(1))
+        for marker in SETTINGS_MARKERS:
+            if re.search(r"(^|\W)%s(\W|$)" % re.escape(marker), label):
+                found.add(marker)
+    return found
+
+
+def view_lines(text: str) -> set:
+    """Readable content and element titles: the fingerprint of what is shown."""
+
+    lines = set()
+    for line in text.splitlines():
+        m = re.match(r'^(?:\[\d+\] (\S+)|- (\S+)) "(.*?)"', line)
+        if m:
+            lines.add(((m.group(1) or m.group(2)), m.group(3)))
+    return lines
+
+
+def settings_opened(before: str, after: str) -> dict:
+    """Did the press open a settings view? Two NEW settings markers, or a
+    window title that now names settings."""
+
+    new = settings_markers(after) - settings_markers(before)
+    window = re.search(r'"window":"([^"]*)"', after)
+    window_says = bool(window) and any(l in window.group(1).casefold() for l in SETTINGS_LABELS)
+    return {"new_markers": sorted(new), "window_title_says_settings": window_says,
+            "opened": len(new) >= 2 or window_says}
+
+
+def panel_changed(before: str, after: str, minimum: int = 3) -> dict:
+    changed = view_lines(before) ^ view_lines(after)
+    return {"changed_lines": len(changed), "changed": len(changed) >= minimum}
+
+
+def environment_quiet(rows, now: float, person_bundle: str, tail: float = TAIL,
+                      min_samples: int = 50, threshold: float = 0.5) -> dict:
+    """Precondition before touching Claude: over the last `tail` seconds the
+    INDEPENDENT witness saw the person's app in front the whole time, enough
+    samples, and a still cursor. Not satisfied -> do not operate Claude."""
+
+    window = [r for r in rows if now - tail <= r["t"] <= now]
+    facts = {"samples": len(window), "person": person_bundle,
+             "fronts": sorted({r.get("front", "") for r in window}),
+             "tops": sorted({r.get("top", "") for r in window})}
+    if len(window) < min_samples:
+        return dict(facts, ok=False, reason="witness_samples_insufficient")
+    if any(r.get("front") != person_bundle for r in window):
+        return dict(facts, ok=False, reason="frontmost_not_person")
+    ref = window[0]
+    delta = max(abs(r["x"] - ref["x"]) + abs(r["y"] - ref["y"]) for r in window)
+    facts["cursor_delta"] = delta
+    if delta > threshold:
+        return dict(facts, ok=False, reason="cursor_moving")
+    return dict(facts, ok=True, reason=None)
+
+
+def read_monitor(path: str) -> list:
+    rows = []
+    try:
+        for line in pathlib.Path(path).read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass  # a line being written
+    except OSError:
+        pass
+    return rows
+
+
+def wait_for_quiet_environment(monitor_path: str, person_bundle: str, attempts: int = 3) -> dict:
+    """Wait (bounded) for one full quiet TAIL window; report every attempt."""
+
+    tries = []
+    for _ in range(attempts):
+        time.sleep(TAIL)
+        verdict = environment_quiet(read_monitor(monitor_path), uptime(), person_bundle)
+        tries.append(verdict)
+        if verdict["ok"]:
+            break
+    return {"ok": tries[-1]["ok"], "reason": None if tries[-1]["ok"] else "environment_not_quiet",
+            "attempts": tries}
+
+
+def run_press_control(d, app: str) -> dict:
+    """Prove control of `app` with reversible, non-destructive AXPresses through
+    computer_use_* only: open Settings, prove it by AX content, optionally
+    switch to another settings tab and prove the panel changed, optionally
+    close Settings again. No preference is ever changed: only navigation
+    controls are pressed. Every step is quiet and judged against `app`."""
+
+    out = {"attempted": False, "reason": None, "steps": [], "presses": []}
+
+    def call(step, tool, args):
+        out["steps"].append(step)
+        return d.call(step, tool, args, quiet=True, target=app)
+
+    def press(step, element, snapshot_text):
+        text, err = call(step, "computer_use_press",
+                         {"element_id": element["id"], "snapshot": snapshot_of(snapshot_text)})
+        record = {"step": step, "role": element["role"], "title": element["title"], "ok": not err,
+                  "untouched": "verdict=untouched" in text, "breach": "INTERFERENCE_BREACH" in text}
+        out["presses"].append(record)
+        out["breach"] = out.get("breach") or record["breach"]
+        return record
+
+    # 1. Find Settings: unfiltered first (40-element cut), then by label.
+    base, err = call("P1 observe", "computer_use_observe", {"app": app})
+    if err or "(background)" not in base:
+        out["reason"] = "observe_failed_or_not_background"
+        return out
+    found, status, matches, source = None, "not_found", [], base
+    for label in ("Ajustes", "Settings", "Configuración"):
+        text, err = call("P1 find %s" % label, "computer_use_observe", {"app": app, "filter": label})
+        found, status, matches = pick_labeled(text, SETTINGS_LABELS)
+        if found or status == "ambiguous":
+            source = text
+            break
+    out["settings_match"] = {"status": status, "matches": [{k: m[k] for k in ("role", "title")} for m in matches]}
+    if not found:
+        out["reason"] = "settings_control_%s" % status
+        return out
+    out["attempted"] = True
+    out["settings_element"] = {k: found[k] for k in ("role", "title")}
+    first = press("P2 press Settings", found, source)
+    if not first["ok"] or first["breach"]:
+        out["reason"] = "breach_stop" if first["breach"] else "press_failed"
+        return out
+    after, _ = call("P3 re-observe (settings)", "computer_use_observe", {"app": app, "ax_diagnostics": True})
+    out["settings_evidence"] = settings_opened(base, after)
+    out["settings_opened"] = out["settings_evidence"]["opened"]
+    if not out["settings_opened"]:
+        out["reason"] = "settings_not_observed"
+        return out
+
+    # 2. Optional internal navigation (never a preference toggle).
+    for label in ("Cuenta", "Account", "General"):
+        text, _ = call("P4 find %s" % label, "computer_use_observe", {"app": app, "filter": label})
+        tab, tab_status, _ = pick_labeled(text, (label,))
+        if tab:
+            record = press("P5 press %s" % label, tab, text)
+            if record["breach"]:
+                out["reason"] = "breach_stop"
+                return out
+            later, _ = call("P6 re-observe (%s)" % label, "computer_use_observe", {"app": app})
+            out["navigation"] = dict(panel_changed(after, later), label=label, pressed_ok=record["ok"])
+            after = later
+            break
+    else:
+        out["navigation"] = {"label": None, "changed": None, "reason": "no_unambiguous_tab"}
+
+    # 3. Optional: close Settings again (an in-window close, never a window control).
+    text, _ = call("P7 find close", "computer_use_observe", {"app": app, "filter": "Cerrar"})
+    close, _, _ = pick_labeled(text, CLOSE_LABELS)
+    if close is None:
+        text, _ = call("P7 find close (en)", "computer_use_observe", {"app": app, "filter": "Close"})
+        close, _, _ = pick_labeled(text, CLOSE_LABELS)
+    if close:
+        record = press("P8 press close", close, text)
+        if record["breach"]:
+            out["reason"] = "breach_stop"
+            return out
+        final, _ = call("P9 re-observe (closed)", "computer_use_observe", {"app": app})
+        out["closed"] = record["ok"] and not settings_opened(base, final)["opened"]
+    else:
+        out["closed"] = None  # Settings left open: harmless, reported
+    return out
+
+
+def control_claims(observe: dict, control: dict, witness_ok_for_control,
+                   press: dict = None, witness_ok_for_press=None, environment: dict = None) -> dict:
+    """The claims, kept apart and never inferred from one another.
 
     observe_proven                     the window is readable (observe-only gate)
     actionable                         the helper reports a real control
-    control_proven                     a reversible change was made, VERIFIED by the
-                                       helper and by re-observation, and restored
-    background_noninterference_proven  for every control step: witness quiet
-                                       (no activation, no raise, cursor <= 0.5),
-                                       ledger untouched, no breach
+    press_control_proven               an AXPress opened Settings, PROVEN by AX content
+                                       on re-observation, every press untouched
+    set_value_control_proven           (optional composer test) a test text set,
+                                       verified twice and restored
+    control_proven                     press_control_proven OR set_value_control_proven
+    background_noninterference_proven  for every Claude control step: environment
+                                       quiet beforehand, witness quiet (no activation,
+                                       no raise, cursor <= 0.5), ledger untouched, no breach
     """
 
-    attempted = bool(control.get("attempted"))
-    noninterference = None
-    if attempted:
-        noninterference = bool(witness_ok_for_control) and control.get("set_untouched") is True \
+    control = control or {}
+    press = press or {}
+    env_ok = None if environment is None else environment.get("ok") is True
+
+    composer_attempted = bool(control.get("attempted"))
+    composer_quiet = None
+    if composer_attempted:
+        composer_quiet = bool(witness_ok_for_control) and control.get("set_untouched") is True \
             and control.get("restore_untouched") is True and not control.get("breach")
-    proven = attempted and noninterference is True and all(control.get(k) is True for k in (
+    set_proven = composer_attempted and composer_quiet is True and all(control.get(k) is True for k in (
         "set_verified", "observed_changed", "restore_verified", "observed_restored"))
+
+    press_attempted = bool(press.get("attempted"))
+    press_quiet = None
+    if press_attempted:
+        presses = press.get("presses") or []
+        press_quiet = bool(witness_ok_for_press) and bool(presses) and not press.get("breach") \
+            and all(p.get("untouched") for p in presses)
+    press_proven = press_attempted and press_quiet is True and press.get("settings_opened") is True \
+        and bool(press.get("presses")) and press["presses"][0].get("ok") is True
+
+    attempted_quiet = [q for q in (press_quiet, composer_quiet) if q is not None]
+    noninterference = None
+    if attempted_quiet:
+        noninterference = all(attempted_quiet) and env_ok is not False
+    proven = press_proven or set_proven
+    reason = None
+    if not proven:
+        if env_ok is False:
+            reason = "environment_not_quiet"
+        else:
+            reason = press.get("reason") or control.get("reason") or (
+                "not_attempted" if not (press_attempted or composer_attempted) else "checks_failed")
     return {
         "observe_proven": observe.get("readable") is True,
         "actionable": observe.get("actionable") is True,
+        "press_control_proven": press_proven,
+        "set_value_control_proven": set_proven,
         "control_proven": proven,
         "background_noninterference_proven": noninterference,
-        "control_unproven_reason": None if proven else (control.get("reason") or
-                                                         ("not_attempted" if not attempted else "checks_failed")),
+        "control_unproven_reason": reason,
     }
 
 
@@ -457,8 +717,12 @@ def main() -> int:
     parser.add_argument("--breach-control", action="store_true",
                         help="press the fixture's self-activating button (latches the fixture until CMM Console rearms it)")
     parser.add_argument("--electron-control", action="store_true",
-                        help="with --electron-app: prove control by setting a test text in its composer "
-                             "WITHOUT sending it, verifying and restoring it (needs `control` on that app)")
+                        help="with --electron-app: prove control with reversible AXPresses (open Settings, "
+                             "prove it by AX content, optionally switch tab and close); needs `control`")
+    parser.add_argument("--electron-composer-test", action="store_true",
+                        help="also run the optional composer set_value test (diagnostic)")
+    parser.add_argument("--person-app", default="com.apple.Terminal",
+                        help="the app that must stay in front during the Claude control steps")
     parser.add_argument("--monitor", required=True, help="JSONL written by focus-monitor")
     parser.add_argument("--report", required=True)
     args = parser.parse_args()
@@ -533,6 +797,18 @@ def main() -> int:
         # The fixture always has a scroll area: not finding one is a failure there.
         checks["scroll"] = False if args.app == FIXTURE else None
 
+    environment = None
+    if args.electron_app and args.electron_control:
+        # Precondition BEFORE the first Claude step: the person's app in front,
+        # a still cursor, a stable witness for a full TAIL. Otherwise nothing
+        # in Claude is operated (and the run says why).
+        environment = wait_for_quiet_environment(args.monitor, args.person_app)
+        diagnostics["electron_environment"] = environment
+        checks["electron_control_environment_quiet"] = environment["ok"]
+        if not environment["ok"]:
+            print("!! environment_not_quiet before Claude: %s — Claude will not be operated"
+                  % environment["attempts"][-1].get("reason"))
+
     if args.electron_app:
         text, err = d.call("7 electron observe", "computer_use_observe", {"app": args.electron_app},
                            target=args.electron_app)
@@ -542,14 +818,23 @@ def main() -> int:
         diagnostics["electron"] = verdict
     electron_observe = verdict if args.electron_app else {}
     control = {"attempted": False, "reason": "not_requested"}
-    if args.electron_app and args.electron_control:
+    press_control = {"attempted": False, "reason": "not_requested"}
+    if args.electron_app and args.electron_control and environment and environment["ok"]:
+        press_control = run_press_control(d, args.electron_app)
+        diagnostics["electron_press_control"] = press_control
+        checks["electron_control_no_breach"] = not press_control.get("breach")
+    elif args.electron_app and args.electron_control:
+        press_control = {"attempted": False, "reason": "environment_not_quiet"}
+    if args.electron_app and args.electron_composer_test and environment and environment["ok"] \
+            and not press_control.get("breach"):
         token = "CMM-CU control test - not sent %d" % int(time.time())
         control = run_electron_control(d, args.electron_app, token)
         diagnostics["electron_control"] = control
         if control.get("access"):
             electron_observe = dict(electron_observe, actionable=control["access"] == "actionable")
         # Safety gates (the claim itself may honestly stay unproven):
-        checks["electron_control_no_breach"] = not control.get("breach")
+        checks["electron_control_no_breach"] = checks.get("electron_control_no_breach", True) \
+            and not control.get("breach")
         if control.get("attempted") and control.get("set_verified"):
             # A verified test text MUST be gone again: never leave it behind.
             checks["electron_control_restored"] = control.get("restore_verified") is True \
@@ -612,10 +897,13 @@ def main() -> int:
             v["ok"] = v["target_front"] or v["target_top"]
             checks["witness_saw_breach"] = v["ok"]
     checks["witness_quiet"] = quiet_ok
-    control_steps = set(control.get("steps") or [])
-    witness_ok_for_control = all(v.get("ok") for st, v in zip(d.steps, verdicts) if st["step"] in control_steps) \
-        if control_steps else None
-    claims = control_claims(electron_observe, control, witness_ok_for_control) if args.electron_app else None
+    def witness_ok_for(steps):
+        names = set(steps or [])
+        return all(v.get("ok") for st, v in zip(d.steps, verdicts) if st["step"] in names) if names else None
+
+    claims = control_claims(electron_observe, control, witness_ok_for(control.get("steps")),
+                            press=press_control, witness_ok_for_press=witness_ok_for(press_control.get("steps")),
+                            environment=environment) if args.electron_app else None
     # Diagnosis of any cursor movement the witness saw: which step, when, and
     # what the helper's own ledger said. It explains the gate; it never
     # changes it, and external activity is never turned into a PASS.

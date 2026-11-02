@@ -228,3 +228,54 @@ Resultado en `claims` (no deciden PASS/FAIL; un "unproven" honesto es válido):
 Qué traer: el bloque `claims`, las líneas `ax_enrichment` y `ax_walk` de E1, las
 líneas `ax_diagnostics before/after` con sus candidatos, y las líneas
 `set_value:` de E2/E4.
+
+
+## Control de Claude por AXPress (sustituye al composer como prueba principal)
+
+LIVE de `65a7145`: tras el nuevo recorrido Claude es `actionable` (61
+controles, 162 candidatos en el escaneo profundo) pero no expone ningún campo
+de texto settable (`text_inputs=[]`), así que la prueba del composer no llegó a
+ejecutarse. La prueba de control pasa a ser **AXPress reversible**; el composer
+queda como diagnóstico opcional (`--electron-composer-test`).
+
+```bash
+python3 scripts/verification/isolated-live.py all \
+  --staged-app build/stage-<fecha>/CMMComputerUse.app \
+  --electron-app com.anthropic.claudefordesktop --electron-control
+```
+
+0. **Precondición de entorno** antes del primer paso Claude: durante una
+   ventana completa de `TAIL` el testigo debe ver `--person-app`
+   (por defecto `com.apple.Terminal`) en primer plano, cursor quieto y muestras
+   suficientes; hasta 3 intentos. Si no: `environment_not_quiet` (motivo
+   concreto: `frontmost_not_person`, `cursor_moving`,
+   `witness_samples_insufficient`), el check
+   `electron_control_environment_quiet` falla y **Claude no se opera**.
+   Cierra notificaciones antes de empezar (el run anterior tenía
+   `com.apple.UserNotificationCenter` delante).
+1. P1: observe de Claude y búsqueda con `filter` `Ajustes` / `Settings` /
+   `Configuración`. Sólo se acepta **un** elemento pulsable, que no sea control
+   de ventana, cuyo título sea exactamente esa etiqueta (o, si no hay exacto,
+   la contenga como palabra y sea único). Varios → `ambiguous`, no se pulsa.
+2. P2: `computer_use_press`. P3: re-observe; se exige evidencia AX de Ajustes:
+   ≥ 2 marcadores nuevos (General, Cuenta, Privacidad, Apariencia, …) o el
+   título de ventana.
+3. P4–P6 (opcional): una pestaña interna (`Cuenta`/`Account`, si no
+   `General`), pulsada y re-observada: el panel debe cambiar (≥ 3 líneas).
+4. P7–P9 (opcional): `Cerrar`/`Close` dentro de la ventana (nunca el botón de
+   ventana) para volver a dejarla como estaba; si no existe, Ajustes queda
+   abierto y se informa.
+
+Nunca se pulsa un interruptor o preferencia: sólo navegación. Todo es quiet y
+el testigo lo juzga contra Claude. Un AXPress que eleve Claude →
+`INTERFERENCE_BREACH`, latch, STOP.
+
+Claims: `observe_proven`, `actionable`, `press_control_proven`,
+`set_value_control_proven`, `control_proven` (= press OR set_value),
+`background_noninterference_proven` (precondición OK + testigo quiet + ledger
+untouched + sin breach), `control_unproven_reason`.
+
+Qué traer: `claims`, `electron_environment`, `electron_press_control`
+(elemento elegido, `settings_evidence`, `navigation`, `closed`, cada press con
+`untouched`) y cualquier `INTERFERENCE_BREACH` / `witness_window_overlap` /
+`CURSOR`.
