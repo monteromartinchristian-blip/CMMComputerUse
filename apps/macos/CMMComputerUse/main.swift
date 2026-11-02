@@ -180,6 +180,9 @@ nonisolated(unsafe) var deploymentMode: BridgeInteractionMode = .background
 /// resolved against a newer one (``bridgeSnapshotRefusal``).
 nonisolated(unsafe) var observationGeneration = 0
 nonisolated(unsafe) var observationCapturedAt: Double = 0
+/// Generations retired by `observation.release` (bounded): their handles are
+/// refused with `reason=released` (Shared: `bridgeReleasedSnapshotRefusal`).
+nonisolated(unsafe) var releasedSnapshots: Set<Int> = []
 
 /// Where the system cursor is.
 ///
@@ -738,15 +741,26 @@ final class Traversal: @unchecked Sendable {
     var elements: [[String: Any]] = []
     var content: [[String: Any]] = []
     var visited = 0
-    /// Elements collected under the regular budget / the text-input budget.
-    var regularElements = 0
-    var textInputs = 0
+    /// Which controls are returned (Shared: `BridgeProjectionBudget`): the
+    /// regular and text-input budgets, and the optional pushed-down filter.
+    var budget: BridgeProjectionBudget
     /// Where the bounded walk stopped short — reported, so "no control found"
     /// can be told apart from "the walk never got there".
     var depthCutoffs = 0
     var childrenCutoffs = 0
-    var budgetSkippedControls = 0
     var deepestDepth = 0
+    /// Pressable, non-window controls the FILTER left out: the window still
+    /// offers them, so a filtered projection never reads as "not actionable".
+    var filteredOutActionable = 0
+
+    init(elementFilter: String = "") {
+        budget = BridgeProjectionBudget(
+            filter: elementFilter, maxRegular: maxElements, maxTextInputs: maxTextInputs)
+    }
+
+    var regularElements: Int { budget.regular }
+    var textInputs: Int { budget.textInputs }
+    var budgetSkippedControls: Int { budget.budgetSkipped }
 
     var limits: [String: Any] {
         [
@@ -755,6 +769,14 @@ final class Traversal: @unchecked Sendable {
             "children_cutoffs": childrenCutoffs, "budget_skipped_controls": budgetSkippedControls,
             "element_budget": maxElements, "text_input_budget": maxTextInputs,
         ]
+    }
+
+    /// Only when a filter was pushed down.
+    var filterSummary: [String: Any]? {
+        guard budget.isFiltering else { return nil }
+        return ["text": budget.filter, "matched": elements.count,
+                "skipped_non_matching": budget.filterSkipped,
+                "non_matching_actionable": filteredOutActionable]
     }
 
     /// Whether a node carries text a person can read.
@@ -891,9 +913,15 @@ func ensureAccessibilityTree(
 
 /// Access class of one traversal (see `bridgeAXAccess`) and its actionable count.
 func traversalAccess(_ traversal: Traversal) -> (access: BridgeAXAccess, actionable: Int) {
-    let observed = traversal.elements.map {
+    var observed = traversal.elements.map {
         BridgeObservedElement(windowChrome: ($0["window_chrome"] as? Bool) == true,
                               actionable: ($0["actionable"] as? Bool) == true)
+    }
+    // A filter narrows what is RETURNED, not what the window offers: controls
+    // it left out still count, so a filtered observation neither looks
+    // "not actionable" nor triggers enrichment the unfiltered one would not.
+    if traversal.filteredOutActionable > 0 {
+        observed.append(BridgeObservedElement(windowChrome: false, actionable: true))
     }
     return (bridgeAXAccess(contentCount: traversal.content.count, elements: observed),
             observed.filter { $0.actionable }.count)
@@ -979,8 +1007,7 @@ func walk(
     if traversal.visited >= maxVisitedNodes { return }
     // Budgets are per list: running out of controls must not stop content
     // collection, and running out of content must not stop control collection.
-    if traversal.regularElements >= maxElements && traversal.content.count >= maxContentNodes
-        && traversal.textInputs >= maxTextInputs {
+    if traversal.budget.isFull && traversal.content.count >= maxContentNodes {
         return
     }
     traversal.visited += 1
@@ -988,10 +1015,29 @@ func walk(
 
     let role = (axAttr(element, kAXRoleAttribute) as? String) ?? "AXUnknown"
     let isTextInput = bridgeTextInputRoles.contains(role)
-    let hasRoom = isTextInput ? traversal.textInputs < maxTextInputs : traversal.regularElements < maxElements
-    if interactiveRoles.contains(role) && !hasRoom { traversal.budgetSkippedControls += 1 }
-    if interactiveRoles.contains(role), hasRoom {
-        if isTextInput { traversal.textInputs += 1 } else { traversal.regularElements += 1 }
+    var decision: BridgeProjectionBudget.Decision? = nil
+    if interactiveRoles.contains(role) {
+        // The filter fields are read only when a filter was pushed down.
+        decision = traversal.budget.consider(isTextInput: isTextInput) {
+            var fields = [role]
+            for attr in [kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute, kAXHelpAttribute,
+                         kAXRoleDescriptionAttribute, kAXIdentifierAttribute, "AXPlaceholderValue",
+                         kAXSubroleAttribute] {
+                if let text = axAttr(element, attr) as? String { fields.append(text) }
+            }
+            return fields
+        }
+        if decision == .skipFilter {
+            var skippedNames: CFArray?
+            let skippedActions = (AXUIElementCopyActionNames(element, &skippedNames) == .success
+                ? (skippedNames as? [String]) : nil) ?? []
+            if skippedActions.contains("AXPress"),
+               !bridgeIsWindowChrome(subrole: axAttr(element, kAXSubroleAttribute) as? String) {
+                traversal.filteredOutActionable += 1
+            }
+        }
+    }
+    if decision == .admit {
         let elementID = traversal.elements.count + 1
         var actionNames: CFArray?
         let namesErr = AXUIElementCopyActionNames(element, &actionNames)
@@ -1029,6 +1075,7 @@ func walk(
         ]
         if let subrole { entry["subrole"] = subrole }
         if bridgeIsWindowChrome(subrole: subrole) { entry["window_chrome"] = true }
+        if traversal.budget.isFiltering { entry["filter_match"] = true }
         let verticalBar = axElement(element, kAXVerticalScrollBarAttribute)
         let scrollPlan = bridgeScrollPlan(
             direction: .down, actions: actions, role: role,
@@ -1153,7 +1200,7 @@ func runningApp(named request: String) -> NSRunningApplication? {
 /// result that a client could mistake for a successful one.
 func describe(
     includeScreenshot: Bool, targetApp: String?, mode: BridgeInteractionMode,
-    includeDiagnostics: Bool = false
+    includeDiagnostics: Bool = false, elementFilter: String = ""
 ) -> (result: [String: Any]?, refusal: BridgePolicyRefusal?) {
     let workspace = NSWorkspace.shared
     let frontmost = workspace.frontmostApplication
@@ -1210,7 +1257,7 @@ func describe(
     observationGeneration += 1
     observationCapturedAt = Date().timeIntervalSince1970
 
-    var traversal = Traversal()
+    var traversal = Traversal(elementFilter: elementFilter)
     var enrichment: [String: Any] = ["state": "not_trusted"]
     var diagnostics: [String: Any] = [:]
     // Scope to the window the person is actually looking at. Walking the
@@ -1244,7 +1291,7 @@ func describe(
                 elementRoles.removeAll()
                 elementSubroles.removeAll()
                 elementContexts.removeAll()
-                traversal = Traversal()
+                traversal = Traversal(elementFilter: elementFilter)
                 walkTarget(traversal)
             }
         } else {
@@ -1333,7 +1380,8 @@ func buildDescription(
         BridgeObservedElement(windowChrome: ($0["window_chrome"] as? Bool) == true,
                               actionable: ($0["actionable"] as? Bool) == true)
     }
-    result["ax_access"] = bridgeAXAccess(contentCount: traversal.content.count, elements: observed).rawValue
+    result["ax_access"] = traversalAccess(traversal).access.rawValue
+    if let filterSummary = traversal.filterSummary { result["ax_filter"] = filterSummary }
     result["ax_counts"] = [
         "content": traversal.content.count,
         "elements": traversal.elements.count,
@@ -1508,14 +1556,25 @@ func appsList() -> [String: Any] {
 /// reference to another application's UI element and to the window it came
 /// from, and a client that has finished with an app should be able to say so
 /// without waiting for the next observation to sweep the table.
+/// Drop every element handle AND retire the generation that produced them.
+///
+/// Zeroing the timestamp (the old way) made the next action on an old handle
+/// report `reason=expired;age=<seconds since 1970>`. Now the generation moves
+/// on and is remembered as released: an old handle is refused with
+/// `reason=released` before any UI is touched; a fresh observation works as
+/// usual. Idempotent: each call retires the then-current generation.
 func releaseObservation() -> [String: Any] {
     let released = elementTable.count
+    let invalidated = observationGeneration
     elementTable.removeAll()
     elementRoles.removeAll()
     elementSubroles.removeAll()
     elementContexts.removeAll()
-    observationCapturedAt = 0
-    return ["released": released, "snapshot": observationGeneration]
+    releasedSnapshots.insert(invalidated)
+    if releasedSnapshots.count > 64, let oldest = releasedSnapshots.min() { releasedSnapshots.remove(oldest) }
+    observationGeneration += 1
+    observationCapturedAt = Date().timeIntervalSince1970
+    return ["released": released, "invalidated_snapshot": invalidated, "snapshot": observationGeneration]
 }
 
 /// The authorization document as diagnostics, never as content.
@@ -2151,6 +2210,11 @@ func elementPreconditions(
     kind: String, params: [String: Any], mode: BridgeInteractionMode
 ) -> BridgePolicyRefusal? {
     guard kind == "ui.press" || kind == "ui.set_value" || kind == "ui.scroll" else { return nil }
+    if let refusal = bridgeReleasedSnapshotRefusal(
+        requested: (params["snapshot"] as? NSNumber)?.intValue, releasedSnapshots: releasedSnapshots,
+        current: observationGeneration, mode: mode) {
+        return refusal
+    }
     let now = Date().timeIntervalSince1970
     if bridgeObservationExpired(capturedAt: observationCapturedAt, now: now, mode: mode) {
         return BridgePolicyRefusal(
@@ -2431,7 +2495,8 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         }
         let (result, refusal) = describe(
             includeScreenshot: include, targetApp: target, mode: resolved.mode,
-            includeDiagnostics: (arguments["include_ax_diagnostics"] as? Bool) ?? false)
+            includeDiagnostics: (arguments["include_ax_diagnostics"] as? Bool) ?? false,
+            elementFilter: (arguments["element_filter"] as? String) ?? "")
         if let refusal {
             return (false, nil, refusalFrame(refusal))
         }

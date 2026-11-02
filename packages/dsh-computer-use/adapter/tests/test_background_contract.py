@@ -450,6 +450,85 @@ class HumanTakeoverTests(Case):
                          "one call, no retry, no implicit re-observe")
 
 
+class FilterPushdownTests(Case):
+    """`filter` reaches the helper as `element_filter` (applied before its
+    budget); the adapter keeps a post-filter as defense."""
+
+    sent = []
+
+    @staticmethod
+    def responder(request):
+        FilterPushdownTests.sent.append(request)
+        op = request["operation"]
+        args = request["arguments"]
+        if op == "observation.release":
+            return ok(request, {"released": 54, "invalidated_snapshot": 21, "snapshot": 22})
+        if op != "observation.describe":
+            return failure(request, "CAPABILITY_UNSUPPORTED", "unexpected")
+        if args.get("app") == "com.apple.mail":
+            return failure(request, "APPROVAL_REJECTED", "The deployment does not authorize this application.",
+                           "auth=app_not_granted;app=com.apple.mail")
+        unrelated = [{"element_id": i, "role": "AXButton", "title": "Chat %d" % i, "value": "",
+                      "x": 0, "y": i, "width": 10, "height": 10, "pressable": True, "actionable": True}
+                     for i in range(1, 62)]
+        gear = {"element_id": 62, "role": "AXButton", "title": "Configuración de Code", "value": "",
+                "x": 900, "y": 20, "width": 24, "height": 24, "pressable": True, "actionable": True}
+        icon_only = {"element_id": 63, "role": "AXButton", "title": "", "value": "",
+                     "x": 950, "y": 20, "width": 24, "height": 24, "pressable": True, "actionable": True}
+        base = {"frontmost_app": "Terminal", "frontmost_bundle": "com.apple.Terminal", "target_app": "Claude",
+                "target_bundle": CLAUDE, "target_pid": 7, "target_window": "Claude", "target_window_id": 4,
+                "target_is_frontmost": False, "windows": [], "content": [], "snapshot": 21, "captured_at": 1.0,
+                "screenshot_scope": "none", "ax_tree": "ok", "ax_access": "actionable"}
+        if args.get("element_filter"):
+            # As the helper does: only matches, marked, plus the filter summary.
+            needle = args["element_filter"].lower()
+            matched = [dict(e, filter_match=True) for e in unrelated + [gear] if needle in e["title"].lower()]
+            if needle == "ajustes":  # matched on a field the text does not show (description)
+                matched = [dict(icon_only, filter_match=True)]
+            return ok(request, dict(base, elements=matched, ax_filter={
+                "text": args["element_filter"], "matched": len(matched), "skipped_non_matching": 62 - len(matched)}))
+        # Unfiltered: the ordinary budget cut the gear off.
+        return ok(request, dict(base, elements=unrelated[:60],
+                                ax_counts={"content": 0, "elements": 60, "actionable": 60, "window_controls": 0,
+                                           "limits": {"budget_skipped_controls": 2}}))
+
+    def setUp(self):
+        FilterPushdownTests.sent = []
+        super().setUp()
+
+    def describe_args(self):
+        return [r["arguments"] for r in FilterPushdownTests.sent if r["operation"] == "observation.describe"][-1]
+
+    def test_the_filter_is_pushed_down_and_finds_the_late_control(self):
+        text = text_of(self.call("computer_use_observe", {"app": CLAUDE, "filter": "Configuración"}))
+        self.assertEqual(self.describe_args()["element_filter"], "Configuración")
+        self.assertEqual(self.describe_args()["app"], CLAUDE)
+        self.assertIn('[62] AXButton "Configuración de Code"', text)
+        self.assertIn('ax_filter: "Configuración" matched=1 skipped_non_matching=61', text)
+
+    def test_no_filter_sends_nothing_new_and_keeps_the_bounded_projection(self):
+        text = text_of(self.call("computer_use_observe", {"app": CLAUDE}))
+        self.assertNotIn("element_filter", self.describe_args())
+        self.assertNotIn("Configuración de Code", text)
+        self.call("computer_use_observe", {"app": CLAUDE, "filter": "   "})
+        self.assertNotIn("element_filter", self.describe_args(), "blank filter == no filter")
+
+    def test_the_post_filter_keeps_what_the_helper_matched(self):
+        text = text_of(self.call("computer_use_observe", {"app": CLAUDE, "filter": "ajustes"}))
+        self.assertIn('[63] AXButton ""', text, "matched by the helper on description; kept by the adapter")
+
+    def test_a_filter_never_widens_authorization(self):
+        response = self.call("computer_use_observe", {"app": "com.apple.mail", "filter": "Configuración"})
+        self.assertTrue(response["result"].get("isError"))
+        self.assertIn("REFUSED APPROVAL_REJECTED", text_of(response))
+        self.assertEqual(len([r for r in FilterPushdownTests.sent if r["operation"] == "observation.describe"]), 1,
+                         "one request for the named app only; no global search")
+
+    def test_release_reports_the_invalidated_snapshot_and_the_new_generation(self):
+        text = text_of(self.call("computer_use_release"))
+        self.assertEqual(text, "released 54 element handle(s); snapshot 21 invalidated; current generation=22")
+
+
 class InstructionsTests(unittest.TestCase):
     def test_initialize_carries_the_no_bypass_policy(self):
         client = BridgeClient("/nonexistent/socket", policy="background")

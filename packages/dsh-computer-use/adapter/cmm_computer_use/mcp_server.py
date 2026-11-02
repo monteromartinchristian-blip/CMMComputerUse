@@ -454,10 +454,13 @@ class ToolRegistry:
         app = arguments.get("app") or None
         include = bool(arguments.get("include_screenshot", False))
         diagnose = bool(arguments.get("ax_diagnostics", False))
+        element_filter = str(arguments.get("filter") or "").strip()
+        extra: Dict[str, Any] = {}
         if diagnose:
-            observation = self.client.observe(app=app, include_screenshot=include, include_ax_diagnostics=True)
-        else:
-            observation = self.client.observe(app=app, include_screenshot=include)
+            extra["include_ax_diagnostics"] = True
+        if element_filter:
+            extra["element_filter"] = element_filter
+        observation = self.client.observe(app=app, include_screenshot=include, **extra)
         blocks: List[Dict[str, Any]] = [_text(_render_observation(
             observation, str(arguments.get("filter") or "")))["content"][0]]
         image = observation.get("screenshot_base64") if isinstance(observation, dict) else None
@@ -634,6 +637,9 @@ def _render_apps(result: Any) -> str:
 def _render_release(result: Any) -> str:
     if not isinstance(result, dict):
         return "released"
+    if "invalidated_snapshot" in result:
+        return "released %s element handle(s); snapshot %s invalidated; current generation=%s" % (
+            result.get("released", 0), result.get("invalidated_snapshot"), result.get("snapshot", "?"))
     return "released %s element handle(s); snapshot=%s" % (
         result.get("released", 0),
         result.get("snapshot", "?"),
@@ -672,6 +678,11 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
         # Before all untrusted AX content; fourth line of the observation.
         lines.extend(metadata.lstrip("\n").splitlines())
     lines.extend(_render_ax_tree(observation))
+    ax_filter = observation.get("ax_filter")
+    if isinstance(ax_filter, dict):
+        lines.append("ax_filter: %s matched=%s skipped_non_matching=%s (applied by the helper before its budget)" % (
+            json.dumps(ax_filter.get("text") or "", ensure_ascii=False), ax_filter.get("matched"),
+            ax_filter.get("skipped_non_matching")))
     windows = observation.get("windows") or []
     if windows:
         lines.append("windows on screen (%d):" % len(windows))
@@ -696,9 +707,13 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
             lines.append("- … %d more" % (len(content) - MAX_CONTENT_IN_TEXT))
     elements = observation.get("elements") or []
     if element_filter:
+        # Defense / compatibility post-filter. The helper already applied the
+        # filter before its budget and marks what it matched (`filter_match`),
+        # possibly on a field this text does not show (description, …).
         needle = element_filter.strip().lower()
         elements = [e for e in elements
-                    if needle in (e.get("title") or "").lower()
+                    if e.get("filter_match") is True
+                    or needle in (e.get("title") or "").lower()
                     or needle in (e.get("value") or "").lower()
                     or needle in (e.get("role") or "").lower()]
     if elements:

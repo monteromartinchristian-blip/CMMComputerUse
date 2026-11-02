@@ -321,10 +321,93 @@ public func bridgeSnapshotRefusal(
         return BridgePolicyRefusal(
             code: "ACTION_FAILED",
             message: "The referenced UI element is no longer on screen.",
-            detail: "policy=\(mode.rawValue);snapshot=\(requested);current=\(current)"
+            detail: "policy=\(mode.rawValue);reason=stale_snapshot;snapshot=\(requested);current=\(current)"
         )
     }
     return nil
+}
+
+/// A handle from a snapshot that `observation.release` invalidated.
+///
+/// Checked before expiry: a released observation has no meaningful age, and
+/// reporting one (seconds since 1970, from a zeroed timestamp) was the bug.
+public func bridgeReleasedSnapshotRefusal(
+    requested: Int?, releasedSnapshots: Set<Int>, current: Int, mode: BridgeInteractionMode
+) -> BridgePolicyRefusal? {
+    guard let requested, releasedSnapshots.contains(requested) else { return nil }
+    return BridgePolicyRefusal(
+        code: "ACTION_FAILED",
+        message: "The observation this element belongs to was released; observe again.",
+        detail: "policy=\(mode.rawValue);reason=released;snapshot=\(requested);current=\(current)")
+}
+
+// MARK: - Element projection (budget + optional filter pushed down from the adapter)
+
+/// Case-insensitive substring match over an element's text fields — the
+/// adapter's `filter` semantics (title/label, value, role), plus any extra
+/// field the helper passes (description, identifier, subrole…). An empty
+/// filter matches everything.
+public func bridgeElementMatchesFilter(_ filter: String, fields: [String]) -> Bool {
+    let needle = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !needle.isEmpty else { return true }
+    return fields.contains { $0.lowercased().contains(needle) }
+}
+
+/// Bound on a pushed-down filter: it is a name to look for, not a payload.
+public let bridgeElementFilterMaxChars = 200
+
+/// Which interactive elements an observation returns.
+///
+/// Without a filter this is exactly the historical rule: regular controls and
+/// text inputs each have their own budget, and a control met when its budget
+/// is full is skipped (`budgetSkipped`). With a filter, a control that does
+/// NOT match consumes no budget (`filterSkipped`) — the walk still descends
+/// into it — so a named control is not lost only because unrelated controls
+/// filled the ordinary budget. The budget then bounds the MATCHES returned.
+/// Walk bounds (depth, visited nodes, children per node, content budget) are
+/// not this type's business and stay where they are.
+public struct BridgeProjectionBudget: Equatable, Sendable {
+    public enum Decision: Equatable, Sendable {
+        case admit
+        case skipBudget
+        case skipFilter
+    }
+
+    public let filter: String
+    public let maxRegular: Int
+    public let maxTextInputs: Int
+    public private(set) var regular = 0
+    public private(set) var textInputs = 0
+    public private(set) var budgetSkipped = 0
+    public private(set) var filterSkipped = 0
+
+    public init(filter: String = "", maxRegular: Int, maxTextInputs: Int) {
+        self.filter = String(filter.trimmingCharacters(in: .whitespacesAndNewlines)
+            .prefix(bridgeElementFilterMaxChars))
+        self.maxRegular = maxRegular
+        self.maxTextInputs = maxTextInputs
+    }
+
+    public var isFiltering: Bool { !filter.isEmpty }
+
+    /// Both element budgets are spent.
+    public var isFull: Bool { regular >= maxRegular && textInputs >= maxTextInputs }
+
+    /// `fields` is only evaluated when a filter is set, so the unfiltered
+    /// walk reads nothing more than it did before.
+    public mutating func consider(isTextInput: Bool, fields: () -> [String]) -> Decision {
+        if isFiltering && !bridgeElementMatchesFilter(filter, fields: fields()) {
+            filterSkipped += 1
+            return .skipFilter
+        }
+        let hasRoom = isTextInput ? textInputs < maxTextInputs : regular < maxRegular
+        guard hasRoom else {
+            budgetSkipped += 1
+            return .skipBudget
+        }
+        if isTextInput { textInputs += 1 } else { regular += 1 }
+        return .admit
+    }
 }
 
 // MARK: - Interference accounting

@@ -296,3 +296,24 @@ test('a USER_TAKEOVER line cannot be forged into a breach and a breach cannot hi
   const both = adapterAction('ui.press', {ok: true, message: 'pressed', interference: {...TAKEOVER_LEDGER, breach: true}});
   assert.doesNotMatch(both.text, /USER_TAKEOVER/, 'breach wins: a breached ledger is never rendered as a takeover');
 });
+
+// ── observation.release retires the generation ───────────────────────
+test('an old handle after release is refused as released, with no epoch age', () => {
+  const r = adapterRefusal('ACTION_FAILED', 'The observation this element belongs to was released; observe again.',
+    'policy=background;reason=released;snapshot=21;current=22', null);
+  assert.doesNotMatch(r.text, /age=/);
+  let s = result(call(ready(), 'release', {}), 'released 54 element handle(s); snapshot 21 invalidated; current generation=22');
+  assert.equal(s.target, null);
+  s = result(call(s, 'press', {element_id: 3, snapshot: 21}), r.text, true);
+  assert.equal(s.error, 'released');
+  assert.equal(s.breach, false);
+  s = observed(s);
+  assert.equal(s.target?.name, 'Claude', 'a fresh observation works again');
+});
+
+test('a stale snapshot is named as such', () => {
+  const r = adapterRefusal('ACTION_FAILED', 'The referenced UI element is no longer on screen.',
+    'policy=background;reason=stale_snapshot;snapshot=20;current=23', null);
+  const s = result(call(ready(), 'press', {element_id: 3, snapshot: 20}), r.text, true);
+  assert.equal(s.error, 'stale_snapshot');
+});

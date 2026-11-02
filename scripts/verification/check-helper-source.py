@@ -153,6 +153,22 @@ check(re.search(r"&& \(attributed\.attribution == \.action \|\| attributed\.attr
       is not None and "bridgeHumanActivationInputs(sequence)" in POLICY_SRC,
       "breach excused ONLY by a correlated human input; no witness -> unknown -> breach (fail closed)")
 
+describe_start = main.index("func describe(")
+describe_body = main[describe_start:main.index("\nfunc buildDescription(", describe_start)]
+check(describe_body.index("authorization.decision(") < describe_body.index("walkTarget(traversal)")
+      and "Traversal(elementFilter: elementFilter)" in describe_body,
+      "P: the pushed-down filter is applied only after the app/window authorization, inside the target walk")
+release_start = main.index("func releaseObservation(")
+release_body = main[release_start:main.index("\n}\n", release_start)]
+check("observationGeneration += 1" in release_body and "releasedSnapshots.insert(" in release_body
+      and "observationCapturedAt = Date().timeIntervalSince1970" in release_body
+      and "observationCapturedAt = 0" not in release_body,
+      "R: release retires the generation (no zeroed timestamp, no epoch age)")
+pre_start = main.index("func elementPreconditions(")
+pre_body = main[pre_start:main.index("\n}\n", pre_start)]
+check(pre_body.index("bridgeReleasedSnapshotRefusal(") < pre_body.index("bridgeObservationExpired("),
+      "R: a released snapshot is refused as `released` before any expiry/age is computed")
+
 build = BUILD.read_text()
 shared = sorted(p.name for p in (REPO / "apps/macos/Shared").glob("*.swift"))
 missing = [name for name in shared if name not in build]

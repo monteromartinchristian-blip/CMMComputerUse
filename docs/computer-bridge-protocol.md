@@ -300,6 +300,43 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   `window_chrome_guard`, `ax_scroll`, `ax_tree_enrichment`,
   `breach_latch: "persistent"`, `breach_rearm`.
 
+### Filtered projection and release (helper 0.3.2)
+
+- **`observation.describe` accepts `element_filter?`** (string, ≤ 200 chars;
+  additive within protocol v1). The adapter filter is pushed down to the
+  helper so a named control is not lost only because unrelated controls
+  filled the ordinary projection budget. Semantics: case-insensitive
+  substring over role, title/label, value, description, help, role
+  description, identifier, placeholder and subrole (a superset of the
+  adapter's title/value/role). Absent or blank = exactly the previous
+  behaviour. Present: non-matching controls consume no element budget and the
+  walk still descends into them; the budgets (60 regular / 20 text inputs)
+  bound the MATCHES returned. Depth (40), visited nodes (6 000), children per
+  node (200) and the content budget are unchanged. Authorization is decided
+  before the walk exactly as before; a filter never widens apps or scopes and
+  never searches another application. Matched elements carry
+  `filter_match: true`; the observation carries
+  `ax_filter {text, matched, skipped_non_matching, non_matching_actionable}`.
+  Controls the filter left out still count for `ax_access` and for the
+  enrichment decision, so filtering never changes what the window is said to
+  offer. The adapter still post-filters (title/value/role or `filter_match`).
+- **`observation.release`** now retires the generation: it clears the element
+  tables, records the old generation as released, increments the generation
+  and stamps the observation time. Result: `{released, invalidated_snapshot,
+  snapshot}` — `snapshot` is the NEW generation (after the invalidation).
+  An element action with a released snapshot is refused before any UI with
+  `ACTION_FAILED detail=policy=…;reason=released;snapshot=<old>;current=<new>`
+  (no `age`). Any other old snapshot is refused with
+  `reason=stale_snapshot;snapshot=…;current=…`. A new observation works as
+  usual. Idempotent: each call retires the then-current generation.
+- Not changed: interference accounting, attribution, HID witness, settle
+  window, breach/latch/rearm, window-chrome guard, set_value, scroll.
+  Known pending item: the `USER_TAKEOVER` invalidation still zeroes the
+  observation time, so an old handle after a takeover reports
+  `reason=expired` with an epoch-sized `age` (safe, but the number is
+  meaningless); left untouched because that block belongs to the attribution
+  path.
+
 ### Who moved the focus: action vs person (helper 0.3.1)
 
 Bug fixed: the person clicked the target while an AX action on it was

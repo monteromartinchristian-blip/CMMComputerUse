@@ -264,7 +264,7 @@ export function fold(state, event) {
   if(call.revision!==state.revision&&call.name!=='status')return {...state,pending};
   if(msg.isError || /^REFUSED /m.test(text)) {
     const code=text.match(/^REFUSED ([A-Z_]+)/m)?.[1];
-    const reason=text.match(/(?:^|[; =])reason=(app_not_granted|window_changed|pid_changed|expired|global_input_not_scoped|breach_latch_invalid|breach)(?:[; \n\]]|$)/m)?.[1];
+    const reason=text.match(/(?:^|[; =])reason=(app_not_granted|window_changed|pid_changed|expired|released|stale_snapshot|global_input_not_scoped|breach_latch_invalid|breach)(?:[; \n\]]|$)/m)?.[1];
     const known=['APPROVAL_REJECTED','ACTION_FAILED','CAPABILITY_UNSUPPORTED','TIMEOUT','UNAVAILABLE','COMPUTER_RUNTIME_UNAVAILABLE','COMPUTER_PERMISSION_DENIED','COMPUTER_TARGET_UNAVAILABLE','INTERFERENCE_BREACH'];
     const statusFailure=call.name==='status';
     const failure=reason||(known.includes(code)?code:'REFUSED');

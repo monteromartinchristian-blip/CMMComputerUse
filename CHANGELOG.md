@@ -7,6 +7,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The helper and the plugin version independently; this file tracks the plugin
 (`@cmm/dsh-computer-use`) and notes helper-visible changes explicitly.
 
+## Unreleased — helper 0.3.2 build 5 (projection filter + release, 2026-11-02)
+
+### Fixed
+
+- `computer_use_observe(filter=…)` could not find a control the helper had
+  cut off by its element budget (Claude "Inicio": 61 returned, 24 skipped,
+  `filter="Configuración"` → 0). The filter is pushed down as
+  `observation.describe.element_filter`: non-matching controls consume no
+  budget; the budget bounds the matches. Blank filter = previous behaviour.
+- `observation.release` left a zeroed timestamp, so an old handle was refused
+  with `age=<seconds since 1970>`. It now retires the generation; old handles
+  are refused with `reason=released` (others `reason=stale_snapshot`), and
+  the result reports `invalidated_snapshot` and the new `snapshot`.
+- DSH projection names `released` / `stale_snapshot` (stateVersion 12).
+
 ## Unreleased — helper 0.3.1 build 4 (focus attribution, 2026-11-02)
 
 ### Fixed

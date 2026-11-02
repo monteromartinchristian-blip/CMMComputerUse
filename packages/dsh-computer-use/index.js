@@ -349,8 +349,9 @@ export function apply(ctx, config) {
   startStreamer();
   // 10: fold learned `scroll`, window-raised and helper-latch breaches.
   // 11: USER_TAKEOVER (the person took focus) drops the target without a
-  // breach. Rebuild checkpoints from the log so resumed sessions apply it.
-  ctx.sessionProjections.register({key:KEY,stateVersion:11,stateSchema,
+  // breach. 12: `released` / `stale_snapshot` refusals are named. Rebuild
+  // checkpoints from the log so resumed sessions apply them.
+  ctx.sessionProjections.register({key:KEY,stateVersion:12,stateSchema,
     init:initialState,apply:fold,
     wire:{viewSchema:stateSchema,view:state=>state}});
   if (typeof ctx.effect === 'function') {

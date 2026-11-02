@@ -409,7 +409,7 @@ class BridgeClient:
         return self.request("apps.list")
 
     def observe(self, app: Optional[str] = None, include_screenshot: bool = False,
-                include_ax_diagnostics: bool = False) -> Any:
+                include_ax_diagnostics: bool = False, element_filter: Optional[str] = None) -> Any:
         """Observe one application (or the frontmost one) without activating it.
 
         Reading another application's accessibility tree does not bring it
@@ -431,6 +431,12 @@ class BridgeClient:
         if include_ax_diagnostics:
             # Read-only deep scan of the tree (roles, depth, would-be controls).
             arguments["include_ax_diagnostics"] = True
+        needle = (element_filter or "").strip()
+        if needle:
+            # Pushed down so the helper looks for it BEFORE its element budget:
+            # a named control is not lost because unrelated controls filled
+            # the ordinary projection. Same app, same authorization.
+            arguments["element_filter"] = needle[:200]
         return self.request("observation.describe", arguments)
 
     def capture_window(self, app: str, window_title: str) -> Any:
