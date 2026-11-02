@@ -21,6 +21,13 @@ The helper and the plugin version independently; this file tracks the plugin
   are refused with `reason=released` (others `reason=stale_snapshot`), and
   the result reports `invalidated_snapshot` and the new `snapshot`.
 - DSH projection names `released` / `stale_snapshot` (stateVersion 12).
+- `USER_TAKEOVER` zeroed the observation time, so the next action on an old
+  handle reported `reason=expired;age=<seconds since 1970>`. It now retires
+  the generation with the same operation as `observation.release`
+  (`invalidateObservation` → Shared `bridgeRetireObservation`): tables
+  emptied, generation N+1, time = now; old handles are refused with
+  `reason=released`, no age. When a takeover is detected, attribution,
+  breach, settle and latch are unchanged.
 
 ## Unreleased — helper 0.3.1 build 4 (focus attribution, 2026-11-02)
 

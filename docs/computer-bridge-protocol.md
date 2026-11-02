@@ -331,11 +331,19 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   usual. Idempotent: each call retires the then-current generation.
 - Not changed: interference accounting, attribution, HID witness, settle
   window, breach/latch/rearm, window-chrome guard, set_value, scroll.
-  Known pending item: the `USER_TAKEOVER` invalidation still zeroes the
-  observation time, so an old handle after a takeover reports
-  `reason=expired` with an epoch-sized `age` (safe, but the number is
-  meaningless); left untouched because that block belongs to the attribution
-  path.
+- `USER_TAKEOVER` invalidates with the SAME rule as `observation.release`
+  (one helper operation, `invalidateObservation(reason:)`, over the pure
+  Shared rule `bridgeRetireObservation`): the four handle tables are emptied,
+  the current generation N is remembered as released, the generation becomes
+  N+1 and the observation time is set to now (never 0). A handle from N is
+  refused with `reason=released` before any UI is touched, with no `age`; a
+  fresh `observation.describe` works as usual. This replaces the old zeroed
+  timestamp, which produced `reason=expired` with an epoch-sized `age`.
+  WHEN a takeover is reported (`requiresReobserve`: attribution `user` or
+  `ambiguous_external`), the attribution, witness, settle window, breach and
+  latch are unchanged; the action is still never retried. Wire, adapter and
+  DSH projection are unchanged (`released` was already a known reason,
+  stateVersion 12).
 
 ### Who moved the focus: action vs person (helper 0.3.1)
 
@@ -358,8 +366,9 @@ FACTS; the breach now also needs the change to be attributable to the action.
 - **Breach** only for `action` or `unknown` (fail closed without telemetry).
   `user` / `ambiguous_external`: `external_activity=true`, `breach=false`, no
   latch, no audit entry, and the helper invalidates the element handles: the
-  next element action answers `ACTION_FAILED reason=expired` until a fresh
-  `observation.describe`. Nothing is retried.
+  next element action on an old handle answers `ACTION_FAILED reason=released`
+  (since 0.3.2; 0.3.1 answered `reason=expired` with an epoch-sized `age`)
+  until a fresh `observation.describe`. Nothing is retried.
 - New ledger keys (old ones unchanged): `focus_change_attribution`
   (`none|action|user|ambiguous_external|unknown`), `human_witness_available`,
   `human_input_detected`, `human_input_kind`

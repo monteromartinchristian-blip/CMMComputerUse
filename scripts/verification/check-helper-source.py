@@ -113,8 +113,8 @@ def enclosing_funcs(source: str, needle: str) -> set:
         m = re.match(r"^func (\w+)", line)
         if m:
             current = m.group(1)
-        elif re.match(r"^\S", line) and not line.startswith(("//", "}", "@", "#")):
-            current = None
+        elif re.match(r"^\S", line) and not line.startswith(("//", "}", "@", "#", ")")):
+            current = None  # `)` closes a multi-line signature: still the same func
         if needle in line.split("//", 1)[0]:
             names.add(current)
     return names
@@ -138,11 +138,18 @@ check(not re.search(r"NSAppleScript|OSAScript|osascript|System Events|JavaScript
 removals = enclosing_funcs(main, "state.remove(id:") | enclosing_funcs(main, "breachLatch = .loaded(empty)")
 check(removals <= {"breachRearm"} and enclosing_funcs(main, "breachRearm(arguments:") <= {"dispatch", "breachRearm"},
       "20: latches are removed only by breach.rearm (no automatic reset/rearm); found in %s" % sorted(removals))
-takeover_start = main.index("if report.requiresReobserve {")
-takeover_block = main[takeover_start:main.index("\n        }\n", takeover_start)]
-check("observationCapturedAt = 0" in takeover_block
-      and not re.search(r"breachLatch|saveBreachLatch|appendBreachAudit|activate\(|retry", takeover_block.split("log(")[0]),
+takeover_start = main.find("if report.requiresReobserve {")
+takeover_block = main[takeover_start:main.index("\n        }\n", takeover_start)] if takeover_start >= 0 else ""
+takeover_code = "\n".join(l.split("//", 1)[0] for l in takeover_block.splitlines())
+check(not re.search(r"breachLatch|saveBreachLatch|appendBreachAudit|activate\(|retry", takeover_code.split("log(")[0]),
       "a human takeover only invalidates the snapshot: no latch, no audit entry, no activation, no retry")
+check(len(re.findall(r"^        if report\.requiresReobserve \{$", main, re.M)) == 1
+      and re.search(r"public var requiresReobserve: Bool \{\s*focusChangeAttribution == \.user "
+                    r"\|\| focusChangeAttribution == \.ambiguousExternal\s*\}", POLICY_SRC) is not None,
+      "T: the takeover condition is unchanged (`if report.requiresReobserve {`, user|ambiguous_external)")
+check('invalidateObservation(reason: "user_takeover")' in takeover_code
+      and "observationCapturedAt" not in takeover_code,
+      "T: a takeover invalidates through the SAME operation as release (no zeroed timestamp, no epoch age)")
 check("elementChromeRefusal(kind: kind, params: params, mode: mode)" in main
       and all(sub in POLICY_SRC for sub in ('"AXCloseButton"', '"AXMinimizeButton"', '"AXZoomButton"', '"AXFullScreenButton"')),
       "21: window chrome guard intact (all four subroles, checked before every press)")
@@ -160,10 +167,24 @@ check(describe_body.index("authorization.decision(") < describe_body.index("walk
       "P: the pushed-down filter is applied only after the app/window authorization, inside the target walk")
 release_start = main.index("func releaseObservation(")
 release_body = main[release_start:main.index("\n}\n", release_start)]
-check("observationGeneration += 1" in release_body and "releasedSnapshots.insert(" in release_body
-      and "observationCapturedAt = Date().timeIntervalSince1970" in release_body
-      and "observationCapturedAt = 0" not in release_body,
-      "R: release retires the generation (no zeroed timestamp, no epoch age)")
+invalidate_start = main.index("func invalidateObservation(")
+invalidate_body = main[invalidate_start:main.index("\n}\n", invalidate_start)]
+retire_start = POLICY_SRC.index("public func bridgeRetireObservation(")
+retire_body = POLICY_SRC[retire_start:POLICY_SRC.index("\n}\n", retire_start)]
+check('invalidateObservation(reason: "release")' in release_body
+      and all(t + ".removeAll()" in invalidate_body
+              for t in ("elementTable", "elementRoles", "elementSubroles", "elementContexts"))
+      and "bridgeRetireObservation(" in invalidate_body
+      and "releasedSnapshots = retirement.releasedSnapshots" in invalidate_body
+      and "observationGeneration = retirement.generation" in invalidate_body
+      and "observationCapturedAt = retirement.capturedAt" in invalidate_body
+      and "released.insert(generation)" in retire_body and "generation: generation + 1" in retire_body
+      and "capturedAt: now" in retire_body,
+      "R: release retires the generation through the one shared invalidation (tables emptied, N+1, time=now)")
+check(enclosing_funcs(main, "observationCapturedAt = ") <= {"describe", "invalidateObservation"}
+      and not re.search(r"observationCapturedAt = 0\b", "\n".join(l.split("//", 1)[0] for l in main.splitlines()))
+      and enclosing_funcs(main, "invalidateObservation(reason:") <= {"releaseObservation", "dispatch", "invalidateObservation"},
+      "R/T: the observation time is set only by describe and the shared invalidation, never to 0")
 pre_start = main.index("func elementPreconditions(")
 pre_body = main[pre_start:main.index("\n}\n", pre_start)]
 check(pre_body.index("bridgeReleasedSnapshotRefusal(") < pre_body.index("bridgeObservationExpired("),

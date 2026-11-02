@@ -1564,17 +1564,28 @@ func appsList() -> [String: Any] {
 /// `reason=released` before any UI is touched; a fresh observation works as
 /// usual. Idempotent: each call retires the then-current generation.
 func releaseObservation() -> [String: Any] {
+    invalidateObservation(reason: "release")
+}
+
+/// The single invalidation of the element handles, used by
+/// `observation.release` and by a `USER_TAKEOVER`. The state change is the
+/// pure Shared rule ``bridgeRetireObservation``; this only applies it to the
+/// globals and empties the four handle tables.
+@discardableResult
+func invalidateObservation(reason: String) -> [String: Any] {
     let released = elementTable.count
-    let invalidated = observationGeneration
     elementTable.removeAll()
     elementRoles.removeAll()
     elementSubroles.removeAll()
     elementContexts.removeAll()
-    releasedSnapshots.insert(invalidated)
-    if releasedSnapshots.count > 64, let oldest = releasedSnapshots.min() { releasedSnapshots.remove(oldest) }
-    observationGeneration += 1
-    observationCapturedAt = Date().timeIntervalSince1970
-    return ["released": released, "invalidated_snapshot": invalidated, "snapshot": observationGeneration]
+    let retirement = bridgeRetireObservation(
+        generation: observationGeneration, releasedSnapshots: releasedSnapshots,
+        now: Date().timeIntervalSince1970)
+    releasedSnapshots = retirement.releasedSnapshots
+    observationGeneration = retirement.generation
+    observationCapturedAt = retirement.capturedAt
+    log("OBSERVATION_INVALIDATED reason=\(reason) handles=\(released) snapshot=\(retirement.retired) current=\(retirement.generation)")
+    return ["released": released, "invalidated_snapshot": retirement.retired, "snapshot": retirement.generation]
 }
 
 /// The authorization document as diagnostics, never as content.
@@ -2696,10 +2707,11 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         if report.requiresReobserve {
             // The PERSON brought the target in front while this action ran:
             // not a breach, nothing is latched. But the screen is no longer
-            // what the element handles described, so they are invalidated: the
-            // next element action is refused (`reason=expired`) until the
-            // client observes again. Never retried here.
-            observationCapturedAt = 0
+            // what the element handles described, so the generation is retired
+            // exactly as `observation.release` does: the next action on an old
+            // handle is refused (`reason=released`, no age) before any UI is
+            // touched, until the client observes again. Never retried here.
+            invalidateObservation(reason: "user_takeover")
             log("USER_TAKEOVER kind=\(kind) attribution=\(report.focusChangeAttribution.rawValue) input=\(report.humanInputKind?.rawValue ?? "-") age_ms=\(report.humanInputAgeMs.map { String($0) } ?? "-") target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-")")
         }
         if result["unsupported"] as? Bool == true {

@@ -341,6 +341,39 @@ public func bridgeReleasedSnapshotRefusal(
         detail: "policy=\(mode.rawValue);reason=released;snapshot=\(requested);current=\(current)")
 }
 
+/// How many retired generations are remembered as `released`.
+public let bridgeReleasedSnapshotsLimit = 64
+
+/// The observation state after a generation is retired.
+public struct BridgeObservationRetirement: Equatable, Sendable {
+    /// The generation whose handles are now refused with `reason=released`.
+    public let retired: Int
+    /// The new current generation (`retired + 1`).
+    public let generation: Int
+    /// The new observation time: `now`, never 0 (0 used to make the next
+    /// refusal report `age=<seconds since 1970>`).
+    public let capturedAt: Double
+    public let releasedSnapshots: Set<Int>
+}
+
+/// Retire the current generation. The ONE invalidation rule, shared by
+/// `observation.release` and by a `USER_TAKEOVER` (the person brought the
+/// target in front during an action): the current generation is remembered as
+/// released (bounded, oldest dropped first), the generation moves on and the
+/// observation time is reset to now. A handle from the retired generation is
+/// then refused by ``bridgeReleasedSnapshotRefusal`` before any expiry/age is
+/// computed and before any UI is touched; a fresh observation works as usual.
+public func bridgeRetireObservation(
+    generation: Int, releasedSnapshots: Set<Int>, now: Double,
+    limit: Int = bridgeReleasedSnapshotsLimit
+) -> BridgeObservationRetirement {
+    var released = releasedSnapshots
+    released.insert(generation)
+    while released.count > max(1, limit), let oldest = released.min() { released.remove(oldest) }
+    return BridgeObservationRetirement(
+        retired: generation, generation: generation + 1, capturedAt: now, releasedSnapshots: released)
+}
+
 // MARK: - Element projection (budget + optional filter pushed down from the adapter)
 
 /// Case-insensitive substring match over an element's text fields — the
