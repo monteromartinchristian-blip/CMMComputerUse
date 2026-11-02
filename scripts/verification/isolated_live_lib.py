@@ -210,6 +210,78 @@ def diff_snapshots(before: Dict[str, Any], after: Dict[str, Any], prefix: str = 
     return out
 
 
+# ── LaunchServices: its own gate, not part of the strict diff ────────
+
+#: Lane directories, as LaunchServices records them (realpath) or as typed.
+LANE_PREFIXES = ("/private/tmp/cmm-cu-isolated-", "/tmp/cmm-cu-isolated-")
+
+
+def classify_launchservices_path(path: str, home: str, repo: str) -> str:
+    """canonical | lane | build | other, for one registered bundle path.
+
+    `build` is non-production output that registers itself when built or
+    opened: `<repo>/build/stage-*` and Xcode DerivedData. Anything else that
+    is neither canonical nor ours is `other`, and stays strict.
+    """
+
+    norm = os.path.normpath(path)
+    if norm == os.path.normpath(production_paths(home)["installed_app"]):
+        return "canonical"
+    if norm.startswith(LANE_PREFIXES):
+        return "lane"
+    stage_root = os.path.join(os.path.normpath(repo), "build") + os.sep
+    if norm.startswith(stage_root) and norm[len(stage_root):].startswith("stage-"):
+        return "build"
+    derived = os.path.join(home, "Library", "Developer", "Xcode", "DerivedData") + os.sep
+    if norm.startswith(derived):
+        return "build"
+    return "other"
+
+
+def launchservices_verdict(
+    before: Any, after: Any, home: str, repo: str
+) -> Tuple[List[str], List[str]]:
+    """(failures, diagnostics) for the LaunchServices registrations.
+
+    Invariants:
+      1. the canonical installed path is registered before AND after;
+      2. no lane path survives the teardown;
+      3. build paths (stage-*, DerivedData) appearing/disappearing is drift,
+         reported, never a failure;
+      -  any other path appearing or disappearing is a failure.
+    """
+
+    failures: List[str] = []
+    diagnostics: List[str] = []
+    if not isinstance(before, list) or not isinstance(after, list):
+        failures.append("launchservices unreadable: before=%r after=%r" % (
+            before if not isinstance(before, list) else "ok", after if not isinstance(after, list) else "ok"))
+        return failures, diagnostics
+    canonical = os.path.normpath(production_paths(home)["installed_app"])
+    norm_before = {os.path.normpath(p) for p in before}
+    norm_after = {os.path.normpath(p) for p in after}
+    if canonical not in norm_before:
+        failures.append("canonical %s was not registered BEFORE" % canonical)
+    if canonical not in norm_after:
+        failures.append("canonical %s is not registered AFTER" % canonical)
+    for path in sorted(norm_after):
+        if classify_launchservices_path(path, home, repo) == "lane":
+            failures.append("lane path survived the teardown: %s" % path)
+    for path in sorted(norm_after - norm_before):
+        kind = classify_launchservices_path(path, home, repo)
+        if kind == "build":
+            diagnostics.append("drift (non-production build) added:   %s" % path)
+        elif kind == "other":
+            failures.append("unexpected registration added: %s" % path)
+    for path in sorted(norm_before - norm_after):
+        kind = classify_launchservices_path(path, home, repo)
+        if kind in ("build", "lane"):
+            diagnostics.append("drift (non-production %s) removed: %s" % (kind, path))
+        elif kind == "other":
+            failures.append("unexpected registration removed: %s" % path)
+    return failures, diagnostics
+
+
 def launchctl_facts(text: str) -> Dict[str, Any]:
     """Stable facts from `launchctl print gui/<uid>/<label>`; volatile counters
     are left out on purpose, the pid and arguments are kept."""

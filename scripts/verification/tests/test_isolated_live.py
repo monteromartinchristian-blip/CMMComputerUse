@@ -293,6 +293,84 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(lib.tcc_ready({})[0])
 
 
+class LaunchServicesGateTests(unittest.TestCase):
+    HOME = "/Users/tester"
+    REPO = "/Users/tester/CMM Desarrollo/CMM Computer Use"
+    CANONICAL = "/Users/tester/Applications/CMMComputerUse.app"
+    STAGE = REPO + "/build/stage-20261102-073412/CMMComputerUse.app"
+    DERIVED = "/Users/tester/Library/Developer/Xcode/DerivedData/CMMComputerUse-abc/Build/Products/Debug/CMMComputerUse.app"
+    LANE = "/private/tmp/cmm-cu-isolated-k2j9x1/CMMComputerUse.app"
+
+    def verdict(self, before, after):
+        return lib.launchservices_verdict(before, after, self.HOME, self.REPO)
+
+    def test_new_staged_registration_passes_with_drift(self):
+        failures, drift = self.verdict([self.CANONICAL], [self.CANONICAL, self.STAGE])
+        self.assertEqual(failures, [])
+        self.assertEqual(len(drift), 1)
+        self.assertIn(self.STAGE, drift[0])
+        self.assertIn("added", drift[0])
+
+    def test_derived_data_added_or_removed_passes_with_drift(self):
+        for before, after, word in (([self.CANONICAL], [self.CANONICAL, self.DERIVED], "added"),
+                                    ([self.CANONICAL, self.DERIVED], [self.CANONICAL], "removed")):
+            failures, drift = self.verdict(before, after)
+            self.assertEqual(failures, [], (before, after))
+            self.assertEqual(len(drift), 1)
+            self.assertIn(self.DERIVED, drift[0])
+            self.assertIn(word, drift[0])
+
+    def test_canonical_path_disappearing_fails(self):
+        failures, _ = self.verdict([self.CANONICAL, self.STAGE], [self.STAGE])
+        self.assertTrue(any("canonical" in f and "AFTER" in f for f in failures), failures)
+
+    def test_canonical_path_must_also_be_registered_before(self):
+        failures, _ = self.verdict([self.STAGE], [self.CANONICAL, self.STAGE])
+        self.assertTrue(any("canonical" in f and "BEFORE" in f for f in failures), failures)
+
+    def test_surviving_lane_path_fails(self):
+        for lane in (self.LANE, "/tmp/cmm-cu-isolated-zz/CMM Computer Use Fixture.app"):
+            failures, _ = self.verdict([self.CANONICAL], [self.CANONICAL, lane])
+            self.assertTrue(any("lane path survived" in f for f in failures), (lane, failures))
+
+    def test_any_other_registration_change_stays_strict(self):
+        other = "/Applications/CMMComputerUse.app"
+        self.assertTrue(self.verdict([self.CANONICAL], [self.CANONICAL, other])[0])
+        self.assertTrue(self.verdict([self.CANONICAL, other], [self.CANONICAL])[0])
+        # build/ outside stage-* (or outside this repo) is not exempt either
+        self.assertTrue(self.verdict([self.CANONICAL], [self.CANONICAL, self.REPO + "/build/CMMComputerUse.app"])[0])
+        self.assertTrue(self.verdict([self.CANONICAL], [self.CANONICAL, "/elsewhere/build/stage-1/CMMComputerUse.app"])[0])
+
+    def test_unreadable_launchservices_fails(self):
+        self.assertTrue(self.verdict("lsregister_unavailable", [self.CANONICAL])[0])
+        self.assertTrue(self.verdict([self.CANONICAL], "lsregister_unavailable")[0])
+
+    def test_identical_registrations_pass_without_drift(self):
+        self.assertEqual(self.verdict([self.CANONICAL, self.STAGE], [self.STAGE, self.CANONICAL]), ([], []))
+
+    def test_verify_production_keeps_every_other_section_strict(self):
+        body = ORCHESTRATOR.split('"""', 2)[2]
+        phase = body[body.index("def phase_verify_production"):body.index("def main(")]
+        # Only LaunchServices leaves the strict diff; it is then judged by its own gate.
+        self.assertIn('if k != "launchservices_paths"', phase)
+        self.assertEqual(phase.count("!= \"launchservices_paths\""), 2)
+        self.assertIn("lib.launchservices_verdict(", phase)
+        self.assertIn('"launchservices-audit.json"', phase)
+        self.assertIn("failures = diff + ", phase)
+        # No manual unregistering of build products to make the diff pass.
+        self.assertNotIn("lsregister", phase)
+        snapshot = body[body.index("def production_snapshot"):body.index("# ── process helpers")]
+        for key in ('"support_dir"', '"launch_agent"', '"installed_app"', '"installed_app_signature"',
+                    '"launchctl"', '"production_helper_processes"', '"launchservices_paths"'):
+            self.assertIn(key, snapshot)
+
+    def test_teardown_unregisters_only_lane_bundles(self):
+        body = ORCHESTRATOR.split('"""', 2)[2]
+        lsregister_calls = re.findall(r"run\(\[LSREGISTER, \"-u\", ([^\]]+)\]", body)
+        self.assertEqual(lsregister_calls, ["str(app)"])
+        self.assertIn("for app in pathlib.Path(lane.work).rglob(\"*.app\"):", body)
+
+
 class OrchestratorSourceTests(unittest.TestCase):
     """What the lane may not do, pinned on its source."""
 

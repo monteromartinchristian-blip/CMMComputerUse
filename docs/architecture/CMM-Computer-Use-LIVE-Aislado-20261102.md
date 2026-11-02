@@ -147,7 +147,15 @@ la de `prepare` (`production-diff.txt` vacío = PASS):
   argumentos.
 - Procesos del helper de producción (los que sirven el socket de producción):
   pid y hora de arranque.
-- Registros de LaunchServices para `com.cmm.chat.computer-use` (rutas).
+- Registros de LaunchServices para `com.cmm.chat.computer-use`, con su propia
+  puerta (no entran en el diff estricto): la ruta canónica
+  `~/Applications/CMMComputerUse.app` debe estar registrada antes y después;
+  ninguna ruta `/private/tmp/cmm-cu-isolated-*` puede sobrevivir; los builds no
+  productivos (`<repo>/build/stage-*`, DerivedData) que aparecen o desaparecen
+  son deriva diagnóstica (`DIAG`), no fallo; cualquier otra ruta que cambie
+  sí es fallo. Las listas completas ANTES/DESPUÉS, fallos y deriva quedan en
+  `launchservices-audit.json`. El orquestador no desregistra builds para
+  hacer pasar el diff: sólo desregistra los `.app` del propio carril.
 
 Límites: TCC no es legible (se apoya en que el carril no llama a `tccutil` ni
 pide permisos, y lo fija un test sobre el código del orquestador); y

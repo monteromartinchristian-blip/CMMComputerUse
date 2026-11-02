@@ -631,14 +631,32 @@ def phase_verify_production(evidence: str) -> None:
     before = json.loads(pathlib.Path(evidence, "production-before.json").read_text())
     after = production_snapshot()
     pathlib.Path(evidence, "production-after.json").write_text(json.dumps(after, indent=2, sort_keys=True))
-    diff = lib.diff_snapshots(before, after)
-    pathlib.Path(evidence, "production-diff.txt").write_text("\n".join(diff) + "\n")
-    if diff:
-        say("FAIL production changed:\n  " + "\n  ".join(diff[:50]))
-        raise Gate("production differs from the snapshot (%d differences)" % len(diff))
+    # Everything except LaunchServices is compared strictly. LaunchServices has
+    # its own invariants (lib.launchservices_verdict): non-production build
+    # registrations come and go on their own and are drift, not production.
+    strict_before = {k: v for k, v in before.items() if k != "launchservices_paths"}
+    strict_after = {k: v for k, v in after.items() if k != "launchservices_paths"}
+    diff = lib.diff_snapshots(strict_before, strict_after)
+    ls_failures, ls_drift = lib.launchservices_verdict(
+        before.get("launchservices_paths"), after.get("launchservices_paths"), HOME, str(REPO))
+    failures = diff + ["launchservices: " + f for f in ls_failures]
+    pathlib.Path(evidence, "production-diff.txt").write_text("\n".join(failures) + "\n")
+    # Full BEFORE/AFTER lists stay in the evidence for audit, with the drift.
+    pathlib.Path(evidence, "launchservices-audit.json").write_text(json.dumps({
+        "before": before.get("launchservices_paths"),
+        "after": after.get("launchservices_paths"),
+        "failures": ls_failures,
+        "diagnostics": ls_drift,
+    }, indent=2))
+    for line in ls_drift:
+        say("DIAG " + line)
+    if failures:
+        say("FAIL production changed:\n  " + "\n  ".join(failures[:50]))
+        raise Gate("production differs from the snapshot (%d differences)" % len(failures))
     say("PASS production identical: support dir, policy, socket inode, LaunchAgent plist, "
-        "installed app (every file hash + signature), launchctl job, production helper pid/start, "
-        "LaunchServices registrations")
+        "installed app (every file hash + signature), launchctl job, production helper pid/start; "
+        "LaunchServices: canonical path registered before and after, no lane path left "
+        "(%d non-production drift line(s), see launchservices-audit.json)" % len(ls_drift))
 
 
 def main() -> int:
