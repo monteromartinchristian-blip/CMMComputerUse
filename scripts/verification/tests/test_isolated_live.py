@@ -225,6 +225,17 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy["mode"], "background")
         self.assertEqual(policy["default"], "deny")
 
+    def test_electron_control_only_when_explicitly_requested(self):
+        observe_only = self.policy(False, electron="com.anthropic.claudefordesktop")
+        claude = [a for a in observe_only["apps"] if a["bundle_id"] == "com.anthropic.claudefordesktop"][0]
+        self.assertEqual(claude["scopes"], ["observe"])
+        control = lib.build_policy("PRB", "DRV", probe_admin=False,
+                                   electron_bundle="com.anthropic.claudefordesktop", electron_control=True)
+        claude = [a for a in control["apps"] if a["bundle_id"] == "com.anthropic.claudefordesktop"][0]
+        self.assertEqual(claude["scopes"], ["observe", "control"])
+        probe = control["clients"][0]
+        self.assertEqual((probe["apps"], probe["scopes"]), ([], []), "the probe never gains anything")
+
     def test_bootstrap_policy_has_only_the_probe(self):
         self.assertEqual([c["client_id"] for c in self.policy(False, driver=None)["clients"]],
                          [lib.PROBE_CLIENT_ID])

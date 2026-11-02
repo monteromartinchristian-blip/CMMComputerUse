@@ -112,6 +112,7 @@ def build_policy(
     driver_requirement: Optional[str],
     probe_admin: bool,
     electron_bundle: str = "",
+    electron_control: bool = False,
 ) -> Dict[str, Any]:
     """The isolated policy. The probe has NO apps and NO scopes; only `admin`
     when the step asks for it. The driver (stand-in for an agent) never has
@@ -131,8 +132,11 @@ def build_policy(
     ]
     driver_apps = [FIXTURE_BUNDLE_ID]
     if electron_bundle:
-        # Observe only: the Electron step never acts on the real app.
-        apps.append({"bundle_id": electron_bundle, "scopes": ["observe"]})
+        # Observe only, unless the run explicitly asks for the reversible
+        # control test (`--electron-control`); only then, and only in this
+        # temporary policy, does the Electron app get `control`.
+        scopes = ["observe", "control"] if electron_control else ["observe"]
+        apps.append({"bundle_id": electron_bundle, "scopes": scopes})
         driver_apps.append(electron_bundle)
     if driver_requirement:
         clients.append({

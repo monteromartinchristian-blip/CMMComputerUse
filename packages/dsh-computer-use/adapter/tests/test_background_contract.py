@@ -307,6 +307,101 @@ class ReadableVersusActionableTests(Case):
         self.assertEqual(_ax_access({"elements": [], "content": []}), "unavailable")
 
 
+class ClaudeControlSurfaceTests(Case):
+    """What the agent sees about Claude's tree and a verified set_value."""
+
+    sent = []
+    composer_value = ""
+
+    @staticmethod
+    def responder(request):
+        ClaudeControlSurfaceTests.sent.append(request)
+        op = request["operation"]
+        if op == "observation.describe":
+            return ok(request, {
+                "frontmost_app": "Terminal", "frontmost_bundle": "com.apple.Terminal",
+                "target_app": "Claude", "target_bundle": CLAUDE, "target_pid": 777,
+                "target_window": "Claude", "target_window_id": 41, "target_is_frontmost": False,
+                "windows": [], "snapshot": 12, "captured_at": 1.0, "screenshot_scope": "none",
+                "content": [{"role": "AXWebArea", "text": "Nuevo chat - Claude"}],
+                "elements": [
+                    {"element_id": 4, "role": "AXTextArea", "title": "Escribe a Claude", "value": ClaudeControlSurfaceTests.composer_value,
+                     "x": 300, "y": 800, "width": 600, "height": 40, "pressable": False,
+                     "value_settable": True, "actionable": True},
+                    {"element_id": 5, "role": "AXTextField", "title": "Buscar", "value": "",
+                     "x": 10, "y": 10, "width": 100, "height": 20, "pressable": False,
+                     "value_settable": False, "actionable": False},
+                ],
+                "ax_tree": "ok", "ax_access": "actionable",
+                "ax_counts": {"content": 1, "elements": 2, "actionable": 1, "window_controls": 0, "text_inputs": 2,
+                              "limits": {"visited": 812, "deepest_depth": 27, "max_depth": 40, "depth_cutoffs": 0,
+                                         "children_cutoffs": 0, "budget_skipped_controls": 0}},
+                "ax_enrichment": {"state": "enabled", "mechanism": "AXManualAccessibility",
+                                  "trigger": "readable_not_actionable", "nodes_before": 24, "nodes_after": 400,
+                                  "access_before": "readable", "actionable_before": 0,
+                                  "access_after": "actionable", "actionable_after": 1},
+                "ax_diagnostics": {"after": {"visited": 812, "deepest_depth": 27, "depth_cutoffs": 0,
+                                             "children_cutoffs": 0, "candidates_total": 1,
+                                             "roles": [{"role": "AXGroup", "count": 600}],
+                                             "candidates": [{"role": "AXTextArea", "title": "Escribe a Claude", "depth": 26,
+                                                             "actions": [], "value_settable": True,
+                                                             "path": "AXWebArea>AXGroup>AXGroup"}]}},
+            })
+        params = request["arguments"]["params"]
+        if params["element_id"] == 5:
+            return failure(request, "CAPABILITY_UNSUPPORTED",
+                           "This element's value cannot be set through accessibility.",
+                           "policy=background;kind=ui.set_value;reason=value_not_settable;role=AXTextField")
+        if params["text"] == "no-take":
+            error = failure(request, "ACTION_FAILED", "The value did not take (read back does not match).",
+                            "policy=background;kind=ui.set_value;reason=value_not_applied;role=AXTextArea")
+            error["error"]["set_value"] = {"check": "not_applied", "requested_length": 7, "read_back_length": 0}
+            return error
+        ClaudeControlSurfaceTests.composer_value = params["text"]
+        return ok(request, {"ok": True, "message": "value set and verified",
+                            "set_value": {"check": "verified", "requested_length": len(params["text"]),
+                                          "read_back_length": len(params["text"]), "previous_length": 0},
+                            "interference": dict(BREACH_LEDGER, verdict="untouched", breach=False,
+                                                 focus_became_target=False, transient_focus_changes=0)})
+
+    def setUp(self):
+        ClaudeControlSurfaceTests.sent = []
+        ClaudeControlSurfaceTests.composer_value = ""
+        super().setUp()
+
+    def test_enrichment_transition_walk_limits_and_text_inputs_are_visible(self):
+        text = text_of(self.call("computer_use_observe", {"app": CLAUDE}))
+        self.assertIn("ax_enrichment: enabled via AXManualAccessibility nodes 24->400 trigger=readable_not_actionable "
+                      "access readable->actionable actionable 0->1", text)
+        self.assertIn("ax_walk: visited=812 deepest=27/40 depth_cutoffs=0", text)
+        self.assertIn('settable value=""', text)
+        self.assertIn('not-settable value=""', text)
+        self.assertNotIn("include_ax_diagnostics", ClaudeControlSurfaceTests.sent[-1]["arguments"])
+
+    def test_diagnostics_only_when_asked(self):
+        text = text_of(self.call("computer_use_observe", {"app": CLAUDE, "ax_diagnostics": True}))
+        self.assertTrue(ClaudeControlSurfaceTests.sent[-1]["arguments"]["include_ax_diagnostics"])
+        self.assertIn("ax_diagnostics after: visited=812 deepest=27", text)
+        self.assertIn('- AXTextArea "Escribe a Claude" depth=26 actions=- value_settable=True', text)
+
+    def test_verified_set_value_and_honest_failures(self):
+        ok_text = text_of(self.call("computer_use_set_value", {"element_id": 4, "text": "CMM prueba", "snapshot": 12}))
+        self.assertIn("set_value: check=verified requested_length=10 read_back_length=10", ok_text)
+        refused = self.call("computer_use_set_value", {"element_id": 5, "text": "x", "snapshot": 12})
+        self.assertTrue(refused["result"].get("isError"))
+        self.assertIn("REFUSED CAPABILITY_UNSUPPORTED", text_of(refused))
+        self.assertIn("reason=value_not_settable", text_of(refused))
+        no_take = self.call("computer_use_set_value", {"element_id": 4, "text": "no-take", "snapshot": 12})
+        self.assertIn("reason=value_not_applied", text_of(no_take))
+        self.assertIn("set_value: check=not_applied", text_of(no_take))
+
+    def test_read_only_text_input_is_not_actionable_in_the_derived_reading(self):
+        from cmm_computer_use.mcp_server import _ax_access
+        self.assertEqual(_ax_access({"elements": [{"role": "AXTextArea", "value_settable": False}],
+                                     "content": [{"role": "AXWebArea"}]}), "readable")
+        self.assertEqual(_ax_access({"elements": [{"role": "AXTextArea", "value_settable": True}]}), "actionable")
+
+
 class InstructionsTests(unittest.TestCase):
     def test_initialize_carries_the_no_bypass_policy(self):
         client = BridgeClient("/nonexistent/socket", policy="background")

@@ -491,11 +491,60 @@ public struct BridgeObservedElement: Equatable, Sendable {
 /// action itself).
 public let bridgeTextInputRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
 
+/// A text input counts only when its AXValue is SETTABLE: a read-only field
+/// is content, not a control (2026-11-02: no optimistic `actionable`).
 public func bridgeElementIsActionable(
-    role: String, pressable: Bool, scrollable: Bool, windowChrome: Bool
+    role: String, pressable: Bool, scrollable: Bool, windowChrome: Bool,
+    valueSettable: Bool = false
 ) -> Bool {
     guard !windowChrome else { return false }
-    return pressable || scrollable || bridgeTextInputRoles.contains(role)
+    return pressable || scrollable || (bridgeTextInputRoles.contains(role) && valueSettable)
+}
+
+// MARK: - When to ask Electron/Chromium for its full tree
+
+/// Why the helper asks the application to materialize its accessibility tree
+/// (`AXManualAccessibility`), decided AFTER a first walk:
+///
+/// - `sparse`: fewer nodes than the threshold (the original rule);
+/// - `unavailable`: only window controls, or nothing;
+/// - `readableNotActionable`: content is readable but no control is — the
+///   live Claude Desktop state (AXWebArea + headings, 0 actionable). The old
+///   node-count rule never fired there, so the tree was never requested.
+///
+/// nil when the window already offers a control: nothing is touched.
+public enum BridgeEnrichmentTrigger: String, Sendable {
+    case sparse
+    case unavailable
+    case readableNotActionable = "readable_not_actionable"
+}
+
+public func bridgeEnrichmentTrigger(
+    nodeCount: Int, access: BridgeAXAccess, sparseThreshold: Int
+) -> BridgeEnrichmentTrigger? {
+    if access == .actionable { return nil }
+    if nodeCount < sparseThreshold { return .sparse }
+    return access == .unavailable ? .unavailable : .readableNotActionable
+}
+
+// MARK: - set_value postcondition
+
+/// Did `ui.set_value` actually take? Judged on the value read back through
+/// AX, never on the return code. Whitespace at the ends and non-breaking
+/// spaces are normalized (editors add them); anything else must match.
+public enum BridgeSetValueCheck: String, Sendable {
+    case verified
+    case notApplied = "not_applied"
+    case unreadable
+}
+
+public func bridgeSetValueCheck(requested: String, readBack: String?) -> BridgeSetValueCheck {
+    guard let readBack else { return .unreadable }
+    func normalized(_ text: String) -> String {
+        text.replacingOccurrences(of: "\u{00A0}", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return normalized(readBack) == normalized(requested) ? .verified : .notApplied
 }
 
 public func bridgeAXAccess(contentCount: Int, elements: [BridgeObservedElement]) -> BridgeAXAccess {

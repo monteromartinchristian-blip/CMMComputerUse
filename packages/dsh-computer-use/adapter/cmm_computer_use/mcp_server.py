@@ -178,6 +178,16 @@ class ToolRegistry:
                             ),
                             "default": False,
                         },
+                        "ax_diagnostics": {
+                            "type": "boolean",
+                            "description": (
+                                "Also report a read-only deep scan of the accessibility "
+                                "tree before and after enrichment: depth, truncation, "
+                                "roles, and nodes that look like controls. Diagnosis "
+                                "only; it performs no action."
+                            ),
+                            "default": False,
+                        },
                     }
                 ),
             },
@@ -443,7 +453,11 @@ class ToolRegistry:
     def _observe(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         app = arguments.get("app") or None
         include = bool(arguments.get("include_screenshot", False))
-        observation = self.client.observe(app=app, include_screenshot=include)
+        diagnose = bool(arguments.get("ax_diagnostics", False))
+        if diagnose:
+            observation = self.client.observe(app=app, include_screenshot=include, include_ax_diagnostics=True)
+        else:
+            observation = self.client.observe(app=app, include_screenshot=include)
         blocks: List[Dict[str, Any]] = [_text(_render_observation(
             observation, str(arguments.get("filter") or "")))["content"][0]]
         image = observation.get("screenshot_base64") if isinstance(observation, dict) else None
@@ -703,7 +717,7 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
                     element.get("height", 0),
                     " pressable" if element.get("pressable") and not element.get("window_chrome") else "",
                     " window-control(not pressable in background)" if element.get("window_chrome") else "",
-                    _scroll_flag(element),
+                    _scroll_flag(element) + _text_input_flag(element),
                 )
             )
         if len(elements) > limit:
@@ -711,6 +725,16 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
     else:
         lines.append("interactive elements: none detected")
     return "\n".join(lines)
+
+
+def _text_input_flag(element: Dict[str, Any]) -> str:
+    """Text inputs say whether their value can be set, and what it is now
+    (bounded), so a set_value can be verified by observation."""
+
+    if "value_settable" not in element:
+        return ""
+    return " %s value=%s" % ("settable" if element.get("value_settable") else "not-settable",
+                             json.dumps((element.get("value") or "")[:80], ensure_ascii=False))
 
 
 def _scroll_flag(element: Dict[str, Any]) -> str:
@@ -733,7 +757,16 @@ def _ax_access(observation: Dict[str, Any]) -> str:
         return access
     elements = [e for e in (observation.get("elements") or []) if isinstance(e, dict)]
     controls = [e for e in elements if not e.get("window_chrome")]
-    if any(e.get("pressable") or e.get("scrollable") or e.get("role") in _TEXT_INPUT_ROLES for e in controls):
+    def is_control(e: Dict[str, Any]) -> bool:
+        if "actionable" in e:
+            return bool(e.get("actionable"))
+        if e.get("pressable") or e.get("scrollable"):
+            return True
+        # A text input is a control only when its value is settable; a helper
+        # that predates `value_settable` keeps the older reading.
+        return e.get("role") in _TEXT_INPUT_ROLES and e.get("value_settable", True) is not False
+
+    if any(is_control(e) for e in controls):
         return "actionable"
     if observation.get("content") or controls:
         return "readable"
@@ -751,16 +784,23 @@ def _render_ax_tree(observation: Dict[str, Any]) -> List[str]:
 
     lines: List[str] = []
     enrichment = observation.get("ax_enrichment")
-    if isinstance(enrichment, dict) and enrichment.get("state") not in (None, "not_needed"):
-        lines.append(
-            "ax_enrichment: %s via %s nodes %s->%s"
-            % (
-                enrichment.get("state"),
-                enrichment.get("mechanism"),
-                enrichment.get("nodes_before"),
-                enrichment.get("nodes_after"),
-            )
+    if isinstance(enrichment, dict) and enrichment.get("state") is not None:
+        # Always shown, `not_needed` included: hiding it is how the Claude
+        # case (enrichment never attempted) went unnoticed.
+        line = "ax_enrichment: %s via %s nodes %s->%s" % (
+            enrichment.get("state"),
+            enrichment.get("mechanism"),
+            enrichment.get("nodes_before", "-"),
+            enrichment.get("nodes_after", "-"),
         )
+        if "trigger" in enrichment or "access_before" in enrichment:
+            line += " trigger=%s access %s->%s actionable %s->%s" % (
+                enrichment.get("trigger", "-"),
+                enrichment.get("access_before", "-"), enrichment.get("access_after", "-"),
+                enrichment.get("actionable_before", "-"), enrichment.get("actionable_after", "-"))
+        if "ax_error" in enrichment:
+            line += " ax_error=%s" % enrichment.get("ax_error")
+        lines.append(line)
     access = _ax_access(observation)
     counts = observation.get("ax_counts") if isinstance(observation.get("ax_counts"), dict) else {}
     lines.append("ax_access: %s content=%s elements=%s actionable=%s window_controls=%s" % (
@@ -770,6 +810,14 @@ def _render_ax_tree(observation: Dict[str, Any]) -> List[str]:
         counts.get("actionable", "?"),
         counts.get("window_controls", "?"),
     ))
+    limits = counts.get("limits") if isinstance(counts.get("limits"), dict) else None
+    if limits:
+        lines.append("ax_walk: visited=%s deepest=%s/%s depth_cutoffs=%s children_cutoffs=%s "
+                     "budget_skipped_controls=%s text_inputs=%s" % (
+                         limits.get("visited"), limits.get("deepest_depth"), limits.get("max_depth"),
+                         limits.get("depth_cutoffs"), limits.get("children_cutoffs"),
+                         limits.get("budget_skipped_controls"), counts.get("text_inputs", "?")))
+    lines.extend(_render_ax_diagnostics(observation.get("ax_diagnostics")))
     if access == "readable":
         lines.append("readable only: this window can be observed; it exposes no control to operate.")
     elif access == "unavailable":
@@ -780,6 +828,36 @@ def _render_ax_tree(observation: Dict[str, Any]) -> List[str]:
             % ("only its window controls" if tree == "chrome_only" else "no elements", NO_BYPASS_LINE)
         )
     return lines
+
+
+def _render_ax_diagnostics(diagnostics: Any) -> List[str]:
+    if not isinstance(diagnostics, dict):
+        return []
+    lines: List[str] = []
+    for phase in ("before", "after"):
+        scan = diagnostics.get(phase)
+        if not isinstance(scan, dict):
+            continue
+        roles = ",".join("%s:%s" % (r.get("role"), r.get("count")) for r in (scan.get("roles") or [])[:10])
+        lines.append("ax_diagnostics %s: visited=%s deepest=%s depth_cutoffs=%s children_cutoffs=%s "
+                     "candidates=%s roles=%s" % (
+                         phase, scan.get("visited"), scan.get("deepest_depth"), scan.get("depth_cutoffs"),
+                         scan.get("children_cutoffs"), scan.get("candidates_total"), roles))
+        for c in (scan.get("candidates") or [])[:20]:
+            lines.append("  - %s%s %s depth=%s actions=%s value_settable=%s%s path=%s" % (
+                c.get("role"), "/" + c["subrole"] if c.get("subrole") else "",
+                json.dumps(c.get("title") or "", ensure_ascii=False), c.get("depth"),
+                ",".join(c.get("actions") or []) or "-", c.get("value_settable"),
+                " window-control" if c.get("window_chrome") else "", c.get("path")))
+    return lines
+
+
+def _render_set_value(evidence: Any) -> List[str]:
+    if not isinstance(evidence, dict):
+        return []
+    return ["set_value: check=%s requested_length=%s read_back_length=%s previous_length=%s ax_error=%s" % (
+        evidence.get("check"), evidence.get("requested_length"), evidence.get("read_back_length", "none"),
+        evidence.get("previous_length", "none"), evidence.get("ax_error", "none"))]
 
 
 def _render_action(kind: str, result: Any) -> "tuple":
@@ -795,6 +873,7 @@ def _render_action(kind: str, result: Any) -> "tuple":
         return "%s: done" % kind, False
     lines = ["%s: %s" % (kind, result.get("message", "done"))]
     lines.extend(_render_scroll(result.get("scroll")))
+    lines.extend(_render_set_value(result.get("set_value")))
     interference = result.get("interference")
     lines.extend(_render_interference(interference))
     if isinstance(interference, dict) and interference.get("breach"):
@@ -912,6 +991,7 @@ def _render_refusal(error: BridgeError) -> Dict[str, Any]:
         )
     ]
     lines.extend(_render_scroll(getattr(error, "scroll", None)))
+    lines.extend(_render_set_value(getattr(error, "set_value", None)))
     interference = getattr(error, "interference", None)
     lines.extend(_render_interference(interference))
     if isinstance(interference, dict) and interference.get("breach"):

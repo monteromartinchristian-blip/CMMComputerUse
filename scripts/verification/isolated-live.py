@@ -132,7 +132,8 @@ class Lane:
 
     def write_policy(self, admin: bool) -> None:
         policy = lib.build_policy(self.state["probe_requirement"], self.state.get("driver_requirement"),
-                                  probe_admin=admin, electron_bundle=self.state.get("electron_app", ""))
+                                  probe_admin=admin, electron_bundle=self.state.get("electron_app", ""),
+                                  electron_control=bool(self.state.get("electron_control")))
         target = self.path("policy.json")
         pathlib.Path(target).write_text(json.dumps(policy, indent=2))
         os.chmod(target, 0o600)
@@ -289,7 +290,10 @@ def phase_prepare(args) -> Lane:
     lane = new_lane()
     say("work dir: %s" % lane.work)
     r: Dict[str, Any] = {}
-    lane.state.update(work=lane.work, electron_app=args.electron_app or "", results={})
+    if args.electron_control and not args.electron_app:
+        raise Gate("--electron-control needs --electron-app")
+    lane.state.update(work=lane.work, electron_app=args.electron_app or "",
+                      electron_control=bool(args.electron_control), results={})
 
     snap = production_snapshot()
     pathlib.Path(lane.path("production-before.json")).write_text(json.dumps(snap, indent=2, sort_keys=True))
@@ -538,12 +542,17 @@ def phase_live(lane: Lane) -> None:
     cmd = [str(HERE / "live-background-e2e.sh")]
     if lane.state.get("electron_app"):
         cmd += ["--electron-app", lane.state["electron_app"]]
+        if lane.state.get("electron_control"):
+            cmd += ["--electron-control"]
     cmd += ["--breach-control"]  # the controlled breach is the e2e's LAST step
     say("== LIVE: %s" % " ".join(cmd))
     proc = subprocess.run(cmd, env=env)
     report = lane.path("e2e/report.json")
-    checks = json.loads(pathlib.Path(report).read_text()).get("checks", {}) if os.path.exists(report) else {}
+    data = json.loads(pathlib.Path(report).read_text()) if os.path.exists(report) else {}
+    checks = data.get("checks", {})
     lane.state["results"]["live"] = {k: v is not False for k, v in checks.items()} or {"report": False}
+    # Claims are recorded, never turned into gates (an honest "unproven" passes).
+    lane.state["claims"] = data.get("claims")
     lane.save()
     if proc.returncode != 0:
         raise Gate("LIVE e2e failed (exit %d); evidence in %s" % (proc.returncode, lane.path("e2e")))
@@ -606,6 +615,11 @@ def summarize(lane: Lane) -> None:
             continue
         failed = sorted(k for k, v in results.items() if v is False)
         say("  %-13s %s" % (phase, "PASS (%d)" % len(results) if not failed else "FAIL: %s" % ", ".join(failed)))
+    claims = lane.state.get("claims")
+    if claims:
+        say("══ claims (%s)" % lane.state.get("electron_app"))
+        for key, value in claims.items():
+            say("  %-34s %s" % (key, value))
 
 
 def phase_teardown(lane: Lane) -> str:
@@ -682,6 +696,9 @@ def main() -> int:
     parser.add_argument("--evidence", help="evidence directory (verify-production)")
     parser.add_argument("--staged-app", default=str(REPO / "build/stage-20261102/CMMComputerUse.app"))
     parser.add_argument("--electron-app", default="")
+    parser.add_argument("--electron-control", action="store_true",
+                        help="grant the Electron app `control` in the TEMPORARY policy and run the reversible "
+                             "composer test (set a test text without sending it, verify, restore)")
     parser.add_argument("--no-live", action="store_true", help="all: stop after rearm-tests (no LIVE, no breach)")
     parser.add_argument("--confirm-control", action="store_true",
                         help="after-breach phase alone: one fixture press after the rearm "

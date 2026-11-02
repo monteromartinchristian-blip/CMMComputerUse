@@ -176,3 +176,55 @@ Límites: TCC no es legible (se apoya en que el carril no llama a `tccutil` ni
 pide permisos, y lo fija un test sobre el código del orquestador); y
 `AXManualAccessibility` puede quedar activado en Claude si se usa
 `--electron-app` (efecto en la app, no en la configuración de producción).
+
+
+## Prueba aislada de control real de Claude Desktop (2026-11-02)
+
+Objetivo: demostrar una acción **reversible y no destructiva** sobre Claude en
+background, sólo por `computer_use_*`: poner un texto de prueba en el composer
+**sin enviarlo**, verificarlo, y restaurarlo. Nunca se pulsa nada (ni Enter ni
+botones), nunca controles de ventana.
+
+Preparación en el Mac:
+
+- Claude Desktop abierto en **un chat nuevo con el composer vacío** (si el
+  composer tiene texto, la prueba no lo toca: `composer_not_empty`).
+- Terminal (o DSH) en primer plano; no toques ratón ni teclado.
+- Build staged del HEAD actual (`build/stage-…`), como en las fases previas.
+
+```bash
+python3 scripts/verification/isolated-live.py all \
+  --staged-app build/stage-<fecha>/CMMComputerUse.app \
+  --electron-app com.anthropic.claudefordesktop --electron-control
+```
+
+`--electron-control` concede `control` a Claude **sólo en la política temporal
+del carril**. Pasos E1–E5 (todos quiet; el testigo los juzga contra Claude):
+
+1. E1 observe con `ax_diagnostics`: `ax_enrichment` (trigger, access
+   antes→después), `ax_walk`, escaneo profundo antes/después.
+2. Selección: el primer `AXTextArea` settable (si no, un campo settable), el
+   más bajo en pantalla. Ninguno → `control_unproven: no_settable_text_input`.
+3. E2 `set_value` de `CMM-CU control test - not sent <ts>`: el helper debe
+   devolver `set_value: check=verified` y `verdict=untouched`.
+4. E3 re-observe: el mismo control (por geometría) contiene el texto.
+5. E4 `set_value ""`: verificado y untouched. E5 re-observe: vacío.
+
+Si cualquier paso eleva o activa Claude → `INTERFERENCE_BREACH`, latch y STOP
+(sin reintentar ni restaurar). Gates de seguridad: `electron_control_no_breach`
+y, si el texto llegó a ponerse, `electron_control_restored` (si falla, el
+script avisa: hay que borrar el texto a mano).
+
+Resultado en `claims` (no deciden PASS/FAIL; un "unproven" honesto es válido):
+
+| claim | significa |
+|---|---|
+| `observe_proven` | la ventana es legible (gate observe-only) |
+| `actionable` | el helper informa un control real tras el enriquecimiento |
+| `control_proven` | set verificado por helper Y por re-observación, Y restaurado y re-observado |
+| `background_noninterference_proven` | E1–E5: testigo quiet (sin activar, sin elevar, cursor ≤ 0,5) + ledger untouched + sin breach |
+| `control_unproven_reason` | `no_settable_text_input`, `composer_not_empty`, `value_not_settable`, `set_not_verified`, `breach_stop`, `not_restored`, … |
+
+Qué traer: el bloque `claims`, las líneas `ax_enrichment` y `ax_walk` de E1, las
+líneas `ax_diagnostics before/after` con sus candidatos, y las líneas
+`set_value:` de E2/E4.

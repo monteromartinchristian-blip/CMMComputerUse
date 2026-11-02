@@ -65,7 +65,7 @@ class Driver:
         self.transcript = []  # (tool, args, text, isError) for the DSH fold
         self.seq = 0
 
-    def call(self, step: str, tool: str, args=None, quiet=True):
+    def call(self, step: str, tool: str, args=None, quiet=True, target=None):
         """Run one tool call. After a QUIET call, wait a real TAIL before
         returning, so the witness window of that step (end .. end + TAIL)
         belongs to it alone: a late interference caused by this step is still
@@ -83,7 +83,10 @@ class Driver:
         is_error = bool(result.get("isError"))
         self.transcript.append({"tool": tool, "args": args, "text": text, "isError": is_error})
         self.steps.append({"step": step, "tool": tool, "start": start, "end": end,
-                           "quiet": quiet, "isError": is_error, "text": text[:4000]})
+                           "quiet": quiet, "isError": is_error, "text": text[:4000],
+                           # The app this step acts on: the witness judges THIS
+                           # app's activation/raise (default: the run's --app).
+                           "target": target})
         print("── %s (%s) %s" % (step, tool, "ERROR" if is_error else "ok"))
         print(text[:2000])
         if quiet:
@@ -178,6 +181,134 @@ def electron_verdict(text: str, is_error: bool) -> dict:
             "control_proven": False}
 
 
+TEXT_INPUT_LINE = re.compile(
+    r'^\[(\d+)\] (AXTextArea|AXTextField|AXComboBox) "(.*)" \((-?\d+),(-?\d+) (\d+)x(\d+)\)'
+    r'.* (settable|not-settable) value=("(?:[^"\\]|\\.)*")$', re.M)
+
+
+def text_inputs(text: str) -> list:
+    """Every text input the observation lists, with settability and value."""
+
+    out = []
+    for m in TEXT_INPUT_LINE.finditer(text):
+        out.append({"id": int(m.group(1)), "role": m.group(2), "title": m.group(3),
+                    "x": int(m.group(4)), "y": int(m.group(5)), "w": int(m.group(6)), "h": int(m.group(7)),
+                    "settable": m.group(8) == "settable", "value": json.loads(m.group(9))})
+    return out
+
+
+def pick_composer(text: str):
+    """The control to prove control on: a SETTABLE text input — an AXTextArea
+    first, then the lowest on screen (a chat composer sits at the bottom).
+    None when there is none: that is a capability gap, never a reason to use
+    window controls or anything else."""
+
+    settable = [t for t in text_inputs(text) if t["settable"]]
+    if not settable:
+        return None
+    return sorted(settable, key=lambda t: (t["role"] != "AXTextArea", -t["y"]))[0]
+
+
+def find_same_input(text: str, composer: dict):
+    """The same control in a later observation (ids change per snapshot):
+    same role and geometry (±4 pt), else same role and title."""
+
+    inputs = [t for t in text_inputs(text) if t["role"] == composer["role"]]
+    for t in inputs:
+        if all(abs(t[k] - composer[k]) <= 4 for k in ("x", "y", "w", "h")):
+            return t
+    for t in inputs:
+        if t["title"] and t["title"] == composer["title"]:
+            return t
+    return None
+
+
+def control_claims(observe: dict, control: dict, witness_ok_for_control) -> dict:
+    """The four claims, kept apart and never inferred from one another.
+
+    observe_proven                     the window is readable (observe-only gate)
+    actionable                         the helper reports a real control
+    control_proven                     a reversible change was made, VERIFIED by the
+                                       helper and by re-observation, and restored
+    background_noninterference_proven  for every control step: witness quiet
+                                       (no activation, no raise, cursor <= 0.5),
+                                       ledger untouched, no breach
+    """
+
+    attempted = bool(control.get("attempted"))
+    noninterference = None
+    if attempted:
+        noninterference = bool(witness_ok_for_control) and control.get("set_untouched") is True \
+            and control.get("restore_untouched") is True and not control.get("breach")
+    proven = attempted and noninterference is True and all(control.get(k) is True for k in (
+        "set_verified", "observed_changed", "restore_verified", "observed_restored"))
+    return {
+        "observe_proven": observe.get("readable") is True,
+        "actionable": observe.get("actionable") is True,
+        "control_proven": proven,
+        "background_noninterference_proven": noninterference,
+        "control_unproven_reason": None if proven else (control.get("reason") or
+                                                         ("not_attempted" if not attempted else "checks_failed")),
+    }
+
+
+def run_electron_control(d, app: str, token: str) -> dict:
+    """Reversible, non-destructive control of a text input in `app`, through
+    computer_use_* only: set a test text WITHOUT sending it, verify, restore.
+    Every step is quiet and judged against `app` by the witness. A composer
+    that already holds text is never touched (it may be the person's draft)."""
+
+    out = {"attempted": False, "reason": None, "steps": []}
+
+    def call(step, tool, args):
+        out["steps"].append(step)
+        return d.call(step, tool, args, quiet=True, target=app)
+
+    text, err = call("E1 electron observe (diagnostics)", "computer_use_observe", {"app": app, "ax_diagnostics": True})
+    m = re.search(r"^ax_access: (actionable|readable|unavailable) ", text, re.M)
+    out["access"] = m.group(1) if m else None
+    out["actionable"] = out["access"] == "actionable"
+    out["text_inputs"] = text_inputs(text)
+    if err or "(background)" not in text:
+        out["reason"] = "observe_failed_or_not_background"
+        return out
+    composer = pick_composer(text)
+    if composer is None:
+        out["reason"] = "no_settable_text_input"
+        return out
+    out["composer"] = {k: composer[k] for k in ("role", "title", "x", "y", "w", "h")}
+    if composer["value"] != "":
+        out["reason"] = "composer_not_empty"
+        return out
+    out["attempted"] = True
+    text2, err2 = call("E2 set test text (not sent)", "computer_use_set_value",
+                       {"element_id": composer["id"], "text": token, "snapshot": snapshot_of(text)})
+    out["breach"] = "INTERFERENCE_BREACH" in text2
+    out["set_verified"] = (not err2) and "set_value: check=verified" in text2
+    out["set_untouched"] = "verdict=untouched" in text2
+    if not out["set_verified"]:
+        out["reason"] = "breach_stop" if out["breach"] else (
+            "value_not_settable" if "reason=value_not_settable" in text2 else "set_not_verified")
+        return out
+    text3, _ = call("E3 re-observe (changed)", "computer_use_observe", {"app": app})
+    again = find_same_input(text3, composer)
+    out["observed_changed"] = bool(again) and token in again["value"]
+    if not again:
+        out["reason"] = "composer_lost"
+        return out
+    text4, err4 = call("E4 restore (empty)", "computer_use_set_value",
+                       {"element_id": again["id"], "text": "", "snapshot": snapshot_of(text3)})
+    out["breach"] = out["breach"] or "INTERFERENCE_BREACH" in text4
+    out["restore_verified"] = (not err4) and "set_value: check=verified" in text4
+    out["restore_untouched"] = "verdict=untouched" in text4
+    text5, _ = call("E5 re-observe (restored)", "computer_use_observe", {"app": app})
+    final = find_same_input(text5, composer)
+    out["observed_restored"] = bool(final) and final["value"] == ""
+    if not out["observed_restored"]:
+        out["reason"] = "not_restored"
+    return out
+
+
 def element_id(text: str, predicate) -> int | None:
     for line in text.splitlines():
         m = re.match(r"^\[(\d+)\] (\S+) \"(.*)\" \(", line)
@@ -237,8 +368,9 @@ def judge(steps, monitor_rows, target_bundle, person_bundle):
         moved = 0.0
         if ref:
             moved = max((abs(r["x"] - ref["x"]) + abs(r["y"] - ref["y"]) for r in window), default=0.0)
-        target_front = any(r["front"] == target_bundle for r in window)
-        target_top = any(r["top"] == target_bundle for r in window) and (ref is None or ref["top"] != target_bundle)
+        bundle = step.get("target") or target_bundle
+        target_front = any(r["front"] == bundle for r in window)
+        target_top = any(r["top"] == bundle for r in window) and (ref is None or ref["top"] != bundle)
         verdicts.append({
             "step": step["step"], "samples": len(window), "fronts": fronts, "tops": tops,
             "cursor_max_delta": moved, "target_front": target_front, "target_top": target_top,
@@ -324,6 +456,9 @@ def main() -> int:
     parser.add_argument("--electron-app", default="", help="e.g. com.anthropic.claudefordesktop")
     parser.add_argument("--breach-control", action="store_true",
                         help="press the fixture's self-activating button (latches the fixture until CMM Console rearms it)")
+    parser.add_argument("--electron-control", action="store_true",
+                        help="with --electron-app: prove control by setting a test text in its composer "
+                             "WITHOUT sending it, verifying and restoring it (needs `control` on that app)")
     parser.add_argument("--monitor", required=True, help="JSONL written by focus-monitor")
     parser.add_argument("--report", required=True)
     args = parser.parse_args()
@@ -399,12 +534,28 @@ def main() -> int:
         checks["scroll"] = False if args.app == FIXTURE else None
 
     if args.electron_app:
-        text, err = d.call("7 electron observe", "computer_use_observe", {"app": args.electron_app})
+        text, err = d.call("7 electron observe", "computer_use_observe", {"app": args.electron_app},
+                           target=args.electron_app)
         verdict = electron_verdict(text, err)
         checks["electron_observe_readable"] = verdict["readable"]
-        # Diagnostic only: an actionable tree is not proof of control, and the
-        # isolated policy grants this app `observe` only.
+        # Diagnostic only: an actionable tree is not proof of control.
         diagnostics["electron"] = verdict
+    electron_observe = verdict if args.electron_app else {}
+    control = {"attempted": False, "reason": "not_requested"}
+    if args.electron_app and args.electron_control:
+        token = "CMM-CU control test - not sent %d" % int(time.time())
+        control = run_electron_control(d, args.electron_app, token)
+        diagnostics["electron_control"] = control
+        if control.get("access"):
+            electron_observe = dict(electron_observe, actionable=control["access"] == "actionable")
+        # Safety gates (the claim itself may honestly stay unproven):
+        checks["electron_control_no_breach"] = not control.get("breach")
+        if control.get("attempted") and control.get("set_verified"):
+            # A verified test text MUST be gone again: never leave it behind.
+            checks["electron_control_restored"] = control.get("restore_verified") is True \
+                and control.get("observed_restored") is True
+            if not checks["electron_control_restored"]:
+                print("!! the test text may still be in %s's composer: clear it by hand" % args.electron_app)
 
     folded = dsh_fold(d.transcript)
     checks["bypass_guard"] = all(folded.get("bypass") or [None])
@@ -461,6 +612,10 @@ def main() -> int:
             v["ok"] = v["target_front"] or v["target_top"]
             checks["witness_saw_breach"] = v["ok"]
     checks["witness_quiet"] = quiet_ok
+    control_steps = set(control.get("steps") or [])
+    witness_ok_for_control = all(v.get("ok") for st, v in zip(d.steps, verdicts) if st["step"] in control_steps) \
+        if control_steps else None
+    claims = control_claims(electron_observe, control, witness_ok_for_control) if args.electron_app else None
     # Diagnosis of any cursor movement the witness saw: which step, when, and
     # what the helper's own ledger said. It explains the gate; it never
     # changes it, and external activity is never turned into a PASS.
@@ -471,6 +626,7 @@ def main() -> int:
             print(describe_cursor_motion(item))
 
     report = {"person_bundle": person_bundle, "target": args.app, "checks": checks,
+              "claims": claims,
               "diagnostics": diagnostics,
               "witness": verdicts, "steps": d.steps}
     pathlib.Path(args.report).write_text(json.dumps(report, indent=2, ensure_ascii=False))
@@ -479,6 +635,10 @@ def main() -> int:
     for key, value in checks.items():
         print("  %-22s %s" % (key, "PASS" if value is True else ("n/a" if value is None else "FAIL")))
         failed |= value is False
+    if claims is not None:
+        print("══ claims (%s)" % args.electron_app)
+        for key, value in claims.items():
+            print("  %-34s %s" % (key, value))
     if diagnostics:
         print("══ diagnostics (never decide PASS/FAIL)")
         for key, value in diagnostics.items():

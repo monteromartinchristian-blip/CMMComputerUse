@@ -252,5 +252,167 @@ class PersonFrontmostTests(unittest.TestCase):
         self.assertEqual(e2e.person_frontmost("", [], "")[:2], ("", "none"))
 
 
+import sys  # noqa: E402
+sys.path.insert(0, str(VERIFY.parents[1] / "packages" / "dsh-computer-use" / "adapter"))
+from cmm_computer_use.mcp_server import _render_observation  # noqa: E402
+
+CLAUDE = "com.anthropic.claudefordesktop"
+
+
+def claude_observation(composer_value="", composer_settable=True, with_composer=True):
+    elements = [
+        {"element_id": 1, "role": "AXButton", "subrole": "AXCloseButton", "title": "cerrar", "value": "",
+         "x": 10, "y": 10, "width": 14, "height": 16, "pressable": True, "window_chrome": True, "actionable": False},
+        {"element_id": 2, "role": "AXTextField", "title": "Buscar", "value": "", "x": 20, "y": 60,
+         "width": 200, "height": 24, "pressable": False, "value_settable": True, "actionable": True},
+    ]
+    if with_composer:
+        elements.append({"element_id": 3, "role": "AXTextArea", "title": "Escribe a Claude", "value": composer_value,
+                         "x": 300, "y": 820, "width": 640, "height": 44, "pressable": False,
+                         "value_settable": composer_settable, "actionable": composer_settable})
+    return {"frontmost_app": "Terminal", "frontmost_bundle": "com.apple.Terminal", "target_app": "Claude",
+            "target_bundle": CLAUDE, "target_pid": 7, "target_window": "Claude", "target_window_id": 4,
+            "target_is_frontmost": False, "windows": [], "snapshot": 12, "captured_at": 1.0,
+            "content": [{"role": "AXWebArea", "text": "Nuevo chat"}], "elements": elements,
+            "ax_tree": "ok", "ax_access": "actionable" if (with_composer and composer_settable) else "readable",
+            "ax_counts": {"content": 1, "elements": len(elements), "actionable": 1, "window_controls": 1}}
+
+
+class ComposerParsingTests(unittest.TestCase):
+    def test_parses_the_real_adapter_rendering(self):
+        text = _render_observation(claude_observation(composer_value='hola "x"'))
+        inputs = e2e.text_inputs(text)
+        self.assertEqual([(t["role"], t["settable"]) for t in inputs], [("AXTextField", True), ("AXTextArea", True)])
+        self.assertEqual(inputs[1]["value"], 'hola "x"')
+        self.assertEqual((inputs[1]["x"], inputs[1]["y"], inputs[1]["w"], inputs[1]["h"]), (300, 820, 640, 44))
+
+    def test_composer_is_the_settable_text_area_never_a_window_control(self):
+        composer = e2e.pick_composer(_render_observation(claude_observation()))
+        self.assertEqual((composer["role"], composer["id"]), ("AXTextArea", 3))
+        # No settable text area: falls back to a settable field, never to a button.
+        only_field = e2e.pick_composer(_render_observation(claude_observation(composer_settable=False)))
+        self.assertEqual(only_field["role"], "AXTextField")
+        nothing = claude_observation(with_composer=False)
+        nothing["elements"][1]["value_settable"] = False
+        self.assertIsNone(e2e.pick_composer(_render_observation(nothing)))
+
+    def test_same_input_is_found_again_by_geometry(self):
+        composer = e2e.pick_composer(_render_observation(claude_observation()))
+        later = claude_observation(composer_value="CMM token")
+        later["elements"][2]["element_id"] = 9
+        again = e2e.find_same_input(_render_observation(later), composer)
+        self.assertEqual((again["id"], again["value"]), (9, "CMM token"))
+
+
+class ScriptedDriver:
+    """Plays back adapter outputs; records calls (and their targets)."""
+
+    LEDGER = ("interference: verdict=%s cursor_moved=False policy=background\n"
+              "attributable: cursor_events_posted=False cursor_moved_by_action=False "
+              "focus_became_target=%s external_activity=False\n")
+
+    def __init__(self, composer_value="", composer_settable=True, breach_on_set=False, restore_fails=False,
+                 with_composer=True):
+        self.calls = []
+        self.value = composer_value
+        self.settable = composer_settable
+        self.breach_on_set = breach_on_set
+        self.restore_fails = restore_fails
+        self.with_composer = with_composer
+
+    def call(self, step, tool, args, quiet=True, target=None):
+        self.calls.append((step, tool, args, quiet, target))
+        if tool == "computer_use_observe":
+            return _render_observation(claude_observation(self.value, self.settable, self.with_composer)), False
+        if self.breach_on_set:
+            return ("REFUSED INTERFERENCE_BREACH: raised [policy=background;reason=breach;kind=ui.set_value]\n"
+                    + self.LEDGER % ("focus_changed", "True")), True
+        if args["text"] == "" and self.restore_fails:
+            return "REFUSED ACTION_FAILED: did not take [reason=value_not_applied]\nset_value: check=not_applied", True
+        self.value = args["text"]
+        return ("ui.set_value: value set and verified\nset_value: check=verified requested_length=%d\n"
+                % len(args["text"]) + self.LEDGER % ("untouched", "False")), False
+
+
+class ElectronControlRunTests(unittest.TestCase):
+    TOKEN = "CMM-CU control test - not sent 1"
+
+    def test_full_reversible_control_is_proven(self):
+        d = ScriptedDriver()
+        out = e2e.run_electron_control(d, CLAUDE, self.TOKEN)
+        self.assertTrue(out["attempted"])
+        for key in ("set_verified", "set_untouched", "observed_changed", "restore_verified",
+                    "restore_untouched", "observed_restored"):
+            self.assertTrue(out[key], key)
+        self.assertEqual(d.value, "", "restored")
+        # Every control step is quiet and judged against Claude, never the fixture.
+        self.assertTrue(all(quiet and target == CLAUDE for _, _, _, quiet, target in d.calls))
+        tools = [tool for _, tool, _, _, _ in d.calls]
+        self.assertNotIn("computer_use_press", tools, "no press: nothing is sent")
+        claims = e2e.control_claims({"readable": True, "actionable": True}, out, True)
+        self.assertEqual((claims["observe_proven"], claims["actionable"], claims["control_proven"],
+                          claims["background_noninterference_proven"]), (True, True, True, True))
+
+    def test_a_draft_in_the_composer_is_never_touched(self):
+        d = ScriptedDriver(composer_value="borrador de la persona")
+        out = e2e.run_electron_control(d, CLAUDE, self.TOKEN)
+        self.assertFalse(out["attempted"])
+        self.assertEqual(out["reason"], "composer_not_empty")
+        self.assertEqual([t for _, t, _, _, _ in d.calls], ["computer_use_observe"])
+        self.assertEqual(d.value, "borrador de la persona")
+
+    def test_no_settable_control_is_an_honest_gap(self):
+        d = ScriptedDriver(with_composer=False)
+        d_obs = claude_observation(with_composer=False)
+        d_obs["elements"][1]["value_settable"] = False
+        d.call = lambda step, tool, args, quiet=True, target=None: (_render_observation(d_obs), False)
+        out = e2e.run_electron_control(d, CLAUDE, self.TOKEN)
+        self.assertEqual(out["reason"], "no_settable_text_input")
+        claims = e2e.control_claims({"readable": True, "actionable": False}, out, None)
+        self.assertFalse(claims["control_proven"])
+        self.assertIsNone(claims["background_noninterference_proven"])
+        self.assertEqual(claims["control_unproven_reason"], "no_settable_text_input")
+
+    def test_a_breach_stops_everything(self):
+        d = ScriptedDriver(breach_on_set=True)
+        out = e2e.run_electron_control(d, CLAUDE, self.TOKEN)
+        self.assertTrue(out["breach"])
+        self.assertEqual(out["reason"], "breach_stop")
+        self.assertEqual(len(d.calls), 2, "observe, set_value, then STOP: no restore attempt, no retry")
+        claims = e2e.control_claims({"readable": True, "actionable": True}, out, False)
+        self.assertFalse(claims["control_proven"])
+        self.assertFalse(claims["background_noninterference_proven"])
+
+    def test_a_failed_restore_is_not_control(self):
+        out = e2e.run_electron_control(ScriptedDriver(restore_fails=True), CLAUDE, self.TOKEN)
+        self.assertFalse(out["restore_verified"])
+        self.assertFalse(e2e.control_claims({"readable": True}, out, True)["control_proven"])
+
+    def test_a_noisy_witness_withholds_both_claims(self):
+        out = e2e.run_electron_control(ScriptedDriver(), CLAUDE, self.TOKEN)
+        claims = e2e.control_claims({"readable": True, "actionable": True}, out, False)
+        self.assertFalse(claims["background_noninterference_proven"])
+        self.assertFalse(claims["control_proven"])
+
+    def test_readable_alone_never_claims_control(self):
+        claims = e2e.control_claims({"readable": True, "actionable": False}, {"attempted": False}, None)
+        self.assertTrue(claims["observe_proven"])
+        self.assertFalse(claims["actionable"])
+        self.assertFalse(claims["control_proven"])
+
+
+class PerStepTargetTests(unittest.TestCase):
+    def test_the_witness_judges_each_step_against_its_own_target(self):
+        steps = [{"step": "E2 set test text (not sent)", "start": 10.0, "end": 10.2, "quiet": True, "target": CLAUDE}]
+        rows = [{"t": 9.9 + i / 100, "front": "com.apple.Terminal", "top": "com.apple.Terminal", "x": 0, "y": 0}
+                for i in range(200)]
+        for r in rows:
+            if r["t"] >= 10.6:
+                r["front"] = CLAUDE
+        v = e2e.judge(steps, rows, "com.example.computer-use-fixture", "com.apple.Terminal")[0]
+        self.assertTrue(v["target_front"], "Claude coming to the front is caught even though --app is the fixture")
+        self.assertFalse(e2e.quiet_step_ok(v))
+
+
 if __name__ == "__main__":
     unittest.main()

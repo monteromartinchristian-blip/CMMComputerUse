@@ -257,7 +257,13 @@ final class AXAccessTests: XCTestCase {
 
     func testElementActionability() {
         XCTAssertTrue(bridgeElementIsActionable(role: "AXButton", pressable: true, scrollable: false, windowChrome: false))
-        XCTAssertTrue(bridgeElementIsActionable(role: "AXTextField", pressable: false, scrollable: false, windowChrome: false))
+        // A text input is a control only when its value is settable.
+        XCTAssertTrue(bridgeElementIsActionable(role: "AXTextField", pressable: false, scrollable: false,
+                                                windowChrome: false, valueSettable: true))
+        XCTAssertFalse(bridgeElementIsActionable(role: "AXTextField", pressable: false, scrollable: false,
+                                                 windowChrome: false))
+        XCTAssertFalse(bridgeElementIsActionable(role: "AXTextArea", pressable: false, scrollable: false,
+                                                 windowChrome: false, valueSettable: false))
         XCTAssertTrue(bridgeElementIsActionable(role: "AXScrollArea", pressable: false, scrollable: true, windowChrome: false))
         XCTAssertFalse(bridgeElementIsActionable(role: "AXButton", pressable: true, scrollable: false, windowChrome: true))
         XCTAssertFalse(bridgeElementIsActionable(role: "AXScrollArea", pressable: false, scrollable: false, windowChrome: false))

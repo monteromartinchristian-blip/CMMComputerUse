@@ -154,6 +154,7 @@ class BridgeError(Exception):
         detail: str = "",
         interference: Optional[Dict[str, Any]] = None,
         scroll: Optional[Dict[str, Any]] = None,
+        set_value: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -163,6 +164,8 @@ class BridgeError(Exception):
         #: `ui.scroll` evidence (routes tried, measured before/after, AX errors)
         #: when the helper attached it to a failure.
         self.scroll = scroll if isinstance(scroll, dict) else None
+        #: `ui.set_value` evidence (check, lengths, AX error) on a failure.
+        self.set_value = set_value if isinstance(set_value, dict) else None
 
     def as_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -363,12 +366,14 @@ class BridgeClient:
         detail = error.get("detail") if isinstance(error, dict) else ""
         interference = error.get("interference") if isinstance(error, dict) else None
         scroll = error.get("scroll") if isinstance(error, dict) else None
+        set_value = error.get("set_value") if isinstance(error, dict) else None
         raise BridgeError(
             str(message or "The computer bridge refused %s." % operation),
             code=str(code or "ACTION_FAILED"),
             detail=str(detail or "")[:500],
             interference=interference,
             scroll=scroll,
+            set_value=set_value,
         )
 
     # ── contract ──────────────────────────────────────────────────────
@@ -403,7 +408,8 @@ class BridgeClient:
     def apps(self) -> Any:
         return self.request("apps.list")
 
-    def observe(self, app: Optional[str] = None, include_screenshot: bool = False) -> Any:
+    def observe(self, app: Optional[str] = None, include_screenshot: bool = False,
+                include_ax_diagnostics: bool = False) -> Any:
         """Observe one application (or the frontmost one) without activating it.
 
         Reading another application's accessibility tree does not bring it
@@ -422,6 +428,9 @@ class BridgeClient:
         }
         if app:
             arguments["app"] = app
+        if include_ax_diagnostics:
+            # Read-only deep scan of the tree (roles, depth, would-be controls).
+            arguments["include_ax_diagnostics"] = True
         return self.request("observation.describe", arguments)
 
     def capture_window(self, app: str, window_title: str) -> Any:

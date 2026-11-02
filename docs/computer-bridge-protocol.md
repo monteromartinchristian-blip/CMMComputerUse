@@ -265,7 +265,27 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   (already `observe`-authorized) application element — the attribute Electron
   documents for third-party assistive clients — polls up to 2 s, and reports
   `ax_enrichment = {mechanism, state: not_needed|already_enabled|enabled|enabled_still_sparse|unsupported|failed|not_trusted, nodes_before, nodes_after, ax_error?}`.
-  `AXEnhancedUserInterface` is NOT used (it changes window management). Every
+  `AXEnhancedUserInterface` is NOT used (it changes window management).
+  **Since 2026-11-02 the decision is taken after a first walk**
+  (`bridgeEnrichmentTrigger`): `sparse` (< 24 nodes), `unavailable`, or
+  `readable_not_actionable` — the Claude Desktop state that the old node-count
+  rule never caught. After enrichment the window is walked again;
+  `ax_enrichment` reports `trigger`, `access_before/after`,
+  `actionable_before/after`, `grew`, `enhanced_user_interface` (read only), and
+  is always rendered (also `not_needed`). The walk goes to depth 40 (was 12),
+  text inputs have their own budget (20), and `ax_counts.limits` reports
+  visited/deepest/depth_cutoffs/children_cutoffs/budget_skipped_controls.
+  `include_ax_diagnostics: true` (adapter: `ax_diagnostics`) adds a read-only
+  deep scan before and after: roles, depth, truncation and every node that
+  looks like a control (role, actions, AXValue settable, ancestor path).
+  A text input is `actionable` only when its AXValue is settable
+  (`value_settable`). **`ui.set_value`**: an element whose AXValue is not
+  settable is `CAPABILITY_UNSUPPORTED reason=value_not_settable` before
+  anything is touched; after setting, the value is read back
+  (`bridgeSetValueCheck`) — mismatch is `ACTION_FAILED
+  reason=value_not_applied|value_unreadable`; success and failure carry
+  `set_value {check, requested_length, read_back_length, previous_length,
+  ax_error?}` (lengths only, never the previous content). Every
   observation states `ax_tree: ok|chrome_only|empty` and — readable is not
   actionable — `ax_access: actionable|readable|unavailable` with
   `ax_counts {content, elements, actionable, window_controls}`; each element

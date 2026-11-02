@@ -82,7 +82,14 @@ let maxContentNodes = 240
 /// Content can sit deeper than any control: measured content nodes live at
 /// depth 7 under AXSplitGroup > AXScrollArea > AXOutline > AXRow > AXCell >
 /// AXStaticText, so a depth of 6 structurally cannot reach them.
-let maxDepth = 12
+/// 40, not 12: an Electron/React window nests far deeper than a native one
+/// (window > groups > web area > many div-groups > control). 12 stopped the
+/// walk above Claude Desktop's controls (2026-11-02). Still bounded by
+/// `maxVisitedNodes`.
+let maxDepth = 40
+/// Text inputs have their own budget: a sidebar full of buttons must not use
+/// up the element budget before the walk reaches a composer.
+let maxTextInputs = 20
 /// Hard ceiling on nodes visited, so a pathological tree costs bounded time
 /// and memory no matter how deep or wide it is.
 let maxVisitedNodes = 6_000
@@ -96,7 +103,7 @@ let sparseTreeThreshold = 24
 let interactiveRoles: Set<String> = [
     "AXButton", "AXTextField", "AXTextArea", "AXSecureTextField",
     "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuItem",
-    "AXLink", "AXTab", "AXSlider", "AXSwitch",
+    "AXLink", "AXTab", "AXSlider", "AXSwitch", "AXComboBox",
     // Not pressable, but the one handle `ui.scroll` can aim at: listing it
     // gives a scroll area an element id without any global input.
     "AXScrollArea",
@@ -704,6 +711,24 @@ final class Traversal: @unchecked Sendable {
     var elements: [[String: Any]] = []
     var content: [[String: Any]] = []
     var visited = 0
+    /// Elements collected under the regular budget / the text-input budget.
+    var regularElements = 0
+    var textInputs = 0
+    /// Where the bounded walk stopped short — reported, so "no control found"
+    /// can be told apart from "the walk never got there".
+    var depthCutoffs = 0
+    var childrenCutoffs = 0
+    var budgetSkippedControls = 0
+    var deepestDepth = 0
+
+    var limits: [String: Any] {
+        [
+            "visited": visited, "visited_cap": maxVisitedNodes, "visited_cap_hit": visited >= maxVisitedNodes,
+            "max_depth": maxDepth, "deepest_depth": deepestDepth, "depth_cutoffs": depthCutoffs,
+            "children_cutoffs": childrenCutoffs, "budget_skipped_controls": budgetSkippedControls,
+            "element_budget": maxElements, "text_input_budget": maxTextInputs,
+        ]
+    }
 
     /// Whether a node carries text a person can read.
     ///
@@ -780,18 +805,20 @@ func countAXNodes(_ root: AXUIElement, limit: Int) -> Int {
 /// the target keeps its accessibility tree enabled for its lifetime (some CPU
 /// cost in the target), which the observation reports. The result is VERIFIED
 /// by re-counting the tree, never assumed.
-func ensureAccessibilityTree(appElement: AXUIElement, root: AXUIElement) -> [String: Any] {
+func ensureAccessibilityTree(
+    appElement: AXUIElement, root: AXUIElement, trigger: BridgeEnrichmentTrigger
+) -> [String: Any] {
     let attribute = "AXManualAccessibility"
-    let before = countAXNodes(root, limit: 400)
-    var info: [String: Any] = ["mechanism": attribute, "nodes_before": before]
-    if before >= sparseTreeThreshold {
-        info["state"] = "not_needed"
-        info["nodes_after"] = before
-        return info
+    let limit = 400
+    let before = countAXNodes(root, limit: limit)
+    var info: [String: Any] = ["mechanism": attribute, "trigger": trigger.rawValue, "nodes_before": before]
+    // Read-only, for the record: VoiceOver's attribute is never SET here.
+    if let enhanced = axAttr(appElement, "AXEnhancedUserInterface") as? Bool {
+        info["enhanced_user_interface"] = enhanced
     }
     if let current = axAttr(appElement, attribute) as? Bool, current {
-        // Already on (by us earlier, or by another assistive client) and the
-        // tree is still sparse: nothing more this helper can do safely.
+        // Already on (by us earlier, or by another assistive client): asking
+        // again changes nothing.
         info["state"] = "already_enabled"
         info["nodes_after"] = before
         return info
@@ -812,37 +839,132 @@ func ensureAccessibilityTree(appElement: AXUIElement, root: AXUIElement) -> [Str
         return info
     }
     // Chromium builds the tree asynchronously: poll, bounded, until it grew
-    // and two consecutive counts agree.
-    let deadline = ProcessInfo.processInfo.systemUptime + 2.0
+    // and two consecutive counts agree. A tree already at the count limit
+    // cannot show growth by count, so it just gets the settle time.
+    let deadline = ProcessInfo.processInfo.systemUptime + 3.0
     var after = before
-    var previous = -1
-    while ProcessInfo.processInfo.systemUptime < deadline {
-        Thread.sleep(forTimeInterval: 0.1)
-        after = countAXNodes(root, limit: 400)
-        if after > before && after == previous { break }
-        previous = after
+    if before >= limit {
+        Thread.sleep(forTimeInterval: 1.5)
+        after = countAXNodes(root, limit: limit)
+    } else {
+        var previous = -1
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            after = countAXNodes(root, limit: limit)
+            if after > before && after == previous { break }
+            previous = after
+        }
     }
     info["nodes_after"] = after
-    info["state"] = after >= sparseTreeThreshold ? "enabled" : "enabled_still_sparse"
-    log("ax enrichment \(attribute): \(before) -> \(after) nodes")
+    info["grew"] = after > before
+    info["state"] = (trigger == .sparse && after < sparseTreeThreshold) ? "enabled_still_sparse" : "enabled"
+    log("ax enrichment \(attribute) trigger=\(trigger.rawValue): \(before) -> \(after) nodes")
     return info
+}
+
+/// Access class of one traversal (see `bridgeAXAccess`) and its actionable count.
+func traversalAccess(_ traversal: Traversal) -> (access: BridgeAXAccess, actionable: Int) {
+    let observed = traversal.elements.map {
+        BridgeObservedElement(windowChrome: ($0["window_chrome"] as? Bool) == true,
+                              actionable: ($0["actionable"] as? Bool) == true)
+    }
+    return (bridgeAXAccess(contentCount: traversal.content.count, elements: observed),
+            observed.filter { $0.actionable }.count)
+}
+
+/// Opt-in deep scan for diagnosis (`include_ax_diagnostics`): how deep the
+/// tree goes, where a bounded walk would stop, which roles exist, and every
+/// node that looks like a control — role, actions, AXValue settability and
+/// its ancestor path. Read-only: no action is performed, nothing is set.
+func axDeepScan(_ root: AXUIElement, maxScanDepth: Int = 64, maxScanVisited: Int = 15_000,
+                maxCandidates: Int = 60, maxSettableChecks: Int = 4_000) -> [String: Any] {
+    var stack: [(AXUIElement, Int, [String])] = [(root, 0, [])]
+    var visited = 0, deepest = 0, depthCut = 0, childCut = 0, settableChecks = 0, totalCandidates = 0
+    var roles: [String: Int] = [:]
+    var candidates: [[String: Any]] = []
+    let ignoredActions: Set<String> = ["AXShowMenu", "AXScrollToVisible", "AXShowDefaultUI", "AXShowAlternateUI"]
+    let settableProbeRoles: Set<String> = bridgeTextInputRoles.union(["AXGroup", "AXWebArea", "AXStaticText"])
+    while visited < maxScanVisited, let item = stack.popLast() {
+        let (element, depth, path) = item
+        visited += 1
+        deepest = max(deepest, depth)
+        let role = (axAttr(element, kAXRoleAttribute) as? String) ?? "AXUnknown"
+        roles[role, default: 0] += 1
+        var names: CFArray?
+        let actions = ((AXUIElementCopyActionNames(element, &names) == .success ? (names as? [String]) : nil) ?? [])
+            .filter { !ignoredActions.contains($0) }
+        var valueSettable = false
+        if settableProbeRoles.contains(role), settableChecks < maxSettableChecks {
+            settableChecks += 1
+            var settable: DarwinBoolean = false
+            if AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success {
+                valueSettable = settable.boolValue
+            }
+        }
+        if interactiveRoles.contains(role) || !actions.isEmpty || valueSettable {
+            totalCandidates += 1
+            if candidates.count < maxCandidates {
+                let subrole = axAttr(element, kAXSubroleAttribute) as? String
+                var label = ""
+                for attr in [kAXTitleAttribute, kAXDescriptionAttribute, "AXPlaceholderValue", kAXHelpAttribute] {
+                    if let text = axAttr(element, attr) as? String, !text.isEmpty { label = text; break }
+                }
+                var candidate: [String: Any] = [
+                    "role": role, "depth": depth, "actions": actions, "value_settable": valueSettable,
+                    "title": String(label.prefix(80)),
+                    "path": path.suffix(6).joined(separator: ">"),
+                    "window_chrome": bridgeIsWindowChrome(subrole: subrole),
+                ]
+                if let subrole { candidate["subrole"] = subrole }
+                if let enabled = axAttr(element, kAXEnabledAttribute) as? Bool { candidate["enabled"] = enabled }
+                if let value = axAttr(element, kAXValueAttribute) as? String {
+                    candidate["value_length"] = value.count
+                }
+                candidates.append(candidate)
+            }
+        }
+        if depth >= maxScanDepth {
+            depthCut += 1
+            continue
+        }
+        guard let children = axAttr(element, kAXChildrenAttribute) as? [AXUIElement] else { continue }
+        if children.count > maxChildrenPerNode { childCut += children.count - maxChildrenPerNode }
+        for child in children.prefix(maxChildrenPerNode).reversed() {
+            stack.append((child, depth + 1, path + [role]))
+        }
+    }
+    let topRoles = roles.sorted { $0.value > $1.value }.prefix(25).map { ["role": $0.key, "count": $0.value] as [String: Any] }
+    return [
+        "visited": visited, "visited_cap_hit": visited >= maxScanVisited, "deepest_depth": deepest,
+        "depth_cutoffs": depthCut, "children_cutoffs": childCut, "settable_checks": settableChecks,
+        "roles": topRoles, "candidates": candidates, "candidates_total": totalCandidates,
+    ]
 }
 
 func walk(
     _ element: AXUIElement, into traversal: Traversal, depth: Int,
     owner: BridgeTargetApp, window: AXUIElement?, windowTitle: String
 ) {
-    if depth > maxDepth { return }
+    if depth > maxDepth {
+        traversal.depthCutoffs += 1
+        return
+    }
     if traversal.visited >= maxVisitedNodes { return }
     // Budgets are per list: running out of controls must not stop content
     // collection, and running out of content must not stop control collection.
-    if traversal.elements.count >= maxElements && traversal.content.count >= maxContentNodes {
+    if traversal.regularElements >= maxElements && traversal.content.count >= maxContentNodes
+        && traversal.textInputs >= maxTextInputs {
         return
     }
     traversal.visited += 1
+    traversal.deepestDepth = max(traversal.deepestDepth, depth)
 
     let role = (axAttr(element, kAXRoleAttribute) as? String) ?? "AXUnknown"
-    if interactiveRoles.contains(role), traversal.elements.count < maxElements {
+    let isTextInput = bridgeTextInputRoles.contains(role)
+    let hasRoom = isTextInput ? traversal.textInputs < maxTextInputs : traversal.regularElements < maxElements
+    if interactiveRoles.contains(role) && !hasRoom { traversal.budgetSkippedControls += 1 }
+    if interactiveRoles.contains(role), hasRoom {
+        if isTextInput { traversal.textInputs += 1 } else { traversal.regularElements += 1 }
         let elementID = traversal.elements.count + 1
         var actionNames: CFArray?
         let namesErr = AXUIElementCopyActionNames(element, &actionNames)
@@ -895,9 +1017,18 @@ func walk(
                 scrollable = true
             }
         }
+        // A text input is a control only if its value can actually be set.
+        var valueSettable = false
+        if isTextInput {
+            var settable: DarwinBoolean = false
+            if AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success {
+                valueSettable = settable.boolValue
+            }
+            entry["value_settable"] = valueSettable
+        }
         entry["actionable"] = bridgeElementIsActionable(
             role: role, pressable: actions.contains("AXPress"), scrollable: scrollable,
-            windowChrome: bridgeIsWindowChrome(subrole: subrole))
+            windowChrome: bridgeIsWindowChrome(subrole: subrole), valueSettable: valueSettable)
         traversal.elements.append(entry)
     } else if !interactiveRoles.contains(role),
               traversal.content.count < maxContentNodes,
@@ -915,6 +1046,9 @@ func walk(
     }
 
     guard let children = axAttr(element, kAXChildrenAttribute) as? [AXUIElement] else { return }
+    if children.count > maxChildrenPerNode {
+        traversal.childrenCutoffs += children.count - maxChildrenPerNode
+    }
     for child in children.prefix(maxChildrenPerNode) {
         walk(child, into: traversal, depth: depth + 1,
              owner: owner, window: window, windowTitle: windowTitle)
@@ -991,7 +1125,8 @@ func runningApp(named request: String) -> NSRunningApplication? {
 /// Returns either the observation or a typed refusal; never a half-filled
 /// result that a client could mistake for a successful one.
 func describe(
-    includeScreenshot: Bool, targetApp: String?, mode: BridgeInteractionMode
+    includeScreenshot: Bool, targetApp: String?, mode: BridgeInteractionMode,
+    includeDiagnostics: Bool = false
 ) -> (result: [String: Any]?, refusal: BridgePolicyRefusal?) {
     let workspace = NSWorkspace.shared
     let frontmost = workspace.frontmostApplication
@@ -1048,25 +1183,53 @@ func describe(
     observationGeneration += 1
     observationCapturedAt = Date().timeIntervalSince1970
 
-    let traversal = Traversal()
+    var traversal = Traversal()
     var enrichment: [String: Any] = ["state": "not_trusted"]
-    if AXIsProcessTrusted() {
-        enrichment = ensureAccessibilityTree(
-            appElement: appElement, root: windowElement ?? appElement)
-    }
-    if AXIsProcessTrusted() {
-        // Scope to the window the person is actually looking at. Walking the
-        // whole application spends the element budget on a menu bar and on
-        // every other open window, so the content of the target window arrived
-        // only after its budget was already gone. This is generic: it asks the
-        // system which window is focused, whatever the app.
+    var diagnostics: [String: Any] = [:]
+    // Scope to the window the person is actually looking at. Walking the
+    // whole application spends the element budget on a menu bar and on every
+    // other open window. This is generic: it asks the system which window is
+    // focused, whatever the app.
+    func walkTarget(_ into: Traversal) {
         if let windowElement {
-            walk(windowElement, into: traversal, depth: 0,
+            walk(windowElement, into: into, depth: 0,
                  owner: owner, window: windowElement, windowTitle: captureTitle)
         } else {
-            walk(appElement, into: traversal, depth: 0,
+            walk(appElement, into: into, depth: 0,
                  owner: owner, window: nil, windowTitle: captureTitle)
         }
+    }
+    if AXIsProcessTrusted() {
+        let root = windowElement ?? appElement
+        // 1. What the window offers BEFORE any enrichment.
+        walkTarget(traversal)
+        let first = traversalAccess(traversal)
+        if includeDiagnostics { diagnostics["before"] = axDeepScan(root) }
+        // 2. Ask for the full tree only when no control is offered — now also
+        //    when the tree is readable but not actionable (Claude Desktop).
+        if let trigger = bridgeEnrichmentTrigger(
+            nodeCount: countAXNodes(root, limit: sparseTreeThreshold), access: first.access,
+            sparseThreshold: sparseTreeThreshold) {
+            enrichment = ensureAccessibilityTree(appElement: appElement, root: root, trigger: trigger)
+            // 3. The tree may have changed: walk again from scratch.
+            if let state = enrichment["state"] as? String, state.hasPrefix("enabled") {
+                elementTable.removeAll()
+                elementRoles.removeAll()
+                elementSubroles.removeAll()
+                elementContexts.removeAll()
+                traversal = Traversal()
+                walkTarget(traversal)
+            }
+        } else {
+            enrichment = ["state": "not_needed", "mechanism": "AXManualAccessibility", "trigger": "none"]
+        }
+        // 4. What it offers after.
+        let after = traversalAccess(traversal)
+        enrichment["access_before"] = first.access.rawValue
+        enrichment["actionable_before"] = first.actionable
+        enrichment["access_after"] = after.access.rawValue
+        enrichment["actionable_after"] = after.actionable
+        if includeDiagnostics { diagnostics["after"] = axDeepScan(root) }
     }
 
     var screenshotB64: String? = nil
@@ -1081,7 +1244,7 @@ func describe(
             return (buildDescription(
                 frontmostName: frontmostName, frontmost: frontmost, target: target,
                 traversal: traversal, windowTitle: captureTitle, screenshot: nil, scope: "none",
-                error: screenshotError, enrichment: enrichment), nil)
+                error: screenshotError, enrichment: enrichment, diagnostics: diagnostics), nil)
         }
         let outcome = captureWindowBase64(app: owner.name, title: captureTitle)
         screenshotB64 = outcome.image
@@ -1093,7 +1256,7 @@ func describe(
     return (buildDescription(
         frontmostName: frontmostName, frontmost: frontmost, target: target,
         traversal: traversal, windowTitle: captureTitle, screenshot: screenshotB64, scope: screenshotScope,
-        error: screenshotError, enrichment: enrichment), nil)
+        error: screenshotError, enrichment: enrichment, diagnostics: diagnostics), nil)
 }
 
 /// One observation frame. `frontmost_*` is always measured truth; `target_*`
@@ -1108,7 +1271,8 @@ func buildDescription(
     screenshot: String?,
     scope: String,
     error: String?,
-    enrichment: [String: Any] = [:]
+    enrichment: [String: Any] = [:],
+    diagnostics: [String: Any] = [:]
 ) -> [String: Any] {
     let windows = visibleWindows(frontmostApp: frontmostName, targetPID: target?.processIdentifier)
     let matches = windows.filter { ($0["title"] as? String) == windowTitle }
@@ -1148,7 +1312,10 @@ func buildDescription(
         "elements": traversal.elements.count,
         "actionable": observed.filter { $0.actionable }.count,
         "window_controls": observed.filter { $0.windowChrome }.count,
+        "text_inputs": traversal.textInputs,
+        "limits": traversal.limits,
     ]
+    if !diagnostics.isEmpty { result["ax_diagnostics"] = diagnostics }
     if let error { result["screenshot_error"] = error }
     return result
 }
@@ -1796,6 +1963,13 @@ func uiScroll(_ params: [String: Any]) -> [String: Any] {
     }
 }
 
+/// Set one element's AXValue, and VERIFY it by reading it back.
+///
+/// Before anything is touched: secure fields are refused, and an element
+/// whose AXValue is not settable is `unsupported` (CAPABILITY_UNSUPPORTED).
+/// After: the value read back must match (`bridgeSetValueCheck`), otherwise
+/// the call fails (`reason=value_not_applied|value_unreadable`). The previous
+/// content is never echoed — only lengths.
 func uiSetValue(_ params: [String: Any]) -> [String: Any] {
     guard let (elementID, el) = resolveElement(params: params) else {
         return ["ok": false, "message": "The referenced UI element is no longer on screen."]
@@ -1803,12 +1977,34 @@ func uiSetValue(_ params: [String: Any]) -> [String: Any] {
     if elementRoles[elementID] == "AXSecureTextField" {
         return ["ok": false, "message": "secure fields are never modified automatically"]
     }
-    let text = String((params["text"] as? String ?? "").prefix(maxTextChars))
-    let setErr = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFTypeRef)
-    if setErr != .success {
-        return ["ok": false, "message": "AXSetValue failed (\(setErr.rawValue))"]
+    let role = elementRoles[elementID] ?? "AXUnknown"
+    var settable: DarwinBoolean = false
+    let settableErr = AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable)
+    guard settableErr == .success, settable.boolValue else {
+        return ["ok": false, "unsupported": true,
+                "message": "This element's value cannot be set through accessibility.",
+                "detail": "reason=value_not_settable;role=\(role)"]
     }
-    return ["ok": true, "message": "value set"]
+    let text = String((params["text"] as? String ?? "").prefix(maxTextChars))
+    let previousLength = (axAttr(el, kAXValueAttribute) as? String)?.count
+    let setErr = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFTypeRef)
+    Thread.sleep(forTimeInterval: 0.2)
+    let readBack = axAttr(el, kAXValueAttribute) as? String
+    let check = bridgeSetValueCheck(requested: text, readBack: readBack)
+    var evidence: [String: Any] = [
+        "check": check.rawValue, "requested_length": text.count, "role": role,
+    ]
+    if let previousLength { evidence["previous_length"] = previousLength }
+    if let readBack { evidence["read_back_length"] = readBack.count }
+    if setErr != .success { evidence["ax_error"] = Int(setErr.rawValue) }
+    if check == .verified {
+        return ["ok": true, "set_value": evidence,
+                "message": "value set and verified" + (setErr == .success ? "" : " (AX returned \(setErr.rawValue))")]
+    }
+    return ["ok": false, "set_value": evidence,
+            "message": "The value did not take (read back does not match).",
+            "detail": "reason=value_\(check == .unreadable ? "unreadable" : "not_applied");role=\(role)"
+                + (setErr == .success ? "" : ";ax_error=\(setErr.rawValue)")]
 }
 
 func keyboardType(_ text: String) -> [String: Any] {
@@ -2207,7 +2403,8 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
             return (false, nil, refusalFrame(refusal))
         }
         let (result, refusal) = describe(
-            includeScreenshot: include, targetApp: target, mode: resolved.mode)
+            includeScreenshot: include, targetApp: target, mode: resolved.mode,
+            includeDiagnostics: (arguments["include_ax_diagnostics"] as? Bool) ?? false)
         if let refusal {
             return (false, nil, refusalFrame(refusal))
         }
@@ -2411,6 +2608,7 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 detail: "policy=\(mode.rawValue);kind=\(kind);" + (result["detail"] as? String ?? ""))
             error["interference"] = report.dictionary()
             if let scroll = result["scroll"] { error["scroll"] = scroll }
+            if let setValue = result["set_value"] { error["set_value"] = setValue }
             return (false, nil, error)
         }
         if result["ok"] as? Bool == true {
@@ -2426,6 +2624,7 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
             detail: (result["detail"] as? String).map { "policy=\(mode.rawValue);kind=\(kind);" + $0 } ?? "")
         error["interference"] = report.dictionary()
         if let scroll = result["scroll"] { error["scroll"] = scroll }
+        if let setValue = result["set_value"] { error["set_value"] = setValue }
         return (false, nil, error)
     default:
         return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "Unknown operation: \(operation)"))

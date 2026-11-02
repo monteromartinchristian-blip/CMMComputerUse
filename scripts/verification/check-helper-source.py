@@ -96,6 +96,15 @@ check(not re.search(r"CGEvent|scrollWheel|CGWarp|CGDisplayMoveCursor|\.post\(", 
       and "bridgeScrollEffect(" in scroll_code,
       "ui.scroll: AX-only (no wheel/CGEvent/cursor) and verified by a measured postcondition")
 
+sv_start = main.index("func uiSetValue(")
+sv_body = main[sv_start:main.index("\nfunc ", sv_start + 10)]
+check("bridgeSetValueCheck(" in sv_body and "AXUIElementIsAttributeSettable(" in sv_body
+      and not re.search(r"CGEvent|\.post\(|keyboard", sv_body),
+      "ui.set_value: settable precheck, read-back verification, no synthetic input")
+check("bridgeEnrichmentTrigger(" in main
+      and not re.search(r'AXUIElementSetAttributeValue\([^)]*"AXEnhancedUserInterface"', main),
+      "enrichment decided after a first walk (readable_not_actionable); AXEnhancedUserInterface never set")
+
 build = BUILD.read_text()
 shared = sorted(p.name for p in (REPO / "apps/macos/Shared").glob("*.swift"))
 missing = [name for name in shared if name not in build]
