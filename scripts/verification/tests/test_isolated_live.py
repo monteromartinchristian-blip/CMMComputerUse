@@ -93,6 +93,29 @@ class RequirementTests(unittest.TestCase):
             self.assertIn("cdhash H\"", requirement)
             self.assertTrue(requirement.startswith('identifier "'))
 
+    def test_explicit_designated_requirement(self):
+        self.assertEqual(
+            lib.designated_requirement('Executable=/x\ndesignated => identifier "com.cmm.chat.computer-use" and anchor apple generic\n'),
+            'identifier "com.cmm.chat.computer-use" and anchor apple generic')
+
+    def test_implicit_commented_designated_requirement(self):
+        # How codesign prints the implicit DR of ad-hoc code.
+        text = 'Executable=/tmp/Probe.app/Contents/MacOS/Probe\n# designated => cdhash H"0123456789abcdef0123456789abcdef01234567"\n'
+        self.assertEqual(lib.designated_requirement(text), 'cdhash H"0123456789abcdef0123456789abcdef01234567"')
+
+    def test_indentation_before_the_hash_is_accepted(self):
+        for line in ('   # designated => cdhash H"ab"', '\t#designated=>cdhash H"ab"', '  designated =>  cdhash H"ab"  '):
+            self.assertEqual(lib.designated_requirement("x\n" + line + "\ny"), 'cdhash H"ab"', line)
+
+    def test_a_line_that_merely_contains_designated_is_rejected(self):
+        for text in ('Executable=/x designated => cdhash H"ab"',
+                     'note: designated => cdhash H"ab"',
+                     '# not designated => cdhash H"ab"',
+                     '## designated => cdhash H"ab"',
+                     'designated =>   ',
+                     '#\ndesignated'):
+            self.assertIsNone(lib.designated_requirement(text), text)
+
     def test_designated_requirement_line(self):
         self.assertEqual(lib.designated_requirement('Executable=/x\ndesignated => identifier "a" and anchor apple generic\n'),
                          'identifier "a" and anchor apple generic')

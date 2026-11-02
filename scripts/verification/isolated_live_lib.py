@@ -90,11 +90,19 @@ def compose_requirement(facts: Dict[str, Any]) -> str:
     return " and ".join(parts)
 
 
-def designated_requirement(text: str) -> Optional[str]:
-    """`codesign -d -r- <path>` output → the designated requirement text."""
+#: One whole line: optional indentation, an optional `#` (codesign prints an
+#: IMPLICIT designated requirement — e.g. the cdhash of ad-hoc code — commented
+#: out), then `designated =>` and a non-empty requirement. `[ \t]` rather than
+#: `\s` so the anchor can never run across a newline.
+_DESIGNATED = re.compile(r"^[ \t]*#?[ \t]*designated[ \t]*=>[ \t]*(\S.*?)[ \t]*$", re.M)
 
-    m = re.search(r"^designated => (.*)$", text, re.M)
-    return m.group(1).strip() if m else None
+
+def designated_requirement(text: str) -> Optional[str]:
+    """`codesign -d -r- <path>` output → the designated requirement text,
+    explicit (`designated => …`) or implicit (`# designated => …`)."""
+
+    m = _DESIGNATED.search(text)
+    return m.group(1) if m else None
 
 
 # ── temporary policy and seeded latch ────────────────────────────────
