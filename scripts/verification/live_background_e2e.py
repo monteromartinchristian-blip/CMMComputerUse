@@ -194,6 +194,74 @@ def judge(steps, monitor_rows, target_bundle, person_bundle):
     return verdicts
 
 
+def helper_ledger(text: str) -> dict:
+    """The helper's own interference facts for one step, as printed."""
+
+    facts = {}
+    for key in ("verdict", "cursor_moved", "cursor_events_posted", "cursor_moved_by_action",
+                "focus_became_target", "external_activity", "transient_cursor_max_delta", "sampled"):
+        m = re.search(r"(?:^|[ :])%s=([^\s]+)" % key, text, re.M)
+        if m:
+            facts[key] = m.group(1)
+    return facts
+
+
+def cursor_motion(steps, rows, threshold: float = 0.5) -> list:
+    """WHICH step moved the cursor, and WHEN — diagnosis only, never a verdict.
+
+    For every step whose witness window (call + TAIL) saw the cursor move:
+    when it first moved relative to the call (`during_call` vs `tail`), how
+    far, how many samples moved, which OTHER steps' calls overlap the moving
+    samples (a tail overlaps the next call), and what the helper's ledger said
+    for that call. The quiet gate itself is unchanged.
+    """
+
+    out = []
+    for index, step in enumerate(steps):
+        window = [r for r in rows if step["start"] - 0.05 <= r["t"] <= step["end"] + TAIL]
+        before = [r for r in rows if r["t"] < step["start"]]
+        ref = before[-1] if before else (window[0] if window else None)
+        if not ref:
+            continue
+        moving = [r for r in window if abs(r["x"] - ref["x"]) + abs(r["y"] - ref["y"]) > threshold]
+        if not moving:
+            continue
+        first, peak = moving[0], max(moving, key=lambda r: abs(r["x"] - ref["x"]) + abs(r["y"] - ref["y"]))
+
+        def phase(t):
+            return "during_call" if t <= step["end"] else "tail"
+
+        overlapping = sorted({other["step"] for j, other in enumerate(steps) if j != index
+                              and any(other["start"] <= r["t"] <= other["end"] for r in moving)})
+        out.append({
+            "step": step["step"],
+            "first_move_ms": round((first["t"] - step["start"]) * 1000),
+            "first_move_phase": phase(first["t"]),
+            "peak_delta": round(abs(peak["x"] - ref["x"]) + abs(peak["y"] - ref["y"]), 1),
+            "peak_phase": phase(peak["t"]),
+            "moving_samples": len(moving),
+            "during_call_samples": sum(1 for r in moving if r["t"] <= step["end"]),
+            "from": [ref["x"], ref["y"]],
+            "to": [moving[-1]["x"], moving[-1]["y"]],
+            "overlaps_calls_of": overlapping,
+            "helper_ledger": helper_ledger(step.get("text", "")),
+        })
+    return out
+
+
+def describe_cursor_motion(item: dict) -> str:
+    ledger = item["helper_ledger"]
+    return ("CURSOR moved around step '%s': peak %.0fpt (%s), first move %+dms (%s), "
+            "%d moving samples (%d during the call), overlaps calls of %s; helper ledger: "
+            "cursor_events_posted=%s cursor_moved_by_action=%s external_activity=%s "
+            "transient_cursor_max_delta=%s" % (
+                item["step"], item["peak_delta"], item["peak_phase"], item["first_move_ms"],
+                item["first_move_phase"], item["moving_samples"], item["during_call_samples"],
+                item["overlaps_calls_of"] or "no other step",
+                ledger.get("cursor_events_posted"), ledger.get("cursor_moved_by_action"),
+                ledger.get("external_activity"), ledger.get("transient_cursor_max_delta")))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", default=default_socket_path())
@@ -325,6 +393,14 @@ def main() -> int:
             v["ok"] = v["target_front"] or v["target_top"]
             checks["witness_saw_breach"] = v["ok"]
     checks["witness_quiet"] = quiet_ok
+    # Diagnosis of any cursor movement the witness saw: which step, when, and
+    # what the helper's own ledger said. It explains the gate; it never
+    # changes it, and external activity is never turned into a PASS.
+    motion = cursor_motion(d.steps, rows)
+    if motion:
+        diagnostics["cursor_motion"] = motion
+        for item in motion:
+            print(describe_cursor_motion(item))
 
     report = {"person_bundle": person_bundle, "target": args.app, "checks": checks,
               "diagnostics": diagnostics,

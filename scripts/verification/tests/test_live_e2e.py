@@ -75,5 +75,49 @@ class ElectronVerdictTests(unittest.TestCase):
         self.assertFalse(v["control_proven"])
 
 
+class CursorMotionTests(unittest.TestCase):
+    STEPS = [
+        {"step": "5b re-observe", "start": 10.0, "end": 10.2, "text": "observe"},
+        {"step": "6 scroll", "start": 10.3, "end": 11.4,
+         "text": "interference: verdict=cursor_moved cursor_moved=True policy=background\n"
+                 "attributable: cursor_events_posted=False cursor_moved_by_action=False "
+                 "focus_became_target=False external_activity=True\n"
+                 "sampled: n=200 transient_focus_changes=0 transient_cursor_max_delta=256.0 restored=False\n"},
+    ]
+
+    def rows(self, moves):
+        rows = [{"t": 9.0 + i / 100, "front": "p", "top": "p", "x": 100.0, "y": 100.0} for i in range(400)]
+        for r in rows:
+            for start, end, dx in moves:
+                if start <= r["t"] <= end:
+                    r["x"] = 100.0 + dx
+        return rows
+
+    def test_movement_during_the_scroll_call_is_attributed_with_the_ledger(self):
+        motion = e2e.cursor_motion(self.STEPS, self.rows([(10.5, 10.9, 256.0)]))
+        scroll = [m for m in motion if m["step"] == "6 scroll"][0]
+        self.assertEqual(scroll["first_move_phase"], "during_call")
+        self.assertEqual(scroll["peak_delta"], 256.0)
+        self.assertGreater(scroll["during_call_samples"], 0)
+        self.assertEqual(scroll["helper_ledger"]["external_activity"], "True")
+        self.assertEqual(scroll["helper_ledger"]["cursor_events_posted"], "False")
+        line = e2e.describe_cursor_motion(scroll)
+        self.assertIn("step '6 scroll'", line)
+        self.assertIn("during_call", line)
+        # The previous step's tail also sees it, and is told it overlaps the scroll call.
+        observe = [m for m in motion if m["step"] == "5b re-observe"][0]
+        self.assertEqual(observe["first_move_phase"], "tail")
+        self.assertEqual(observe["overlaps_calls_of"], ["6 scroll"])
+
+    def test_no_movement_no_diagnostic(self):
+        self.assertEqual(e2e.cursor_motion(self.STEPS, self.rows([])), [])
+
+    def test_the_quiet_gate_is_unchanged(self):
+        source = (VERIFY / "live_background_e2e.py").read_text()
+        self.assertIn('v["cursor_max_delta"] <= 0.5', source)
+        self.assertIn('checks["witness_quiet"] = quiet_ok', source)
+        self.assertNotIn('external_activity") == "True" and', source)
+
+
 if __name__ == "__main__":
     unittest.main()
