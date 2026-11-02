@@ -25,6 +25,12 @@ Python interpreter cannot be granted.
   boundary: no TCP port, no HTTP server, no `open`, no FIFOs.
 - Socket and stdio modes speak the identical NDJSON protocol over one JSON
   object per line; only the rendezvous differs.
+- The socket path must fit COMPLETELY in `sockaddr_un.sun_path` (Darwin: at
+  most 103 UTF-8 bytes plus the NUL; capacity derived from the struct). A
+  longer path is never truncated: `--serve-socket` logs `FATAL: socket path
+  does not fit in sockaddr_un …` and exits 2 before probing, unlinking or
+  binding anything, and the single-instance probe treats it as "nobody
+  there". Since helper 0.3.2 build 5; earlier builds truncated to 103 bytes.
 
 Why the app launches the helper (TCC ancestry rule, proven live 2026-10-02
 via the TCC log): on current macOS a helper spawned by an unbundled client

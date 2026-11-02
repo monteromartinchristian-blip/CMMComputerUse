@@ -190,6 +190,39 @@ pre_body = main[pre_start:main.index("\n}\n", pre_start)]
 check(pre_body.index("bridgeReleasedSnapshotRefusal(") < pre_body.index("bridgeObservationExpired("),
       "R: a released snapshot is refused as `released` before any expiry/age is computed")
 
+def top_func(source: str, name: str) -> str:
+    start = source.index("func %s(" % name)
+    return source[start:source.index("\n}\n", start)]
+
+
+def strip_comments(source: str) -> str:
+    return "\n".join(l.split("//", 1)[0] for l in source.splitlines())
+
+
+socket_src = (REPO / "apps/macos/Shared/ComputerUseSocketPath.swift").read_text()
+socket_code = strip_comments(socket_src)
+addr_body = strip_comments(top_func(main, "unixAddr"))
+check("-> sockaddr_un?" in addr_body and "bridgeUnixSocketPathBytes(path)" in addr_body
+      and "path.utf8.prefix(" not in addr_body and ".prefix(" not in addr_body
+      and "utf8.prefix(" not in strip_comments(main),
+      "S: unixAddr never truncates (no utf8.prefix; optional address from the shared validator)")
+check("MemoryLayout.size(ofValue: sockaddr_un().sun_path)" in socket_code
+      and not re.search(r"\b10[34]\b", socket_code)
+      and "bytes.count + 1 <= capacity" in socket_code and "Array(path.utf8)" in socket_code,
+      "S: one capacity derived from sockaddr_un.sun_path, measured in UTF-8 bytes, NUL reserved")
+serve_body = strip_comments(top_func(main, "serveSocket"))
+validate_at = serve_body.find("guard var addr = unixAddr(path) else {")
+check(validate_at >= 0
+      and "exit(2)" in serve_body[validate_at:serve_body.index("}", validate_at)]
+      and all(validate_at < serve_body.index(step)
+              for step in ("socket(AF_UNIX", "probeSocket(at: path)", "unlink(path)", "bind(fd"))
+      and serve_body.count("unixAddr(") == 1,
+      "S: serveSocket refuses an overlong path (FATAL, exit 2) BEFORE socket/probe/unlink/bind")
+probe_body = strip_comments(top_func(main, "probeSocket"))
+probe_at = probe_body.find("guard var addr = unixAddr(path) else { return false }")
+check(probe_at >= 0 and probe_at < probe_body.index("socket(AF_UNIX") < probe_body.index("connect("),
+      "S: probeSocket uses the same validation and never connects to a truncated address")
+
 build = BUILD.read_text()
 shared = sorted(p.name for p in (REPO / "apps/macos/Shared").glob("*.swift"))
 missing = [name for name in shared if name not in build]

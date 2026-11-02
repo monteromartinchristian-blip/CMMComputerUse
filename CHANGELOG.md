@@ -36,6 +36,15 @@ The helper and the plugin version independently; this file tracks the plugin
   (es "Aplicación", en "Application"; the runtime picks no language). A
   bundle id is never the title and stays in `technical.target.bundle`.
   Display only: verification, grants and stateVersion 12 unchanged.
+- `--serve-socket` truncated the UNIX socket path to 103 bytes
+  (`path.utf8.prefix(103)`), so a longer path (a 127-byte harness lane under
+  iCloud Drive) was bound somewhere other than where `unlink`, the probe and
+  the client looked: the helper stayed alive and the client waited. The path
+  is now validated in UTF-8 bytes against the real `sun_path` capacity
+  (Shared `bridgeUnixSocketPathBytes`); a path that does not fit is a FATAL
+  exit 2 before socket/probe/unlink/bind, and the probe never connects to a
+  truncated address. Valid paths, including the canonical
+  `~/.cmm/computer-bridge/bridge.sock`, behave as before.
 
 ## Unreleased — helper 0.3.1 build 4 (focus attribution, 2026-11-02)
 

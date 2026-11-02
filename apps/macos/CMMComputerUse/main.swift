@@ -2880,12 +2880,16 @@ func handleLine(_ text: String, sendTo fd: Int32?, peer: BridgePeerCode? = nil) 
 // NDJSON protocol, same dispatch, same allowlist — only the rendezvous
 // differs. No TCP, no `open`, no FIFOs.
 
-func unixAddr(_ path: String) -> sockaddr_un {
+/// The address for `path`, or nil when the path does not fit COMPLETELY in
+/// `sun_path` (Shared: `bridgeUnixSocketPathBytes`). Never truncated: a
+/// truncated address would bind/connect somewhere other than `path`.
+func unixAddr(_ path: String) -> sockaddr_un? {
+    guard let bytes = bridgeUnixSocketPathBytes(path) else { return nil }
     var addr = sockaddr_un()
     memset(&addr, 0, MemoryLayout<sockaddr_un>.size)
     addr.sun_family = sa_family_t(AF_UNIX)
-    let bytes = Array(path.utf8.prefix(103)) + [0]
     let off = MemoryLayout<sockaddr_un>.offset(of: \.sun_path)!
+    guard bytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
     bytes.withUnsafeBytes { src in
         withUnsafeMutableBytes(of: &addr) { dst in
             dst.baseAddress!.advanced(by: off).copyMemory(
@@ -2904,6 +2908,12 @@ func withSockAddr(_ addr: inout sockaddr_un, _ body: (UnsafePointer<sockaddr>, s
 }
 
 func serveSocket(at path: String) -> Never {
+    // Before the probe, the unlink and the bind: a path that does not fit is
+    // refused outright; nothing is removed and no truncated socket is created.
+    guard var addr = unixAddr(path) else {
+        log("FATAL: socket path does not fit in sockaddr_un (\(path.utf8.count) bytes; max \(bridgeUnixSocketPathMaxBytes)): \(path)")
+        exit(2)
+    }
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else {
         log("FATAL: socket() failed"); exit(2)
@@ -2914,7 +2924,6 @@ func serveSocket(at path: String) -> Never {
         exit(0)
     }
     unlink(path)
-    var addr = unixAddr(path)
     let bound = withSockAddr(&addr) { saddr, len in bind(fd, saddr, len) }
     guard bound == 0 else {
         log("FATAL: bind(\(path)) failed: \(String(cString: strerror(errno)))"); exit(2)
@@ -2945,10 +2954,11 @@ func serveSocket(at path: String) -> Never {
 let dispatchLock = NSLock()
 
 func probeSocket(at path: String) -> Bool {
+    // Same validation as serveSocket: never connect to a truncated address.
+    guard var addr = unixAddr(path) else { return false }
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return false }
     defer { close(fd) }
-    var addr = unixAddr(path)
     let rc = withSockAddr(&addr) { saddr, len in connect(fd, saddr, len) }
     return rc == 0
 }

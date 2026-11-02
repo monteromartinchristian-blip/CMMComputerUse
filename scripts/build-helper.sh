@@ -34,6 +34,7 @@ SHARED_AUTHZ="$APP_SRC/Shared/ComputerUseAuthorization.swift"
 SHARED_CLIENT="$APP_SRC/Shared/ComputerUseClientIdentity.swift"
 SHARED_REQUIREMENT="$APP_SRC/Shared/ComputerUseRequirement.swift"
 SHARED_LATCH="$APP_SRC/Shared/ComputerUseBreachLatch.swift"
+SHARED_SOCKET="$APP_SRC/Shared/ComputerUseSocketPath.swift"
 PLIST="$APP_SRC/CMMComputerUse/Info.plist"
 APP_NAME="CMMComputerUse.app"
 APP_DISPLAY_NAME="CMM Computer Use"
@@ -43,7 +44,7 @@ INSTALL_DIR="${CMM_BRIDGE_INSTALL_DIR:-$HOME/Applications}"
 APP="$INSTALL_DIR/$APP_NAME"
 BUILD_DIR="${CMM_HELPER_BUILD_DIR:-$REPO/build}"
 
-for required in "$SRC" "$SRC_STREAM" "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$PLIST"; do
+for required in "$SRC" "$SRC_STREAM" "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$SHARED_SOCKET" "$PLIST"; do
   if [ ! -f "$required" ]; then
     echo "missing source: $required" >&2; exit 1
   fi
@@ -58,7 +59,7 @@ swiftc -O -target arm64-apple-macosx15.0 \
   -framework ApplicationServices -framework AppKit -framework CoreGraphics -framework Foundation \
   -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework CoreImage -framework ImageIO \
   -framework Security \
-  "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$SRC_STREAM" "$SRC" \
+  "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$SHARED_SOCKET" "$SRC_STREAM" "$SRC" \
   -o "$BUILD_DIR/CMMComputerUse"
 
 echo "== assembling $APP_NAME"
