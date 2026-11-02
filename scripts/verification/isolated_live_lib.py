@@ -29,6 +29,19 @@ SEED_OTHER_ID = "seed-other-0000"
 
 # ── code signatures and requirements ─────────────────────────────────
 
+def codesign_text(stdout: Optional[str], stderr: Optional[str]) -> str:
+    """Everything `codesign -d …` printed, whichever channel it used.
+
+    `codesign -d` writes its display (Executable=, Identifier=, …) on stderr,
+    and `-r-` writes the requirement to the named file `-` (stdout) — but that
+    split is an implementation detail that has differed between releases. Both
+    parsers below look for anchored `key=` / `designated =>` lines, so reading
+    the two channels together can never lose a line nor invent one.
+    """
+
+    return (stdout or "") + "\n" + (stderr or "")
+
+
 def parse_codesign_display(text: str) -> Dict[str, Any]:
     """Facts from `codesign -d --verbose=4 <path>` (it prints on stderr)."""
 

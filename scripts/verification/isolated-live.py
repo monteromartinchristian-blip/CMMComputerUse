@@ -82,6 +82,22 @@ def run(cmd: List[str], check: bool = True, **kw) -> subprocess.CompletedProcess
     return result
 
 
+def codesign_display(path: str, *flags: str, check: bool = True) -> str:
+    """`codesign -d <flags> <path>`, both output channels (see
+    lib.codesign_text). The ONLY way this lane reads a code signature."""
+
+    result = run(["codesign", "-d"] + list(flags) + [path], check=check)
+    return lib.codesign_text(result.stdout, result.stderr)
+
+
+def signature_facts(path: str, check: bool = True) -> Dict[str, Any]:
+    return lib.parse_codesign_display(codesign_display(path, "--verbose=4", check=check))
+
+
+def designated_requirement_of(path: str, check: bool = True) -> Optional[str]:
+    return lib.designated_requirement(codesign_display(path, "-r-", check=check))
+
+
 def expect(condition: bool, message: str, results: Dict[str, Any], key: str) -> None:
     results[key] = bool(condition)
     say(("PASS " if condition else "FAIL ") + message)
@@ -184,12 +200,11 @@ def production_snapshot() -> Dict[str, Any]:
     for pid in pids:
         helpers[pid] = run(["ps", "-o", "lstart=", "-p", pid], check=False).stdout.strip()
     installed = tree(P["installed_app"])
-    cs = run(["codesign", "-d", "--verbose=4", P["installed_app"]], check=False)
     return {
         "support_dir": tree(P["support_dir"]),
         "launch_agent": tree(P["launch_agent"]),
         "installed_app": installed,
-        "installed_app_signature": lib.parse_codesign_display(cs.stderr) if cs.returncode == 0 else "unsigned_or_missing",
+        "installed_app_signature": signature_facts(P["installed_app"], check=False) if os.path.isdir(P["installed_app"]) else "missing",
         "launchctl": lib.launchctl_facts(lc.stdout) if lc.returncode == 0 else "not_loaded",
         "production_helper_processes": helpers,
         "launchservices_paths": launchservices_paths(),
@@ -288,14 +303,18 @@ def phase_prepare(args) -> Lane:
     copy = lane.path("CMMComputerUse.app")
     run(["ditto", staged, copy])
     run(["codesign", "--verify", "--deep", "--strict", copy])
-    copy_facts = lib.parse_codesign_display(run(["codesign", "-d", "--verbose=4", copy]).stderr)
-    copy_dr = lib.designated_requirement(run(["codesign", "-d", "-r-", copy]).stdout)
+    copy_facts = signature_facts(copy)
+    copy_dr = designated_requirement_of(copy)
     installed = lib.production_paths(HOME)["installed_app"]
-    installed_dr = lib.designated_requirement(run(["codesign", "-d", "-r-", installed], check=False).stdout)
+    installed_dr = designated_requirement_of(installed, check=False)
     lane.state.update(helper_signature=copy_facts, helper_dr=copy_dr, installed_dr=installed_dr)
     say("helper copy: %s cdhash=%s team=%s" % (copy_facts["identifier"], copy_facts["cdhash"], copy_facts["team_id"]))
     expect(copy_facts["identifier"] == lib.HELPER_BUNDLE_ID, "copy is %s" % lib.HELPER_BUNDLE_ID, r, "helper_identifier")
-    expect(bool(copy_dr) and copy_dr == installed_dr,
+    say("designated requirement (copy):      %s" % copy_dr)
+    say("designated requirement (installed): %s" % installed_dr)
+    expect(bool(copy_dr), "designated requirement of the copy was read", r, "copy_dr_read")
+    expect(bool(installed_dr), "designated requirement of the installed helper was read", r, "installed_dr_read")
+    expect(copy_dr == installed_dr,
            "designated requirement of the copy == installed helper's (TCC keys on it)", r, "same_dr")
 
     probe_bin = lane.path("rearm-probe")
@@ -304,7 +323,7 @@ def phase_prepare(args) -> Lane:
     run(["codesign", "--force", "--options", "runtime", "--sign", identity,
          "--identifier", lib.PROBE_IDENTIFIER, probe_bin])
     run(["codesign", "--verify", "--strict", probe_bin])
-    probe_facts = lib.parse_codesign_display(run(["codesign", "-d", "--verbose=4", probe_bin]).stderr)
+    probe_facts = signature_facts(probe_bin)
     requirement = lib.compose_requirement(probe_facts)
     lane.state.update(probe_signature=probe_facts, probe_requirement=requirement, signing_identity=identity)
     expect(probe_facts["identifier"] == lib.PROBE_IDENTIFIER, "probe identifier %s" % lib.PROBE_IDENTIFIER, r, "probe_identifier")
@@ -360,7 +379,7 @@ def phase_start(lane: Lane) -> None:
         status = client.policy_status()
         peer = status.get("peer") or {}
         exe = pid_path(os.getpid()) or sys.executable
-        driver_facts = lib.parse_codesign_display(run(["codesign", "-d", "--verbose=4", exe]).stderr)
+        driver_facts = signature_facts(exe)
         driver_requirement = lib.compose_requirement(driver_facts)
         say("driver: %s (peer as seen by the helper: %s)" % (exe, peer))
         check = client.request("policy.requirements.check", {
@@ -411,7 +430,7 @@ def phase_verify_tcc(lane: Lane) -> None:
            "running image is the isolated copy (%s)" % exe, r, "image")
     ppid = run(["ps", "-o", "ppid=", "-p", str(pid)]).stdout.strip()
     expect(ppid == "1", "parent is launchd (LaunchServices launch), ppid=%s" % ppid, r, "ppid")
-    running = lib.parse_codesign_display(run(["codesign", "-d", "--verbose=4", exe]).stderr)
+    running = signature_facts(exe)
     expect(running["cdhash"] == lane.state["helper_signature"]["cdhash"],
            "running code cdhash == staged build cdhash", r, "cdhash")
     ls = run(["lsappinfo", "list"], check=False).stdout

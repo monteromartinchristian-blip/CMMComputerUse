@@ -23,7 +23,7 @@ node scripts/render-client.mjs --check
 node scripts/verify-manifest.mjs
 cd ../..
 python3 -I scripts/verification/check-helper-source.py      # 11 checks
-python3 -m unittest discover -s scripts/verification/tests  # carril aislado + probe
+python3 -m unittest discover -s scripts/verification/tests  # 29 tests; en el Mac NO deben salir los 3 "skipped" de CodesignOnMacTests
 (cd packages/dsh-computer-use && python3 -m unittest tests/test_patch.py)   # necesita /usr/bin/ruby
 node packages/dsh-computer-use/tests/official-host.cjs packages/dsh-computer-use   # necesita DeepSeek Harness.app
 ```

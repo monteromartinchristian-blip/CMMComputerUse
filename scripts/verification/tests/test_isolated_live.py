@@ -10,9 +10,15 @@ its sources may and may not do.
 from __future__ import annotations
 
 import ast
+import importlib.util
+import os
 import pathlib
+import platform
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -91,6 +97,82 @@ class RequirementTests(unittest.TestCase):
         self.assertEqual(lib.designated_requirement('Executable=/x\ndesignated => identifier "a" and anchor apple generic\n'),
                          'identifier "a" and anchor apple generic')
         self.assertIsNone(lib.designated_requirement("nothing"))
+
+
+class CodesignChannelTests(unittest.TestCase):
+    """The requirement must be found whichever channel codesign used."""
+
+    DR = 'designated => identifier "com.cmm.chat.computer-use" and anchor apple generic and certificate leaf[subject.OU] = "7NH822RKEQ"'
+
+    def test_requirement_on_stdout_or_stderr_is_found(self):
+        expected = self.DR.split("=> ", 1)[1]
+        for stdout, stderr in ((self.DR + "\n", "Executable=/x\n"),
+                               ("", "Executable=/x\n" + self.DR + "\n"),
+                               (None, self.DR)):
+            text = lib.codesign_text(stdout, stderr)
+            self.assertEqual(lib.designated_requirement(text), expected, (stdout, stderr))
+
+    def test_display_facts_are_found_on_either_channel(self):
+        for stdout, stderr in ((DEV_DISPLAY, ""), ("", DEV_DISPLAY)):
+            facts = lib.parse_codesign_display(lib.codesign_text(stdout, stderr))
+            self.assertEqual(facts["cdhash"], "0123456789abcdef0123456789abcdef01234567")
+
+    def test_the_lane_reads_signatures_only_through_the_combined_reader(self):
+        body = ORCHESTRATOR.split('"""', 2)[2]
+        calls = re.findall(r'\["codesign", "-d"[^\]]*\]', body)
+        self.assertEqual(calls, ['["codesign", "-d"]'], "every codesign -d goes through codesign_display")
+        self.assertNotRegex(body, r"parse_codesign_display\(run\(|designated_requirement\(run\(")
+
+
+@unittest.skipUnless(platform.system() == "Darwin" and shutil.which("codesign"), "needs macOS codesign")
+class CodesignOnMacTests(unittest.TestCase):
+    """Real `codesign -d -r-` against signed bundles, through the lane's reader."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("isolated_live", str(VERIFY / "isolated-live.py"))
+        cls.lane = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.lane)
+
+    def assert_requirement(self, path, must_contain):
+        requirement = self.lane.designated_requirement_of(path)
+        self.assertTrue(requirement, "no designated requirement read from %s" % path)
+        self.assertIn(must_contain, requirement)
+        return requirement
+
+    def test_apple_signed_system_bundle(self):
+        for candidate in ("/System/Applications/Calculator.app", "/System/Applications/TextEdit.app"):
+            if os.path.isdir(candidate):
+                self.assert_requirement(candidate, "anchor apple")
+                facts = self.lane.signature_facts(candidate)
+                self.assertTrue(facts["identifier"] and facts["cdhash"])
+                return
+        self.skipTest("no system bundle found")
+
+    def test_freshly_signed_temporary_bundle(self):
+        work = tempfile.mkdtemp(prefix="cmm-cu-codesign-test-")
+        try:
+            app = os.path.join(work, "Probe.app")
+            os.makedirs(os.path.join(app, "Contents", "MacOS"))
+            shutil.copy2("/usr/bin/true", os.path.join(app, "Contents", "MacOS", "Probe"))
+            pathlib.Path(app, "Contents", "Info.plist").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'
+                "<key>CFBundleIdentifier</key><string>com.cmm.computer-use.codesign-test</string>"
+                "<key>CFBundleExecutable</key><string>Probe</string></dict></plist>")
+            subprocess.run(["codesign", "--force", "--sign", "-", app], check=True, capture_output=True)
+            requirement = self.assert_requirement(app, "cdhash")  # ad-hoc DR is the cdhash
+            self.assertIn(self.lane.signature_facts(app)["cdhash"], requirement.lower())
+        finally:
+            shutil.rmtree(work)
+
+    def test_installed_and_staged_helpers_when_present(self):
+        installed = os.path.expanduser("~/Applications/CMMComputerUse.app")
+        staged = str(VERIFY.parents[1] / "build/stage-20261102/CMMComputerUse.app")
+        present = [p for p in (installed, staged) if os.path.isdir(p)]
+        if not present:
+            self.skipTest("no helper bundle on this Mac")
+        for path in present:
+            self.assert_requirement(path, 'identifier "com.cmm.chat.computer-use"')
 
 
 class PolicyTests(unittest.TestCase):
