@@ -101,7 +101,14 @@ identidad de código (cdhash) del intérprete que actúa como agente.
    (`effect=moved`) y por el `scroll_y` del fixture; Claude se juzga por
    `electron_observe_readable` (observe-only), y `actionable` es sólo
    diagnóstico — el control real de Claude sigue sin demostrar; cualquier
-   movimiento de cursor sigue haciendo FAIL y se diagnostica por paso. `live-background-e2e.sh --electron-app …
+   movimiento de cursor sigue haciendo FAIL y se diagnostica por paso.
+   Ventana del testigo: tras cada paso quiet el runner espera una cola real de
+   `TAIL`=1,5 s antes del siguiente paso (no se recorta la ventana), y el gate
+   `witness_windows_disjoint` exige que ninguna llamada posterior empiece
+   dentro de esa cola; si ocurre, se imprime `witness_window_overlap`. Así el
+   breach deliberado (quiet=False) ya no cae en la ventana de `9b observe`.
+   El frontmost inicial de la persona se toma de `lsappinfo` (ASN de `front`),
+   y si sale vacío del testigo o del helper, indicando la fuente. `live-background-e2e.sh --electron-app …
    --breach-control` contra el socket aislado: status, observe, nombre en
    PiP, botón de ventana rechazado, press sin robo de foco, scroll, Electron
    (sólo observe), guard anti-bypass y, **al final**, el breach controlado del

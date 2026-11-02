@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 VERIFY = pathlib.Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("live_e2e", str(VERIFY / "live_background_e2e.py"))
@@ -114,9 +115,141 @@ class CursorMotionTests(unittest.TestCase):
 
     def test_the_quiet_gate_is_unchanged(self):
         source = (VERIFY / "live_background_e2e.py").read_text()
-        self.assertIn('v["cursor_max_delta"] <= 0.5', source)
+        # Same criterion, now named quiet_step_ok() and used by the quiet loop.
+        self.assertIn('return (verdict["samples"] > 0 and not verdict["target_front"] and not verdict["target_top"]\n'
+                      '            and verdict["cursor_max_delta"] <= 0.5)', source)
+        self.assertIn("ok = quiet_step_ok(v)", source)
         self.assertIn('checks["witness_quiet"] = quiet_ok', source)
         self.assertNotIn('external_activity") == "True" and', source)
+
+
+class FakeClock:
+    """Simulated CLOCK_UPTIME_RAW: each tool call takes `call_s`; sleep advances."""
+
+    def __init__(self, call_s=0.2):
+        self.now = 100.0
+        self.call_s = call_s
+
+    def uptime(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.0, seconds)
+
+    def handle(self, registry, message):
+        self.now += self.call_s
+        return {"result": {"content": [{"type": "text", "text": "ok " + message["params"]["name"]}]}}
+
+
+class WitnessWindowTests(unittest.TestCase):
+    TARGET = "com.example.computer-use-fixture"
+    PERSON = "com.apple.Terminal"
+
+    def run_steps(self, plan):
+        """plan: [(step, quiet)] executed through the REAL Driver.call."""
+        clock = FakeClock()
+        with mock.patch.object(e2e, "uptime", clock.uptime), \
+             mock.patch.object(e2e.time, "sleep", clock.sleep), \
+             mock.patch.object(e2e, "handle_message", clock.handle), \
+             mock.patch("builtins.print"):
+            d = e2e.Driver("/nonexistent/socket")
+            for step, quiet in plan:
+                d.call(step, "computer_use_observe", {}, quiet=quiet)
+        return d.steps, clock
+
+    def rows(self, start, end, events=()):
+        """Witness samples every 10 ms; events: (t_from, t_to, field, value)."""
+        rows = []
+        t = start
+        while t <= end:
+            row = {"t": round(t, 3), "front": self.PERSON, "top": self.PERSON, "x": 50.0, "y": 50.0}
+            for t0, t1, field, value in events:
+                if t0 <= t <= t1:
+                    row[field] = value
+            rows.append(row)
+            t += 0.01
+        return rows
+
+    def quiet_verdict(self, steps, rows, name):
+        verdicts = e2e.judge(steps, rows, self.TARGET, self.PERSON)
+        return [v for s, v in zip(steps, verdicts) if s["step"] == name][0]
+
+    def test_quiet_step_with_a_silent_tail_passes(self):
+        steps, clock = self.run_steps([("2 observe", True)])
+        step = steps[0]
+        self.assertGreaterEqual(clock.now, step["end"] + e2e.TAIL, "the driver waited the whole tail")
+        v = self.quiet_verdict(steps, self.rows(step["start"] - 0.5, step["end"] + e2e.TAIL + 0.2), "2 observe")
+        self.assertTrue(e2e.quiet_step_ok(v))
+
+    def test_late_interference_800ms_after_the_step_fails_it(self):
+        steps, _ = self.run_steps([("5 press", True)])
+        end = steps[0]["end"]
+        late = [(end + 0.8, end + 1.0, "front", self.TARGET), (end + 0.8, end + 1.0, "top", self.TARGET)]
+        v = self.quiet_verdict(steps, self.rows(steps[0]["start"] - 0.5, end + e2e.TAIL + 0.2, late), "5 press")
+        self.assertTrue(v["target_front"])
+        self.assertFalse(e2e.quiet_step_ok(v), "a late interference of the step itself must still fail it")
+        # and the cursor criterion is unchanged
+        moved = [(end + 0.8, end + 0.9, "x", 51.0)]
+        v = self.quiet_verdict(steps, self.rows(steps[0]["start"] - 0.5, end + e2e.TAIL + 0.2, moved), "5 press")
+        self.assertFalse(e2e.quiet_step_ok(v))
+
+    def test_no_call_can_start_inside_a_quiet_tail(self):
+        steps, _ = self.run_steps([("2 observe", True), ("5 press", True), ("9 breach control", False),
+                                   ("9c latched", False)])
+        self.assertEqual(e2e.witness_window_overlaps(steps), [])
+        for earlier, later in zip(steps, steps[1:]):
+            if earlier["quiet"]:
+                self.assertGreaterEqual(later["start"], earlier["end"] + e2e.TAIL)
+
+    def test_an_overlap_is_named_explicitly(self):
+        steps = [{"step": "9b observe", "start": 1.0, "end": 1.2, "quiet": True},
+                 {"step": "9 breach control", "start": 1.3, "end": 1.5, "quiet": False}]
+        self.assertEqual(e2e.witness_window_overlaps(steps),
+                         [{"quiet_step": "9b observe", "next_call": "9 breach control", "overlap_ms": 1400}])
+
+    def test_the_deliberate_breach_no_longer_contaminates_9b_observe(self):
+        steps, _ = self.run_steps([("9b observe", True), ("9 breach control", False)])
+        observe, breach = steps
+        # The fixture raises itself ~430 ms after the breach press starts.
+        raised = [(breach["start"] + 0.43, breach["end"] + 2.0, "front", self.TARGET),
+                  (breach["start"] + 0.43, breach["end"] + 2.0, "top", self.TARGET)]
+        rows = self.rows(observe["start"] - 0.5, breach["end"] + 2.0, raised)
+        v_observe = self.quiet_verdict(steps, rows, "9b observe")
+        v_breach = self.quiet_verdict(steps, rows, "9 breach control")
+        self.assertTrue(e2e.quiet_step_ok(v_observe), "9b observe stays clean")
+        self.assertTrue(v_breach["target_front"] or v_breach["target_top"], "the witness still sees the breach")
+        self.assertEqual(e2e.witness_window_overlaps(steps), [])
+
+    def test_the_old_back_to_back_timing_is_what_contaminated_it(self):
+        # Without the tail wait (the previous runner), the same breach falls
+        # inside 9b's window and the overlap gate names it.
+        steps = [{"step": "9b observe", "start": 10.0, "end": 10.2, "quiet": True},
+                 {"step": "9 breach control", "start": 10.21, "end": 10.5, "quiet": False}]
+        rows = self.rows(9.5, 12.5, [(10.64, 12.5, "front", self.TARGET), (10.64, 12.5, "top", self.TARGET)])
+        self.assertFalse(e2e.quiet_step_ok(self.quiet_verdict(steps, rows, "9b observe")))
+        self.assertTrue(e2e.witness_window_overlaps(steps))
+
+    def test_gate_constants_are_unchanged(self):
+        self.assertEqual(e2e.TAIL, 1.5)
+        source = (VERIFY / "live_background_e2e.py").read_text()
+        self.assertIn('verdict["cursor_max_delta"] <= 0.5', source)
+        self.assertIn('checks["witness_quiet"] = quiet_ok', source)
+        self.assertIn('"9 breach control", "computer_use_press",\n                           {"element_id": trigger, "snapshot": snap}, quiet=False)', source)
+
+
+class PersonFrontmostTests(unittest.TestCase):
+    def test_lsappinfo_formats(self):
+        for out in ('"CFBundleIdentifier"="com.apple.Terminal"\n', '"bundleID"="com.apple.Terminal"'):
+            self.assertEqual(e2e.person_frontmost(out, [], "")[:2], ("com.apple.Terminal", "lsappinfo"))
+
+    def test_empty_lsappinfo_falls_back_and_says_so(self):
+        rows = [{"t": 1, "front": "com.apple.Terminal", "top": "x", "x": 0, "y": 0}]
+        bundle, source, sources = e2e.person_frontmost("", rows, "")
+        self.assertEqual((bundle, source), ("com.apple.Terminal", "witness"))
+        self.assertEqual(sources["lsappinfo"], "")
+        observe = "frontmost: Terminal [com.apple.Terminal]\ntarget: X [y] (background)\n"
+        self.assertEqual(e2e.person_frontmost("", [], observe)[:2], ("com.apple.Terminal", "helper_observe"))
+        self.assertEqual(e2e.person_frontmost("", [], "")[:2], ("", "none"))
 
 
 if __name__ == "__main__":

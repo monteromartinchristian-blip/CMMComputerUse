@@ -66,6 +66,12 @@ class Driver:
         self.seq = 0
 
     def call(self, step: str, tool: str, args=None, quiet=True):
+        """Run one tool call. After a QUIET call, wait a real TAIL before
+        returning, so the witness window of that step (end .. end + TAIL)
+        belongs to it alone: a late interference caused by this step is still
+        inside its window, and the next step — e.g. the deliberate breach —
+        cannot start inside it. The window is not cut short; the runner waits."""
+
         args = args or {}
         start = uptime()
         response = handle_message(self.registry, {
@@ -80,7 +86,54 @@ class Driver:
                            "quiet": quiet, "isError": is_error, "text": text[:4000]})
         print("── %s (%s) %s" % (step, tool, "ERROR" if is_error else "ok"))
         print(text[:2000])
+        if quiet:
+            remaining = end + TAIL - uptime()
+            if remaining > 0:
+                time.sleep(remaining)
         return text, is_error
+
+
+def quiet_step_ok(verdict: dict) -> bool:
+    """The quiet gate for one step's witness window (unchanged criterion)."""
+
+    return (verdict["samples"] > 0 and not verdict["target_front"] and not verdict["target_top"]
+            and verdict["cursor_max_delta"] <= 0.5)
+
+
+def witness_window_overlaps(steps, tail: float = TAIL) -> list:
+    """Every later call that STARTED inside a quiet step's witness window
+    (end .. end + tail). Any entry means that window is contaminated and the
+    run must say `witness_window_overlap`."""
+
+    overlaps = []
+    for index, step in enumerate(steps):
+        if not step.get("quiet"):
+            continue
+        limit = step["end"] + tail
+        for later in steps[index + 1:]:
+            if later["start"] < limit:
+                overlaps.append({"quiet_step": step["step"], "next_call": later["step"],
+                                 "overlap_ms": round((limit - later["start"]) * 1000)})
+    return overlaps
+
+
+def person_frontmost(lsappinfo_info: str, monitor_rows, observe_text: str):
+    """The person's frontmost app at the start, from three sources:
+    LaunchServices (`lsappinfo`), the independent witness's first sample, and
+    the helper's first observation (`frontmost: Name [bundle]`). Returns
+    (bundle, source, every source) so an empty or disagreeing reading is
+    visible in the evidence instead of silently blank."""
+
+    sources = {}
+    m = re.search(r'"(?:CFBundleIdentifier|bundleID)"\s*=\s*"([^"]+)"', lsappinfo_info or "")
+    sources["lsappinfo"] = m.group(1) if m else ""
+    sources["witness"] = (monitor_rows[0].get("front") or "") if monitor_rows else ""
+    m = re.search(r"^frontmost: .* \[([\w.-]*)\]$", observe_text or "", re.M)
+    sources["helper_observe"] = m.group(1) if m else ""
+    for source in ("lsappinfo", "witness", "helper_observe"):
+        if sources[source]:
+            return sources[source], source, sources
+    return "", "none", sources
 
 
 def scroll_verdict(text: str, is_error: bool, on_fixture: bool,
@@ -275,11 +328,11 @@ def main() -> int:
     parser.add_argument("--report", required=True)
     args = parser.parse_args()
 
-    person = subprocess.run(["lsappinfo", "info", "-only", "bundleid", "front"],
-                            capture_output=True, text=True).stdout
-    m = re.search(r'"CFBundleIdentifier"="([^"]+)"', person)
-    person_bundle = m.group(1) if m else ""
-    print("person's frontmost app: %s" % person_bundle)
+    # `lsappinfo info … front` is not accepted as a specifier on every macOS:
+    # resolve the front ASN first, then ask for its bundle id.
+    front_asn = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True).stdout.strip()
+    person_info = subprocess.run(["lsappinfo", "info", "-only", "bundleid", front_asn or "front"],
+                                 capture_output=True, text=True).stdout
 
     d = Driver(args.socket)
     checks = {}
@@ -290,6 +343,7 @@ def main() -> int:
     checks["status"] = (not err) and "effective_mode: background" in text and "- authorized:" in text
 
     text, err = d.call("2 observe", "computer_use_observe", {"app": args.app})
+    first_observe = text
     checks["observe"] = (not err) and "(background)" in text and "cmm_view: " in text
     snap = snapshot_of(text)
     observation = text
@@ -380,11 +434,25 @@ def main() -> int:
             rows.append(json.loads(line))
         except ValueError:
             pass
+    person_bundle, person_source, person_sources = person_frontmost(person_info, rows, first_observe)
+    diagnostics["person_frontmost"] = {"bundle": person_bundle, "source": person_source,
+                                       "sources": person_sources, "front_asn": front_asn}
+    print("person's frontmost app: %s (source=%s; lsappinfo=%r witness=%r helper=%r)" % (
+        person_bundle or "UNKNOWN", person_source, person_sources["lsappinfo"],
+        person_sources["witness"], person_sources["helper_observe"]))
     verdicts = judge(d.steps, rows, args.app, person_bundle)
+    # No later call may start inside a quiet step's witness window.
+    overlaps = witness_window_overlaps(d.steps)
+    checks["witness_windows_disjoint"] = not overlaps
+    if overlaps:
+        diagnostics["witness_window_overlap"] = overlaps
+        for item in overlaps:
+            print("witness_window_overlap: call '%s' started %d ms inside the tail of quiet step '%s'"
+                  % (item["next_call"], item["overlap_ms"], item["quiet_step"]))
     quiet_ok = True
     for step, v in zip(d.steps, verdicts):
         if step["quiet"]:
-            ok = v["samples"] > 0 and not v["target_front"] and not v["target_top"] and v["cursor_max_delta"] <= 0.5
+            ok = quiet_step_ok(v)
             v["ok"] = ok
             quiet_ok &= ok
         elif step["step"] == "9 breach control":
