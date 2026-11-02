@@ -22,7 +22,8 @@ node --test tests/*.test.mjs
 node scripts/render-client.mjs --check
 node scripts/verify-manifest.mjs
 cd ../..
-python3 -I scripts/verification/check-helper-source.py
+python3 -I scripts/verification/check-helper-source.py      # 11 checks
+python3 -m unittest discover -s scripts/verification/tests  # carril aislado + probe
 (cd packages/dsh-computer-use && python3 -m unittest tests/test_patch.py)   # necesita /usr/bin/ruby
 node packages/dsh-computer-use/tests/official-host.cjs packages/dsh-computer-use   # necesita DeepSeek Harness.app
 ```
@@ -75,22 +76,21 @@ Fíjate en qué identidad usa la firma (`signed_with:` al final). Si sale
 `ad-hoc`, los permisos TCC del helper instalado **no** valdrán para éste: hay
 que resolverlo antes de la fase 4.
 
-## Fase 4 — Sólo si 1–3 pasan: instalación y LIVE
+## Fase 4 — LIVE aislado (sin instalar en producción)
 
-No se hace en esta iteración sin tu confirmación. Resumen de lo que vendrá:
+Decisión 2026-11-02: no se instala ni se toca la política real. El LIVE corre
+sobre una segunda instancia aislada del build staged; procedimiento completo en
+`CMM-Computer-Use-LIVE-Aislado-20261102.md`. Primer pase recomendado:
 
-1. Copia de seguridad: `~/Applications/CMMComputerUse.app`, `~/.cmm/computer-bridge/policy.json`.
-2. `scripts/build-helper.sh --install && scripts/install-helper.sh`.
-3. Política con el fixture (`observe,control`) y Claude; idealmente v2 con
-   Console `admin: ["breach.rearm"]`.
-4. `scripts/verification/live-background-e2e.sh --electron-app com.anthropic.claudefordesktop`
-5. `scripts/verification/live-background-e2e.sh --breach-control` (último).
-6. Reiniciar el helper y comprobar con `computer_use_status` que el latch
-   **sigue** ahí (`breach_latch: state=ok open=1`): el reinicio no desbloquea.
-7. Hasta que exista el rearm en Console, desbloquear el fixture es un paso
-   manual y auditado como `cleared_outside_console` (editar
-   `breach-latch.json` + `policy.reload`). Es para el banco de pruebas, no la
-   UX.
+```bash
+python3 scripts/verification/isolated-live.py all --no-live \
+  --staged-app build/stage-20261102/CMMComputerUse.app
+```
+
+Y sólo después, el LIVE completo con el breach controlado al final.
+
+La edición manual de `breach-latch.json` queda únicamente como recuperación de
+emergencia; el desbloqueo de prueba es el probe `com.cmm.computer-use.test-rearm`.
 
 ## Qué traer de vuelta
 

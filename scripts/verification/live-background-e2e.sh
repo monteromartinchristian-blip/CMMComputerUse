@@ -62,7 +62,9 @@ trap 'kill $MONITOR 2>/dev/null || true' EXIT
 sleep 0.5
 
 set +e
-python3 -I "$REPO/scripts/verification/live_background_e2e.py" \
+# The isolated lane passes its own interpreter: the temporary policy pins the
+# driver's code identity (cdhash) to it.
+"${CMM_E2E_PYTHON:-python3}" -I "$REPO/scripts/verification/live_background_e2e.py" \
   --socket "$SOCKET" --fixture-state "$CMM_CU_FIXTURE_STATE" \
   --monitor "$WORK/monitor.jsonl" --report "$WORK/report.json" "$@"
 STATUS=$?

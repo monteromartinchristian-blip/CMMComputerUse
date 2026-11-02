@@ -6,6 +6,12 @@ Console es otro proyecto y no está en esta sesión. Hasta que se implemente, un
 breach queda latcheado y **no hay UX de desbloqueo** — de forma deliberada: el
 reinicio del helper no lo limpia y no debe convertirse en el mecanismo.
 
+Mientras tanto, para el LIVE controlado existe un sustituto de prueba:
+`scripts/verification/rearm-probe` (`com.cmm.computer-use.test-rearm`), sólo
+`breach.status`/`breach.rearm`, motivo obligatorio, y que sólo funciona en un
+carril aislado (`CMM-Computer-Use-LIVE-Aislado-20261102.md`). No es la UX ni
+debe añadirse a la política de producción.
+
 ## 1. Política (v2): conceder el permiso sólo a Console
 
 ```json

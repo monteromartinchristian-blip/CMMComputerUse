@@ -1136,6 +1136,11 @@ func buildDescription(
     return result
 }
 
+/// Result slot for `appOpen`'s completion handler; see the note there.
+final class LaunchedAppBox: @unchecked Sendable {
+    var app: NSRunningApplication?
+}
+
 final class WindowCaptureBox: @unchecked Sendable {
     var image: String?
     var identity: [String: Any]?
@@ -1534,14 +1539,18 @@ func appOpen(_ app: String) -> [String: Any] {
             let config = NSWorkspace.OpenConfiguration()
             config.activates = true
             let sema = DispatchSemaphore(value: 0)
-            var launched: NSRunningApplication?
+            // The completion handler is @Sendable: it may run on another
+            // thread, so it writes into a box instead of capturing a `var`
+            // (Swift 6 SendableClosureCaptures). The semaphore orders the
+            // write before the read, exactly as before.
+            let launched = LaunchedAppBox()
             workspace.openApplication(at: appURL, configuration: config) { app, err in
-                launched = app
+                launched.app = app
                 if err != nil { log("open failed: \(err!)") }
                 sema.signal()
             }
             _ = sema.wait(timeout: .now() + 15)
-            target = launched
+            target = launched.app
         } else {
             return ["ok": false, "message": "application not found: \(name)"]
         }

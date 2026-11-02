@@ -9,6 +9,8 @@ Pins decisions that XCTest cannot reach because they live in main.swift:
      adapter (the agent's side) has no way to issue `breach.rearm`.
   -  scripts/build-helper.sh compiles every Shared/*.swift file, so the helper
      never ships without a rule the tests pin.
+  -  the test-only rearm probe can send breach.status / breach.rearm and nothing
+     else, needs a reason and refuses the production socket.
 
 Exit 0 when every check holds.
 """
@@ -78,6 +80,14 @@ check("breachLatchedTargets" not in main, "C: no in-memory-only latch remains")
 adapter = "".join(p.read_text() for p in ADAPTER.glob("*.py"))
 check('"breach.rearm"' not in adapter and "def rearm" not in adapter,
       "C: the adapter cannot issue breach.rearm")
+
+probe = (REPO / "scripts/verification/rearm-probe/main.swift").read_text()
+check(set(re.findall(r'operation = "([^"]+)"', probe)) == {"breach.status", "breach.rearm"},
+      "probe: only breach.status / breach.rearm can be sent")
+check('fail("a reason is required")' in probe and 'fail("refusing the production socket")' in probe,
+      "probe: mandatory reason, production socket refused")
+check("var launched: NSRunningApplication?" not in main and "LaunchedAppBox()" in main,
+      "Swift 6: appOpen no longer mutates a captured var in a @Sendable handler")
 
 build = BUILD.read_text()
 shared = sorted(p.name for p in (REPO / "apps/macos/Shared").glob("*.swift"))
