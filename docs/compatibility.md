@@ -76,3 +76,17 @@ The helper and the plugin can be upgraded separately, but not in any order:
 2. Upgrade the plugin.
 3. If the policy format ever changes, `version` in `policy.json` changes with it,
    and an old file is rejected whole rather than partially honoured.
+
+## Harness matrix (0.3.3 workspace contract)
+
+| Harness / client | Status | Evidence |
+|---|---|---|
+| MCP adapter (Python) | tested | adapter unit and contract tests; isolated real-helper lane |
+| Reference harness (`examples/reference-harness`) | tested | stdio conformance tests; isolated real-helper lane |
+| 0.3.2 adapter, unchanged, against helper 0.3.3 | tested | isolated real-helper lane (L12) |
+| DeepSeek Harness 0.2.1-rc.3 (projection, streamer, PiP) | tested at code level, not in a running DSH | Node tests (descriptor-level client, streamer against a scripted helper) |
+| Automatic invocation by a model in DSH | available, not tested | server `instructions`; needs a real DSH session |
+| Other MCP hosts (Claude Code, Codex, Qoder, …) | available, not tested | standard MCP adapter; no host-specific adapter |
+| Hosts without MCP | not compatible without an adapter | write one against [workspace-contract.md](workspace-contract.md) |
+
+A PASS for one harness is not extrapolated to another.
