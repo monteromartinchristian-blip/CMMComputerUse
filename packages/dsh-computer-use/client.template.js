@@ -89,11 +89,14 @@ window.__ModuleLoader__.load({
         return media.frame===frame?media:{url:null,failed:false,frame:null};
       }
 
-      function Pip({sessionId,view,onView,lastRead,frameRef}) {
+      function Pip({sessionId,view,onView,lastRead,frameRef,laneId=null,label=null,index=0}) {
         React.useSyncExternalStore(React.useCallback(fn=>ctx.locale.subscribe(fn),[]),React.useCallback(()=>ctx.locale.getSnapshot(),[]));
         const binding=ctx.sessions.binding(sessionId);
         const face=binding?.session.projections.faceOf(KEY);
-        const state=React.useSyncExternalStore(React.useCallback(fn=>face?face.subscribe(fn):()=>{},[face]),React.useCallback(()=>face?.getSnapshot()||empty,[face]));
+        const session=React.useSyncExternalStore(React.useCallback(fn=>face?face.subscribe(fn):()=>{},[face]),React.useCallback(()=>face?.getSnapshot()||empty,[face]));
+        // One panel's view: its own target, frame, errors and activity; the
+        // helper, grants and breach are the session's and shown on every panel.
+        const state=laneView(session,laneId);
         const indicator=React.useRef(null),firstControl=React.useRef(null),box=React.useRef(null),drag=React.useRef(null);
         const [position,setPosition]=React.useState(null),[returnFocus,setReturnFocus]=React.useState(null);
         const [details,setDetails]=React.useState(false);
@@ -122,9 +125,13 @@ window.__ModuleLoader__.load({
         // tab, so a mirror keyed on it dies on the next navigation, while the
         // id keeps resolving for the life of the window. `window` stays for
         // the capture fallback, which only knows titles.
+        // Split view: each panel is its own streamer slot (its own helper
+        // stream, counters and recovery). The verified bundle and pid travel
+        // so the helper refuses to mirror a relaunched or different process.
         const liveUrl=liveEnabled?'http://127.0.0.1:47183/stream.mjpg?token=cmm-cu-live'
           +'&app='+encodeURIComponent(target.bundle)+'&window='+encodeURIComponent(target.window)
           +(target.windowId?'&window_id='+target.windowId:'')
+          +(label?'&slot='+label+'&bundle='+encodeURIComponent(target.bundle)+(target.pid?'&pid='+target.pid:''):'')
           +(streamNonce?'&rearm='+streamNonce:''):null;
         React.useEffect(()=>{setLiveOk(false);},[liveUrl]);
         // The pixels are only "live" while the streamer keeps producing frames.
@@ -186,7 +193,7 @@ window.__ModuleLoader__.load({
         if(!model.visible||currentSession()!==sessionId)return null;
         // Never a bundle id: a verified target without a human name gets the
         // localized generic name; no verified target, the plugin title.
-        const title=model.app||t(model.appGeneric?'appGeneric':'title');
+        const title=(label?label+' · ':'')+(model.app||t(model.appGeneric?'appGeneric':'title'));
         // The mirror can be live before any capture is admitted: the label has
         // to follow what is on screen, not the admission state alone.
         const shownPhase=displayPhase(model.phase,{mirrorLive:liveOk&&!liveBroken});
@@ -266,7 +273,9 @@ window.__ModuleLoader__.load({
             if(!open)return;
             e.preventDefault();e.stopPropagation();action('collapse');
           },
-          style:position?{left:position.x,top:position.y,right:'auto'}:undefined},
+          'data-panel':label||'default',
+          // The second panel starts beside the first; both move independently.
+          style:position?{left:position.x,top:position.y,right:'auto'}:index>0?{right:16+index*336}:undefined},
           h('style',null,css),
           !open?h('button',{ref:indicator,className:'cmm-cu-pill',type:'button','aria-label':t('openView')+' · '+title,'aria-expanded':false,onClick:()=>action('open')},
             dot,h('span',{className:'cmm-cu-pill-name'},title),status)
@@ -284,14 +293,25 @@ window.__ModuleLoader__.load({
         const sessionId=useSessions(list=>visibleSessionId(list,panel));
         const [views,setViews]=React.useState({});
         const reads=React.useRef(new Map()),frameRef=React.useRef(null);
+        // Subscribed here too: opening or closing a context adds or removes a
+        // panel, which only this component renders.
+        const face=sessionId?ctx.sessions.binding(sessionId)?.session.projections.faceOf(KEY):null;
+        const session=React.useSyncExternalStore(React.useCallback(fn=>face?face.subscribe(fn):()=>{},[face]),
+          React.useCallback(()=>face?.getSnapshot()||empty,[face]));
         if(!sessionId)return null;
         if(!reads.current.has(sessionId)){
           if(reads.current.size>=32)reads.current.delete(reads.current.keys().next().value);
           reads.current.set(sessionId,{current:0});
         }
+        // One Pip per panel (0.3.3 split view), each with its own view state;
+        // with no context open this is exactly the 0.3.2 single panel.
+        const lastRead=reads.current.get(sessionId);
         return h('div',{ref:frameRef,style:{position:'absolute',inset:0,pointerEvents:'none'}},
-          h(Pip,{key:sessionId,sessionId,frameRef,view:views[sessionId],lastRead:reads.current.get(sessionId),
-            onView:view=>setViews(old=>Object.fromEntries([...Object.entries(old).filter(([id])=>id!==sessionId).slice(-31),[sessionId,view]]))}));
+          ...pipPanels(session).map(({laneId,label},index)=>{
+            const viewKey=laneId?sessionId+'|'+laneId:sessionId;
+            return h(Pip,{key:viewKey,sessionId,frameRef,laneId,label,index,view:views[viewKey],lastRead,
+              onView:view=>setViews(old=>Object.fromEntries([...Object.entries(old).filter(([id])=>id!==viewKey).slice(-31),[viewKey,view]]))});
+          }));
       }
       ctx.slots.inject('shell.overlay',()=>ctx.slots.register({
         name:'shell.overlay',id:'cmm-computer-use-pip',order:60,locale:ns,label:()=>t('title')

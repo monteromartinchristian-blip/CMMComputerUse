@@ -5,7 +5,15 @@ export const RETENTION_MS = 60000;
 /** A frame older than this is shown, but labelled as paused: never as current. */
 export const STALE_MS = 10000;
 const PREFIX = 'mcp__cmm-computer-use__computer_use_';
-const TOOLS = new Set(['status','list_apps','observe','capture_window','press','set_value','scroll','release']);
+const TOOLS = new Set(['status','list_apps','observe','capture_window','press','set_value','scroll','release',
+  'workspace_status','context_open','context_close']);
+/** 0.3.3: a context id as the adapter prints and accepts it. */
+const CTX = /^ctx_[0-9a-f]{32}$/;
+/** Panels the PiP can split into: one per context, two at most (two streams). */
+export const MAX_LANES = 2;
+/** What belongs to ONE panel. Everything else (helper, grants, breach,
+ * pending calls) is the session's and shared by every panel. */
+export const LANE_FIELDS = ['target','frame','error','message','attempt','ledger','guiRevision','attemptRevision'];
 /** Results that mean "the agent tried to show or touch a window". */
 const GUI = new Set(['observe','capture_window','press','set_value','scroll']);
 const clean = x => typeof x === 'string' ? x.replace(/[\u0000-\u001f\u007f]/g,'').slice(0,200) : '';
@@ -13,7 +21,11 @@ const token = x => typeof x === 'string' ? x.replace(/[^\w.:/@-]/g,'').slice(0,8
 export function initialState() {
   return {bridge:'disconnected', policy:null, grants:[], target:null, frame:null,
     error:null, message:null, helper:null, attempt:null, ledger:null, breach:false, pending:{},
-    lastAt:0, active:false, revision:0, guiRevision:0, attemptRevision:0};
+    lastAt:0, active:false, revision:0, guiRevision:0, attemptRevision:0, lanes:{}};
+}
+export function emptyLane(label) {
+  return {label, target:null, frame:null, error:null, message:null, attempt:null, ledger:null,
+    guiRevision:0, attemptRevision:0, lastCall:0};
 }
 export function validAttachment(a) {
   // The durable store names an attachment `sha256:<hex>`; the id is a bounded
@@ -79,6 +91,7 @@ function viewIdentity(text) {
     if(!/^[\w.-]{1,200}$/.test(i.bundle)||!Number.isSafeInteger(i.pid)||i.pid<=0
       ||!Number.isSafeInteger(i.snapshot)||i.snapshot<=0||typeof i.window!=='string'
       ||!Number.isSafeInteger(i.window_id)||i.window_id<=0||!i.window||i.window.length>200||/[\u0000-\u001f\u007f]/.test(i.window))return null;
+    if(i.context_id!==undefined&&!CTX.test(i.context_id))return null;
     return i;
   }catch{return null;}
 }
@@ -206,20 +219,128 @@ export function bypassReason(exec) {
   return null;
 }
 
+/** The AX-free head of an observation: the lines before any element,
+ * content or window list. Only here are helper facts read from. */
+function observationHead(text) {
+  const lines=[];
+  for(const line of text.split('\n')) {
+    if(/^(ax_|windows on screen|readable content|interactive elements)/.test(line)) break;
+    lines.push(line);
+  }
+  return lines.join('\n');
+}
+function pickLane(lane) {
+  const out={};
+  for(const key of LANE_FIELDS) out[key]=lane[key];
+  return out;
+}
+/** One panel's view of the session: shared facts + that panel's own fields.
+ * `laneId === null` is the 0.3.2 default panel. Pending calls are filtered to
+ * the panel, so one panel's busy state never shows on the other. */
+export function laneView(state, laneId=null) {
+  if(!state||typeof state!=='object') return state;
+  const pending=Object.fromEntries(Object.entries(state.pending||{})
+    .filter(([,call])=>(call.context||null)===laneId));
+  if(laneId===null) return {...state,pending};
+  const lane=state.lanes?.[laneId];
+  if(!lane) return {...state,...pickLane(emptyLane(null)),pending};
+  return {...state,...pickLane(lane),pending};
+}
+/**
+ * The session projection, with one lane per open context (0.3.3).
+ *
+ * The 0.3.2 rules (`foldCore`) are applied unchanged to whichever panel a
+ * result belongs to: a call made with `context` folds into that context's
+ * lane, every other call into the default panel. Facts that are not a panel's
+ * — the helper, the grants, a breach, the pending calls — stay shared, so a
+ * helper-wide failure or a breach shows on every panel, and a refusal, frame
+ * or takeover in one panel never touches the other.
+ */
 export function fold(state, event) {
+  const base=state.lanes?state:{...state,lanes:{}};
+  if(event.type==='tool/result') {
+    const id=event.data?.message?.source?.callId, call=base.pending[id];
+    if(call&&call.context) return foldLane(base,event,call);
+    if(call&&call.name==='context_open') return openLane(base,event,id);
+    const out=foldCore(base,event);
+    // Revocation is session-wide: a status that is no longer compatible, or
+    // that no longer grants a lane's application, empties that lane too.
+    if(call&&call.name==='status'&&out!==base) return revokeLanes(out);
+    return out;
+  }
+  return foldCore(base,event);
+}
+function revokeLanes(state) {
+  const lanes={};
+  for(const [id,lane] of Object.entries(state.lanes||{})) {
+    const granted=state.bridge==='compatible'&&lane.target&&state.grants.some(g=>g.bundle===lane.target.bundle);
+    lanes[id]=granted||!lane.target?lane:{...lane,target:null,frame:null};
+  }
+  return {...state,lanes};
+}
+function openLane(state,event,id) {
+  const pending={...state.pending}; delete pending[id];
+  const msg=event.data?.message;
+  const text=(msg?.content||[]).filter(b=>b.type==='text'&&typeof b.text==='string').map(b=>b.text.slice(0,4096)).join('\n');
+  const m=!msg?.isError&&text.match(/^context opened: ([A-D]) (ctx_[0-9a-f]{32})(?: bound=[\w.-]+)?$/m);
+  if(!m) return {...state,pending};
+  const lanes={...state.lanes};
+  if(!lanes[m[2]]) {
+    // Two panels at most. A third (the helper refuses it) evicts nothing.
+    if(Object.keys(lanes).length>=MAX_LANES) return {...state,pending};
+    lanes[m[2]]=emptyLane(m[1]);
+  }
+  return {...state,pending,lanes};
+}
+function foldLane(state,event,call) {
+  const id=event.data?.message?.source?.callId;
+  const lane=state.lanes[call.context];
+  if(call.name==='context_close') {
+    const pending={...state.pending}; delete pending[id];
+    const lanes={...state.lanes};
+    if(!event.data?.message?.isError) delete lanes[call.context];
+    return {...state,pending,lanes};
+  }
+  if(!lane) {
+    const pending={...state.pending}; delete pending[id];
+    return {...state,pending};
+  }
+  // The lane is folded with the same rules as the default panel; its own
+  // last call is what "superseded" is measured against.
+  const sub={...state,...pickLane(lane),revision:lane.lastCall,
+    pending:{[id]:call}};
+  const out=foldCore(sub,event);
+  const pending={...state.pending}; delete pending[id];
+  const nextLane={...lane,...pickLane(out)};
+  return {...state,pending,
+    bridge:out.bridge,policy:out.policy,grants:out.grants,helper:out.helper,breach:out.breach,
+    lastAt:out.lastAt,
+    // Session-wide activity (the PiP shows when anything happened) and the
+    // lane's own (the panel shows when ITS context did something).
+    attemptRevision:(state.attemptRevision||0)+((out.attemptRevision||0)-(lane.attemptRevision||0)),
+    guiRevision:Math.min(state.revision,Math.max(state.guiRevision||0,out.guiRevision||0)),
+    lanes:{...state.lanes,[call.context]:nextLane}};
+}
+function foldCore(state, event) {
   if(event.type==='turn/end') return state.active ? {...state,active:false,pending:{}} : state;
   if (event.type === 'assistant/message') {
-    let pending = state.pending, revision=state.revision;
+    let pending = state.pending, revision=state.revision, lanes=state.lanes||{}, defaultCall=0;
     for (const b of event.data?.message?.content || []) {
       if (b.type !== 'tool-call' || !b.name?.startsWith(PREFIX) || !TOOLS.has(b.name.slice(PREFIX.length))) continue;
       const name=b.name.slice(PREFIX.length);
       let args={};
       try { if (typeof b.arguments==='string' && b.arguments.length<=16384) args=JSON.parse(b.arguments); } catch {}
       // Only capture routing is retained. Text-field values never enter state.
-      pending={...pending,[b.id]:{name,app:clean(args?.app),window:clean(args?.window_title),target:state.target,revision:++revision}};
+      const context=typeof args?.context==='string'&&CTX.test(args.context)?args.context:null;
+      const lane=context?lanes[context]:null;
+      pending={...pending,[b.id]:{name,app:clean(args?.app),window:clean(args?.window_title),
+        target:lane?lane.target:state.target,revision:++revision,...(context?{context}:{})}};
+      if(lane) lanes={...lanes,[context]:{...lane,lastCall:revision,frame:null}};
+      else if(!context) defaultCall=revision;
     }
     if(pending===state.pending) return state;
-    return {...state,active:true,revision,frame:null,pending:Object.fromEntries(Object.entries(pending).slice(-32))};
+    return {...state,active:true,revision,lanes,...(defaultCall?{frame:null}:{}),
+      pending:Object.fromEntries(Object.entries(pending).slice(-32))};
   }
   if(event.type!=='tool/result') return state;
   const msg=event.data?.message, id=msg?.source?.callId, call=state.pending[id];
@@ -289,7 +410,21 @@ export function fold(state, event) {
   if(call.name==='release') return {...next,target:null,frame:null};
   if(call.name==='observe') {
     const m=text.match(/^target: ([^\n]+) \[([\w.-]+)\] \((background|frontmost)\)$/m);
-    const grant=m&&state.grants.find(g=>g.bundle===m[2]&&(call.app===g.name||call.app===g.bundle||call.app===clean(m[1])));
+    // 0.3.3: an observation carries the helper facts and the target's grant
+    // BEFORE any AX content (same lines `computer_use_status` prints). A
+    // session that observes first is verified from them instead of failing
+    // closed into a PiP that never shows anything.
+    if(m&&(state.bridge!=='compatible'||!state.grants.some(g=>g.bundle===m[2]))) {
+      const facts=parseStatus(observationHead(text));
+      if(facts.bridge==='compatible'&&facts.grants.some(g=>g.bundle===m[2])) {
+        state={...state,bridge:'compatible',helper:facts.helper,
+          policy:state.policy||facts.helper?.deploymentPolicy||'background',
+          grants:[...state.grants.filter(g=>!facts.grants.some(f=>f.bundle===g.bundle)),...facts.grants].slice(0,20)};
+        next={...next,bridge:state.bridge,helper:state.helper,policy:state.policy,grants:state.grants};
+      }
+    }
+    const grant=m&&state.grants.find(g=>g.bundle===m[2]&&(call.app===g.name||call.app===g.bundle||call.app===clean(m[1])
+      ||(call.context&&call.app==='')));
     if(state.bridge!=='compatible'||!grant) return {...next,target:null,frame:null,error:'UNVERIFIED_TARGET'};
     const identity=viewIdentity(text);
     if(!identity||identity.bundle!==grant.bundle||!['background','frontmost'].includes(m[3]))return {...next,target:null,frame:null,error:'UNVERIFIED_TARGET'};
@@ -503,6 +638,24 @@ export function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
   model.canRead=!!(verified&&fresh&&mode!=='indicator'&&!pending&&model.tone!=='error');
   model.ageMs=fresh?frameAge(state.frame,now):null;
   return model;
+}
+
+/**
+ * Which panels the PiP shows (0.3.3 split view): one per context lane, two
+ * at most because the helper streams two windows at most. With no context
+ * open, the single 0.3.2 panel. The default panel shares the space only while
+ * fewer than two contexts are open and it has something of its own to show.
+ * Each entry's `laneId` is what `laneView` and the streamer slot take.
+ */
+export function pipPanels(state) {
+  const lanes=Object.entries(state?.lanes||{})
+    .filter(([,lane])=>lane&&typeof lane==='object')
+    .sort(([,a],[,b])=>String(a.label).localeCompare(String(b.label)))
+    .slice(0,MAX_LANES)
+    .map(([laneId,lane])=>({laneId,label:lane.label||null}));
+  if(!lanes.length) return [{laneId:null,label:null}];
+  const own=state.target||state.attempt||state.error;
+  return lanes.length<MAX_LANES&&own?[{laneId:null,label:null},...lanes]:lanes;
 }
 
 /** Public root hooks use the same mainView retention source as DSH's title.
