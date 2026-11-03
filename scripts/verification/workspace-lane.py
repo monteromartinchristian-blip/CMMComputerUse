@@ -495,6 +495,29 @@ def main() -> int:
                close1["closed"] and not close2["closed"] and close2["already_closed"]
                and code(after) == "CONTEXT_CLOSED")
 
+        # The non-DSH reference harness, over stdio, against the REAL helper.
+        # It runs as python3 too: under a v1 policy (no clients) the principal
+        # is the CODE identity, so it shares this script's two-context limit.
+        # Free the slot first (this is the documented principal semantics).
+        raw(sock, "workspace.context_close", {"context_id": idf})
+        ref = subprocess.run([sys.executable, str(REPO / "examples/reference-harness/harness.py"),
+                              "--socket", str(sock), "--app", "com.apple.finder", "--app", "Finder",
+                              "--task", "Compare what the two Finder windows show"],
+                             capture_output=True, text=True, timeout=60)
+        try:
+            ref_out = json.loads(ref.stdout)
+        except ValueError:
+            ref_out = {"stderr": ref.stderr[-300:]}
+        flow = (ref_out.get("flow") or {}).get("contexts", [])
+        record("L11b the reference harness (no DSH) runs a two-context flow on the real helper",
+               ref_out.get("uses_computer_use") is True and [c.get("label") for c in flow] == ["A", "B"]
+               and all(c.get("snapshot") == 1 for c in flow)
+               and len({c.get("context") for c in flow}) == 2,
+               json.dumps(flow)[:300])
+
+        idf = raw(sock, "workspace.context_create", {"app": "com.apple.finder"})["result"]["context_id"]
+        raw(sock, "observation.describe", {"context_id": idf})
+
         if args.streams:
             stream_phase(lane, sock)
 
