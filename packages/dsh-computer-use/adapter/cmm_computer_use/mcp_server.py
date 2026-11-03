@@ -69,6 +69,10 @@ READ_ONLY_TOOLS = frozenset(
         "computer_use_list_apps",
         "computer_use_observe",
         "computer_use_capture_window",
+        # 0.3.3: read the workspace, open a context (observe-scoped; it acts on
+        # no application and the helper re-checks the grant on every use).
+        "computer_use_workspace_status",
+        "computer_use_context_open",
     }
 )
 
@@ -99,10 +103,38 @@ NO_BYPASS_POLICY = (
     "authorization policy, can take the person's focus and cursor, and are "
     "invisible to the interference ledger."
 )
+#: When to use these tools. Sent with the MCP ``instructions`` so a host with
+#: this server enabled picks it for GUI work without the person having to name
+#: it — and does not pick it for work that needs no GUI.
+AUTO_INVOCATION_POLICY = (
+    "Use the computer_use_* tools automatically, without waiting to be told, "
+    "whenever the task needs to see, inspect, compare or operate a graphical "
+    "application, window or on-screen content on this Mac (for example: read "
+    "what an app shows, press a button, fill a field, compare two windows). "
+    "Do not use them for work that is purely text, files or code. To work with "
+    "two applications or two windows at once, open a context for each "
+    "(computer_use_context_open), pass its id as `context` to observe and to "
+    "every element action, and close it when done; element ids and snapshots "
+    "belong to the context that produced them. Without `context` the tools "
+    "behave exactly as in 0.3.2 (one default context). A mutating action is "
+    "never resent automatically: on OUTCOME_UNKNOWN observe again instead."
+)
 NO_BYPASS_LINE = (
     "Do not work around this with Bash, osascript/JXA/AppleScript, System Events, "
     "Swift, CGEvent or other automation; report it to the person."
 )
+
+
+#: The optional context every 0.3.3 tool accepts. Absent: the 0.3.2 default.
+CONTEXT_PROPERTY = {
+    "type": "string",
+    "pattern": "^ctx_[0-9a-f]{32}$",
+    "description": (
+        "Context id from computer_use_context_open. Omit to use the default "
+        "context (0.3.2 behaviour). Ids, snapshots and element ids never cross "
+        "contexts."
+    ),
+}
 
 
 def _schema(
@@ -178,6 +210,7 @@ class ToolRegistry:
                             ),
                             "default": False,
                         },
+                        "context": CONTEXT_PROPERTY,
                         "ax_diagnostics": {
                             "type": "boolean",
                             "description": (
@@ -205,6 +238,7 @@ class ToolRegistry:
                             "type": "string",
                             "description": "Window title or fragment.",
                         },
+                        "context": CONTEXT_PROPERTY,
                     },
                     required=["app", "window_title"],
                 ),
@@ -228,6 +262,7 @@ class ToolRegistry:
                             "minimum": 1,
                             "description": "Snapshot generation returned by computer_use_observe.",
                         },
+                        "context": CONTEXT_PROPERTY,
                     },
                     required=["element_id", "snapshot"],
                 ),
@@ -244,6 +279,7 @@ class ToolRegistry:
                         "element_id": {"type": "integer", "minimum": 1},
                         "text": {"type": "string", "maxLength": 65536},
                         "snapshot": {"type": "integer", "minimum": 1},
+                        "context": CONTEXT_PROPERTY,
                     },
                     required=["element_id", "text", "snapshot"],
                 ),
@@ -268,14 +304,49 @@ class ToolRegistry:
                             "enum": ["up", "down", "left", "right"],
                         },
                         "pages": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
+                        "context": CONTEXT_PROPERTY,
                     },
                     required=["element_id", "snapshot", "direction"],
                 ),
             },
             {
                 "name": "computer_use_release",
-                "description": "Drop the element handles the helper holds for this session.",
+                "description": (
+                    "Drop the element handles the helper holds for one context "
+                    "(default: the default context)."
+                ),
+                "inputSchema": _schema({"context": CONTEXT_PROPERTY}),
+            },
+            {
+                "name": "computer_use_workspace_status",
+                "description": (
+                    "List this session's contexts (application, window, snapshot, "
+                    "expiry) and live window streams with their health, plus the "
+                    "limits (two contexts, two streams). Read-only."
+                ),
                 "inputSchema": _schema({}),
+            },
+            {
+                "name": "computer_use_context_open",
+                "description": (
+                    "Open a context for working with one application (or one "
+                    "window of it) alongside another. Returns a context id to pass "
+                    "as `context` to observe and element actions; its snapshots "
+                    "and element ids are independent of every other context. At "
+                    "most two at a time. Activates nothing."
+                ),
+                "inputSchema": _schema(
+                    {"app": {"type": "string",
+                             "description": "Application name or bundle id to bind the context to."}}
+                ),
+            },
+            {
+                "name": "computer_use_context_close",
+                "description": (
+                    "Close a context: its element handles are dropped and its live "
+                    "stream stops. Closing twice is harmless."
+                ),
+                "inputSchema": _schema({"context": CONTEXT_PROPERTY}, required=["context"]),
             },
         ]
         if self.mode in ("focus", "unrestricted"):
@@ -400,12 +471,25 @@ class ToolRegistry:
             if name == "computer_use_capture_window":
                 return self._capture(arguments)
             if name == "computer_use_release":
-                return _text(_render_release(self.client.release()))
+                context = _context(arguments)
+                return _text(_render_release(
+                    self.client.release(**({"context_id": context} if context else {}))))
+            if name == "computer_use_workspace_status":
+                return _text(_render_workspace(self.client.workspace_status()))
+            if name == "computer_use_context_open":
+                app = str(arguments.get("app") or "").strip() or None
+                return _text(_render_context_opened(self.client.context_create(app=app)))
+            if name == "computer_use_context_close":
+                context = _context(arguments)
+                if not context:
+                    raise ValueError("context is required")
+                return _text(_render_context_closed(self.client.context_close(context)))
             if name == "computer_use_press":
                 return self._element_action(
                     "ui.press",
                     {"element_id": _int(arguments, "element_id"),
                      "snapshot": _int(arguments, "snapshot")},
+                    _context(arguments),
                 )
             if name == "computer_use_set_value":
                 return self._element_action(
@@ -413,6 +497,7 @@ class ToolRegistry:
                     {"element_id": _int(arguments, "element_id"),
                      "text": str(arguments.get("text", "")),
                      "snapshot": _int(arguments, "snapshot")},
+                    _context(arguments),
                 )
             if name == "computer_use_scroll":
                 pages = arguments.get("pages", 1)
@@ -422,6 +507,7 @@ class ToolRegistry:
                      "snapshot": _int(arguments, "snapshot"),
                      "direction": str(arguments.get("direction", "")),
                      "pages": _int({"pages": pages}, "pages")},
+                    _context(arguments),
                 )
             if name == "computer_use_activate_app":
                 return self._action("app.activate", {"app": str(arguments.get("app", ""))})
@@ -460,9 +546,13 @@ class ToolRegistry:
             extra["include_ax_diagnostics"] = True
         if element_filter:
             extra["element_filter"] = element_filter
+        context = _context(arguments)
+        if context:
+            extra["context_id"] = context
         observation = self.client.observe(app=app, include_screenshot=include, **extra)
         blocks: List[Dict[str, Any]] = [_text(_render_observation(
-            observation, str(arguments.get("filter") or "")))["content"][0]]
+            observation, str(arguments.get("filter") or ""),
+            facts=self._session_facts(observation)))["content"][0]]
         image = observation.get("screenshot_base64") if isinstance(observation, dict) else None
         if image:
             blocks.append({"type": "image", "data": image, "mimeType": "image/png"})
@@ -470,9 +560,55 @@ class ToolRegistry:
             blocks[0]["text"] += "\nscreenshot: unavailable (%s)" % observation["screenshot_error"]
         return {"content": blocks}
 
+    def _session_facts(self, observation: Any) -> List[str]:
+        """Helper facts and the target's grant, printed with an observation so
+        a host can verify and SHOW the target without a prior status call.
+
+        Same facts ``computer_use_status`` prints (same trust: the adapter's
+        own measurement of the helper). Best effort: a failure to read them
+        leaves the observation unchanged and the host fails closed as before.
+        """
+
+        if not isinstance(observation, dict) or not observation.get("target_bundle"):
+            return []
+        lines: List[str] = []
+        try:
+            ping = self._ping_cached()
+            policy = str(ping.get("policy", "?"))
+            lines.append("helper: %s protocol=%s pid=%s" % (
+                ping.get("bridge", "?"), ping.get("protocol", "?"), ping.get("pid", "?")))
+            lines.append("bundle: %s" % ping.get("bundle_id", "?"))
+            lines.append("deployment_policy: %s" % policy)
+            lines.append("effective_mode: %s" % self.mode)
+            auth = ping.get("authorization") if isinstance(ping.get("authorization"), dict) else {}
+            lines.append("authorization: *** loaded=%s apps=%s default=%s" % (
+                bool(auth.get("loaded")), auth.get("apps", 0), auth.get("default", "deny")))
+            apps = self.client.apps()
+            for app in (apps.get("apps") or []) if isinstance(apps, dict) else []:
+                if isinstance(app, dict) and app.get("bundle_id") == observation.get("target_bundle"):
+                    lines.append("- authorized: %s [%s] scopes=%s windows=%s" % (
+                        str(app.get("name") or "").replace("[", "(").replace("]", ")")[:80],
+                        app.get("bundle_id"), ",".join(app.get("scopes") or []),
+                        1 if app.get("window_limited") else 0))
+                    break
+        except BridgeError:
+            return []
+        return lines
+
+    def _ping_cached(self) -> Dict[str, Any]:
+        cached = getattr(self, "_ping", None)
+        if cached and cached.get("instance_id") == self.client.instance_id:
+            return cached
+        ping = self.client.ping()
+        self._ping = ping
+        return ping
+
     def _capture(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        context = _context(arguments)
+        # The context travels only when named: a 0.3.2 call is sent unchanged.
         result = self.client.capture_window(
-            str(arguments.get("app", "")), str(arguments.get("window_title", ""))
+            str(arguments.get("app", "")), str(arguments.get("window_title", "")),
+            **({"context_id": context} if context else {}),
         )
         data = result.get("screenshot_base64") if isinstance(result, dict) else None
         if not data:
@@ -488,19 +624,34 @@ class ToolRegistry:
             ]
         }
 
-    def _element_action(self, kind: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        return self._action(kind, params)
+    def _element_action(self, kind: str, params: Dict[str, Any],
+                        context: Optional[str] = None) -> Dict[str, Any]:
+        return self._action(kind, params, context)
 
-    def _action(self, kind: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _action(self, kind: str, params: Dict[str, Any],
+                context: Optional[str] = None) -> Dict[str, Any]:
         if kind not in ACTION_KINDS:
             return _text("Unsupported action: %s" % kind, is_error=True)
-        result = self.client.act(kind, **params)
+        result = self.client.act(kind, **({"context_id": context} if context else {}), **params)
         text, is_error = _render_action(kind, result)
         return _text(text, is_error=is_error)
 
 
 class _ToolNotFound(Exception):
     pass
+
+
+def _context(arguments: Dict[str, Any]) -> Optional[str]:
+    """The optional ``context`` argument, shape-checked (the helper re-checks
+    ownership: a well-formed id of another client is still unknown)."""
+
+    value = arguments.get("context")
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not value.startswith("ctx_") or len(value) != 36 \
+            or not all(c in "0123456789abcdef" for c in value[4:]):
+        raise ValueError("context must be a context id from computer_use_context_open")
+    return value
 
 
 def _int(arguments: Dict[str, Any], key: str) -> int:
@@ -639,7 +790,8 @@ def _render_release(result: Any) -> str:
         return "released"
     if "invalidated_snapshot" in result:
         return "released %s element handle(s); snapshot %s invalidated; current generation=%s" % (
-            result.get("released", 0), result.get("invalidated_snapshot"), result.get("snapshot", "?"))
+            result.get("released", 0), result.get("invalidated_snapshot"), result.get("snapshot", "?")) + (
+            "" if not result.get("context_id") else " (context %s)" % result.get("context_id"))
     return "released %s element handle(s); snapshot=%s" % (
         result.get("released", 0),
         result.get("snapshot", "?"),
@@ -650,13 +802,16 @@ def _view_metadata(identity: Any) -> str:
     """Additive helper-owned identity, never image data or arbitrary fields."""
     if not isinstance(identity, dict):
         return ""
-    fields = {key: identity[key] for key in ("bundle", "pid", "snapshot", "window", "window_id") if key in identity}
+    fields = {key: identity[key] for key in ("bundle", "pid", "snapshot", "window", "window_id",
+                                             "context_id", "context_label")
+              if key in identity and identity[key] is not None}
     if not all(key in fields for key in ("bundle", "pid", "snapshot", "window")):
         return ""
     return "\ncmm_view: " + json.dumps(fields, ensure_ascii=True, separators=(",", ":"))
 
 
-def _render_observation(observation: Any, element_filter: str = "") -> str:
+def _render_observation(observation: Any, element_filter: str = "",
+                        facts: Optional[List[str]] = None) -> str:
     if not isinstance(observation, dict):
         return "The helper returned no observation."
     lines = [
@@ -672,11 +827,27 @@ def _render_observation(observation: Any, element_filter: str = "") -> str:
         "snapshot: %s (pass it back with element actions)" % observation.get("snapshot"),
     ]
     if "target_pid" in observation and "target_window" in observation:
+        context_id = observation.get("context_id")
+        legacy = observation.get("context_label") in (None, "default")
         metadata = _view_metadata({"bundle": observation.get("target_bundle"),
             "pid": observation.get("target_pid"), "snapshot": observation.get("snapshot"),
-            "window": observation.get("target_window"), "window_id": observation.get("target_window_id")})
+            "window": observation.get("target_window"), "window_id": observation.get("target_window_id"),
+            "context_id": None if legacy else context_id,
+            "context_label": None if legacy else observation.get("context_label")})
         # Before all untrusted AX content; fourth line of the observation.
         lines.extend(metadata.lstrip("\n").splitlines())
+    if observation.get("context_label") not in (None, "default") and observation.get("context_id"):
+        lines.append("context: %s %s (pass it as `context` with this snapshot)" % (
+            observation.get("context_label"), observation.get("context_id")))
+    changes = observation.get("identity_changes")
+    if isinstance(changes, list) and changes:
+        lines.append("identity_changes: %s (handles from earlier snapshots of this context are invalid)"
+                     % ",".join(str(c) for c in changes[:4]))
+    document = observation.get("document")
+    if isinstance(document, dict):
+        lines.append("document: source=%s verified=%s" % (document.get("source"), document.get("verified")))
+    # Helper facts for the host's panel; before any AX content as well.
+    lines.extend(facts or [])
     lines.extend(_render_ax_tree(observation))
     ax_filter = observation.get("ax_filter")
     if isinstance(ax_filter, dict):
@@ -907,6 +1078,7 @@ def _render_action(kind: str, result: Any) -> "tuple":
     if not isinstance(result, dict):
         return "%s: done" % kind, False
     lines = ["%s: %s" % (kind, result.get("message", "done"))]
+    lines.extend(_render_execution(result.get("execution")))
     lines.extend(_render_scroll(result.get("scroll")))
     lines.extend(_render_set_value(result.get("set_value")))
     interference = result.get("interference")
@@ -931,6 +1103,69 @@ def _render_action(kind: str, result: Any) -> "tuple":
         lines.append(takeover)
         return "\n".join(lines), True
     return "\n".join(lines), False
+
+
+def _render_execution(execution: Any) -> List[str]:
+    """Whether the action was handed to the machine, and its outcome."""
+
+    if not isinstance(execution, dict):
+        return []
+    line = "execution: executed=%s outcome=%s replayed=%s" % (
+        execution.get("executed"), execution.get("outcome"), bool(execution.get("replayed")))
+    if execution.get("recovered"):
+        line += " recovered=True"
+    if execution.get("op_id"):
+        line += " op_id=%s" % execution.get("op_id")
+    if execution.get("context_id"):
+        line += " context=%s" % execution.get("context_id")
+    return [line]
+
+
+def _render_workspace(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "The helper returned no workspace."
+    limits = result.get("limits") or {}
+    lines = ["workspace: contract=%s v%s instance=%s" % (
+        result.get("contract", "?"), result.get("contract_version", "?"), result.get("instance_id", "?")),
+        "limits: contexts=%s streams=%s" % (limits.get("max_contexts_per_client", "?"),
+                                            limits.get("max_streams", "?"))]
+    contexts = result.get("contexts") or []
+    if not contexts:
+        lines.append("contexts: none")
+    for context in contexts[:8]:
+        identity = context.get("identity") or {}
+        lines.append("- context %s %s snapshot=%s handles=%s expired=%s app=%s [%s] window=%s%s" % (
+            context.get("label"), context.get("context_id"), context.get("snapshot"),
+            context.get("handles"), context.get("expired"),
+            json.dumps(identity.get("app") or "", ensure_ascii=False), identity.get("bundle") or "-",
+            json.dumps((identity.get("window") or "")[:80], ensure_ascii=False),
+            (" stream=%s" % (context.get("stream") or {}).get("phase")) if context.get("stream") else ""))
+    for stream in (result.get("streams") or [])[:4]:
+        identity = stream.get("view_identity") or {}
+        lines.append("- stream %s phase=%s frame_index=%s age_ms=%s window_id=%s" % (
+            stream.get("stream_id"), stream.get("phase"), stream.get("frame_index"),
+            stream.get("last_frame_age_ms"), identity.get("window_id")))
+    return "\n".join(lines)
+
+
+def _render_context_opened(result: Any) -> str:
+    if not isinstance(result, dict) or not result.get("context_id"):
+        return "The helper returned no context."
+    return ("context opened: %s %s%s\nPass `context: %s` to computer_use_observe and to every element "
+            "action for this application." % (
+                result.get("label"), result.get("context_id"),
+                (" bound=%s" % result["bound_bundle"]) if result.get("bound_bundle") else "",
+                result.get("context_id")))
+
+
+def _render_context_closed(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "The helper returned no answer."
+    if result.get("already_closed"):
+        return "context %s was already closed" % result.get("context_id")
+    return "context %s closed; released %s element handle(s)%s" % (
+        result.get("context_id"), result.get("released_handles", 0),
+        "; its stream stopped" if result.get("stream_stopped") else "")
 
 
 def _probe_text(probe: Any) -> str:
@@ -1041,6 +1276,11 @@ def _render_refusal(error: BridgeError) -> Dict[str, Any]:
             (" [%s]" % error.detail) if error.detail else "",
         )
     ]
+    lines.extend(_render_execution(getattr(error, "execution", None)))
+    if error.code == "OUTCOME_UNKNOWN":
+        lines.append(
+            "STOP: outcome unknown (%s). Do not resend this action; observe the context again "
+            "to see what the application shows, and report it." % (error.detail or "op_id unknown"))
     lines.extend(_render_scroll(getattr(error, "scroll", None)))
     lines.extend(_render_set_value(getattr(error, "set_value", None)))
     interference = getattr(error, "interference", None)
@@ -1102,7 +1342,7 @@ def handle_message(registry: ToolRegistry, message: Any) -> Optional[Dict[str, A
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "instructions": NO_BYPASS_POLICY,
+                "instructions": AUTO_INVOCATION_POLICY + " " + NO_BYPASS_POLICY,
             },
         )
     if method == "ping":

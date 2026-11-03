@@ -24,6 +24,7 @@ from fake_bridge import FakeBridge, failure, ok  # noqa: E402
 from cmm_computer_use.client import (  # noqa: E402
     BridgeClient,
     BridgeError,
+    BridgeOutcomeUnknown,
     BridgeProtocolError,
     BridgeUnavailable,
 )
@@ -207,8 +208,13 @@ class TransportTests(ClientTestCase):
             return response
 
         client = self.client(self.bridge(responder))
-        with self.assertRaises(BridgeProtocolError):
+        # 0.3.3: the press reached the helper; a desynchronised answer cannot
+        # say whether it ran, so the outcome is UNKNOWN (never "not executed")
+        # and the press is not resent. The protocol violation is the cause.
+        with self.assertRaises(BridgeOutcomeUnknown) as caught:
             client.act("ui.press", element_id=1, snapshot=1)
+        self.assertIsInstance(caught.exception.cause, BridgeProtocolError)
+        self.assertIn("cause=protocol", caught.exception.detail)
         # A desynchronised stream is dropped, never reused.
         self.assertFalse(client.connected)
 

@@ -380,7 +380,8 @@ class ClaudeControlSurfaceTests(Case):
 
     def test_diagnostics_only_when_asked(self):
         text = text_of(self.call("computer_use_observe", {"app": CLAUDE, "ax_diagnostics": True}))
-        self.assertTrue(ClaudeControlSurfaceTests.sent[-1]["arguments"]["include_ax_diagnostics"])
+        describes = [f for f in ClaudeControlSurfaceTests.sent if f["operation"] == "observation.describe"]
+        self.assertTrue(describes[-1]["arguments"]["include_ax_diagnostics"])
         self.assertIn("ax_diagnostics after: visited=812 deepest=27", text)
         self.assertIn('- AXTextArea "Escribe a Claude" depth=26 actions=- value_settable=True', text)
 
@@ -536,7 +537,10 @@ class InstructionsTests(unittest.TestCase):
         response = handle_message(registry, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                              "params": {"protocolVersion": "2025-06-18"}})
         instructions = response["result"]["instructions"]
-        self.assertEqual(instructions, NO_BYPASS_POLICY)
+        # 0.3.3: the no-bypass policy is carried verbatim, after the guidance
+        # on WHEN to use the tools (automatic invocation for GUI work).
+        self.assertIn(NO_BYPASS_POLICY, instructions)
+        self.assertTrue(instructions.endswith(NO_BYPASS_POLICY))
         for word in ("Bash", "osascript", "JXA", "System Events", "Swift", "CGEvent"):
             self.assertIn(word, instructions)
 

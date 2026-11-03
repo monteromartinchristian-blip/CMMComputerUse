@@ -91,8 +91,11 @@ class AnnotationTests(SurfaceCase):
 
     def test_read_only_set_matches_the_background_catalog(self):
         names = {tool["name"] for tool in self.registry().tools()}
+        # 0.3.3 adds two read-only workspace tools (status; opening an
+        # observe-scoped context acts on no application).
         self.assertEqual(READ_ONLY_TOOLS, {"computer_use_status", "computer_use_list_apps",
-                                           "computer_use_observe", "computer_use_capture_window"})
+                                           "computer_use_observe", "computer_use_capture_window",
+                                           "computer_use_workspace_status", "computer_use_context_open"})
         self.assertTrue(READ_ONLY_TOOLS.issubset(names))
 
 
@@ -317,7 +320,9 @@ class AvailabilityTests(SurfaceCase):
         self.assertEqual(initialized["result"]["serverInfo"]["name"], "cmm-computer-use")
         catalog = handle_message(registry, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         assert catalog is not None
-        self.assertEqual(len(catalog["result"]["tools"]), 8)  # + computer_use_scroll (AX-only)
+        # + computer_use_scroll (AX-only); 0.3.3: + workspace_status,
+        # context_open, context_close.
+        self.assertEqual(len(catalog["result"]["tools"]), 11)
         response = self.call("computer_use_status", registry=registry)
         self.assertTrue(is_error(response))
         self.assertIn("REFUSED COMPUTER_RUNTIME_UNAVAILABLE", text_of(response))
@@ -334,9 +339,13 @@ class AvailabilityTests(SurfaceCase):
             response = self.call("computer_use_press", {"element_id": 1, "snapshot": 1})
         text = text_of(response)
         self.assertTrue(is_error(response))
-        self.assertIn("REFUSED COMPUTER_RUNTIME_UNAVAILABLE", text)
+        # 0.3.3: a timed-out MUTATING action is not "unavailable" — it may have
+        # run. The outcome is reported as unknown and the press is never resent.
+        self.assertIn("REFUSED OUTCOME_UNKNOWN", text)
         self.assertIn("did not answer action.execute in time", text)
-        self.assertEqual(len(self.bridge.frames), 1, "a timeout must not be retried")
+        self.assertIn("Do not resend it", text)
+        executes = [f for f in self.bridge.frames if f.get("operation") == "action.execute"]
+        self.assertEqual(len(executes), 1, "a timeout must not be retried")
 
         # A timed-out connection is dropped, so the next call opens a new one
         # instead of matching a late answer to a new request.
