@@ -43,6 +43,9 @@ APP_NAME="CMMComputerUse.app"
 APP_DISPLAY_NAME="CMM Computer Use"
 BUNDLE_ID="com.cmm.chat.computer-use"
 VERSION="${CMM_HELPER_VERSION:-0.3.3}"
+# CFBundleVersion: identifies a build together with the version (an audit or
+# rollback still names the CDHash, never "0.3.3 (6)" alone).
+BUILD_NUMBER="${CMM_HELPER_BUILD_NUMBER:-6}"
 INSTALL_DIR="${CMM_BRIDGE_INSTALL_DIR:-$HOME/Applications}"
 APP="$INSTALL_DIR/$APP_NAME"
 BUILD_DIR="${CMM_HELPER_BUILD_DIR:-$REPO/build}"
@@ -83,7 +86,7 @@ plist_set CFBundleExecutable CMMComputerUse
 plist_set CFBundleName "$APP_DISPLAY_NAME"
 plist_set CFBundleDisplayName "$APP_DISPLAY_NAME"
 plist_set CFBundleShortVersionString "$VERSION"
-plist_set CFBundleVersion 5
+plist_set CFBundleVersion "$BUILD_NUMBER"
 plist_set CFBundleDevelopmentRegion en
 
 # A staged bundle whose visible name or identity regressed must not be shipped.
