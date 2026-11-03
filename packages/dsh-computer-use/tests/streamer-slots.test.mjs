@@ -208,3 +208,34 @@ test('a 0.3.2 viewer (no slot) still gets the single mirror', async () => {
     await helper.close();
   }
 });
+
+test('backpressure is per viewer: a panel that stops reading never stalls the other', async () => {
+  const helper = await fakeHelper();
+  const live = await streamer(helper.path);
+  try {
+    const a = await mirror(live.port, 'A', 1);
+    const b = await mirror(live.port, 'B', 1);
+    // Panel A stops consuming: its socket buffers fill and its writes wait
+    // for a drain that does not come.
+    a.response.pause();
+    a.request.socket.setRecvBufferSize?.(1024);
+    await wait(600);
+    const before = await status(live.port, 'B');
+    await wait(600);
+    const after = await status(live.port, 'B');
+    assert.ok(after.frames > before.frames, 'B keeps flowing while A is stalled');
+    assert.equal(after.phase, 'live');
+    const idA = (await status(live.port, 'A')).stream_id;
+    assert.ok(idA);
+    a.request.destroy();
+    await wait(400);
+    // A's stream is released once its viewer is gone, even though it stalled;
+    // B's is not.
+    const stops = helper.calls.filter(x => x.operation === 'observation.stream_stop').map(x => x.args.stream_id);
+    assert.deepEqual(stops, [idA]);
+    b.request.destroy();
+  } finally {
+    await live.close();
+    await helper.close();
+  }
+});
