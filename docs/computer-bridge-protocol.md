@@ -166,6 +166,20 @@ decided before any surface is opened. `bridge.ping` gains
 so a host can tell "supported" from "not supported" instead of discovering it
 by failing; `capture_screen` stays as the fallback.
 
+### Multi-App Workspace (helper 0.3.3)
+
+Additive operations, all on the same v1 frames: `workspace.status`,
+`workspace.context_create|list|status|close`, `observation.stream_status`,
+`observation.stream_recover`, `action.outcome`; and optional `context_id`,
+`stream_id`, `stream_key`, `expected_bundle`, `expected_pid`, `op_id` on the
+existing ones. The element table, generation and released set are per
+**context** of the caller's **principal** (no longer process-wide); up to two
+window streams run at once, each owned by its principal; every action answer
+carries `execution {executed, outcome, op_id, instance_id, replayed}`.
+`bridge.ping` adds `instance_id` and `capabilities.workspace`. The full,
+harness-neutral contract — schemas, limits, phases, errors, retry classes and
+compatibility — is [workspace-contract.md](workspace-contract.md).
+
 ## Interaction policy (what the helper is allowed to do to the machine)
 
 Not every kind in the allowlist has the same physical effect.

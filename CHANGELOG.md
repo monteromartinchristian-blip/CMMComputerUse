@@ -7,6 +7,51 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The helper and the plugin version independently; this file tracks the plugin
 (`@cmm/dsh-computer-use`) and notes helper-visible changes explicitly.
 
+## Unreleased — helper 0.3.3 build 6 (Multi-App Workspace, 2026-11-03)
+
+Development branch `feature/computer-use-033`; not integrated, not deployed.
+Contract: [docs/workspace-contract.md](docs/workspace-contract.md).
+
+### Added
+
+- Workspace contexts: two per client (plus the 0.3.2 default), each with its
+  own generation, clock, released set and element handles, owned by the
+  verified principal; opaque random ids; `workspace.*` operations.
+- Two concurrent window streams, each with its own SCStream, sink, queue,
+  frame index, health phase (`warming`/`live`/`stale`/`recovering`/`error`)
+  and bounded recovery; third refused; frames served only to the owner.
+- Document identity (window `AXDocument` / web-area `AXURL`, as a digest):
+  a tab or document change refuses old handles.
+- Reliability: `execution` facts on every action, operation-id ledger
+  (replay, conflict, in-progress), `action.outcome`, helper `instance_id`;
+  the adapter never resends a mutating action whose answer was lost
+  (`OUTCOME_UNKNOWN`) and retries only reads.
+- MCP: optional `context` on handle tools; `computer_use_workspace_status`,
+  `computer_use_context_open`, `computer_use_context_close`; invocation
+  guidance in the server instructions.
+- DSH: split PiP (one panel per context, two at most), per-slot streamer,
+  projection `stateVersion` 13 with validated lanes.
+- `examples/reference-harness`: a non-DSH MCP host for conformance;
+  `scripts/verification/workspace-lane.py`: isolated real-helper lane.
+
+### Fixed
+
+- Stream authorization ignored the client (`authorization.decision` without
+  `client:`): under a client-required policy every stream was refused and the
+  mirror fell back to capture polling.
+- A legacy `stream_start`/`stream_stop` from any client replaced/stopped the
+  one stream of every other client.
+- DSH: a session that observed without a prior `computer_use_status` ended in
+  `UNVERIFIED_TARGET` and the PiP never showed the window; observations now
+  carry the helper facts and the target's grant before any AX content.
+
+### Changed (visible to 0.3.2 callers)
+
+- Another client's observation no longer replaces your element handles.
+- A timed-out or desynchronised mutating action is `OUTCOME_UNKNOWN`, not
+  `COMPUTER_RUNTIME_UNAVAILABLE`, and is never resent.
+- A verified document change refuses an old handle (`reason=document_changed`).
+
 ## Unreleased — helper 0.3.2 build 5 (projection filter + release, 2026-11-02)
 
 ### Fixed

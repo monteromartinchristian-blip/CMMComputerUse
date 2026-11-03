@@ -42,6 +42,14 @@ documents the file format and the two scopes.
 | `computer_use_set_value` | control | `AXSetValue` on one resolved element |
 | `computer_use_scroll` | control | accessibility-only scroll of one element (its page action or scroll-bar value); `CAPABILITY_UNSUPPORTED` otherwise — never a wheel event |
 | `computer_use_release` | control | drop an observation |
+| `computer_use_workspace_status` | read | this session's contexts and live streams, with health and limits |
+| `computer_use_context_open` | read | open a context (one app) to work with two apps at once; returns the id to pass as `context` |
+| `computer_use_context_close` | control | close a context: handles dropped, its stream stopped |
+
+Every handle tool accepts an optional `context`. Without it, the tools behave
+exactly as in 0.3.2. With two contexts the PiP splits into two panels (A, B),
+each with its own live mirror, state and errors. See
+[the workspace contract](https://github.com/monteromartinchristian-blip/CMMComputerUse/blob/main/docs/workspace-contract.md).
 
 In `background` mode the catalog contains exactly those. `activate_app`,
 `focus_window`, `click`, `type_text`, `shortcut` and `pointer_scroll` are

@@ -6,6 +6,14 @@ The full project changelog, including the macOS helper, lives in the repository.
 
 ## Unreleased
 
+- 0.3.3 Multi-App Workspace: optional `context` on observe / capture / press /
+  set_value / scroll / release; `computer_use_workspace_status`,
+  `computer_use_context_open`, `computer_use_context_close`; `execution` line on
+  every action; `OUTCOME_UNKNOWN` (never resent) after a lost answer; reads
+  retried with backoff. Split PiP (panels A/B) with a per-slot streamer;
+  projection `stateVersion` 13. Observations carry the helper facts so the PiP
+  shows a target observed without a prior status call.
+
 - `computer_use_scroll` is now the accessibility-only scroll (all modes); the
   global wheel tool is `computer_use_pointer_scroll` (unrestricted only).
 - `INTERFERENCE_BREACH`, window-raised breaches and the helper's breach latch
