@@ -138,18 +138,31 @@ check(not re.search(r"NSAppleScript|OSAScript|osascript|System Events|JavaScript
 removals = enclosing_funcs(main, "state.remove(id:") | enclosing_funcs(main, "breachLatch = .loaded(empty)")
 check(removals <= {"breachRearm"} and enclosing_funcs(main, "breachRearm(arguments:") <= {"dispatch", "breachRearm"},
       "20: latches are removed only by breach.rearm (no automatic reset/rearm); found in %s" % sorted(removals))
-takeover_start = main.find("if report.requiresReobserve {")
-takeover_block = main[takeover_start:main.index("\n        }\n", takeover_start)] if takeover_start >= 0 else ""
+def top_func(source: str, name: str) -> str:
+    start = source.index("func %s(" % name)
+    return source[start:source.index("\n}\n", start)]
+
+
+def strip_comments(source: str) -> str:
+    return "\n".join(l.split("//", 1)[0] for l in source.splitlines())
+
+
+takeover_match = re.search(r"^( +)if report\.requiresReobserve \{$", main, re.M)
+takeover_start = takeover_match.start() if takeover_match else -1
+takeover_block = (main[takeover_start:main.index("\n%s}\n" % takeover_match.group(1), takeover_start)]
+                  if takeover_match else "")
 takeover_code = "\n".join(l.split("//", 1)[0] for l in takeover_block.splitlines())
 check(not re.search(r"breachLatch|saveBreachLatch|appendBreachAudit|activate\(|retry", takeover_code.split("log(")[0]),
       "a human takeover only invalidates the snapshot: no latch, no audit entry, no activation, no retry")
-check(len(re.findall(r"^        if report\.requiresReobserve \{$", main, re.M)) == 1
+check(len(re.findall(r"^ +if report\.requiresReobserve \{$", main, re.M)) == 1
       and re.search(r"public var requiresReobserve: Bool \{\s*focusChangeAttribution == \.user "
                     r"\|\| focusChangeAttribution == \.ambiguousExternal\s*\}", POLICY_SRC) is not None,
       "T: the takeover condition is unchanged (`if report.requiresReobserve {`, user|ambiguous_external)")
-check('invalidateObservation(reason: "user_takeover")' in takeover_code
-      and "observationCapturedAt" not in takeover_code,
-      "T: a takeover invalidates through the SAME operation as release (no zeroed timestamp, no epoch age)")
+check('invalidateObservation(contextID: contextID, reason: "user_takeover")' in takeover_code
+      and "capturedAt" not in takeover_code
+      and "requestContext.map { [$0.id] }" in takeover_code,
+      "T: a takeover invalidates through the SAME operation as release, only in the affected context "
+      "(no zeroed timestamp, no epoch age)")
 check("elementChromeRefusal(kind: kind, params: params, mode: mode)" in main
       and all(sub in POLICY_SRC for sub in ('"AXCloseButton"', '"AXMinimizeButton"', '"AXZoomButton"', '"AXFullScreenButton"')),
       "21: window chrome guard intact (all four subroles, checked before every press)")
@@ -171,32 +184,65 @@ invalidate_start = main.index("func invalidateObservation(")
 invalidate_body = main[invalidate_start:main.index("\n}\n", invalidate_start)]
 retire_start = POLICY_SRC.index("public func bridgeRetireObservation(")
 retire_body = POLICY_SRC[retire_start:POLICY_SRC.index("\n}\n", retire_start)]
-check('invalidateObservation(reason: "release")' in release_body
-      and all(t + ".removeAll()" in invalidate_body
-              for t in ("elementTable", "elementRoles", "elementSubroles", "elementContexts"))
-      and "bridgeRetireObservation(" in invalidate_body
-      and "releasedSnapshots = retirement.releasedSnapshots" in invalidate_body
-      and "observationGeneration = retirement.generation" in invalidate_body
-      and "observationCapturedAt = retirement.capturedAt" in invalidate_body
+WORKSPACE_SRC = (REPO / "apps/macos/Shared/ComputerUseWorkspace.swift").read_text()
+def swift_method(source: str, signature: str) -> str:
+    start = source.index(signature)
+    return source[start:source.index("\n    }\n", start)]
+ws_invalidate = swift_method(WORKSPACE_SRC, "public func invalidate(id: String, reason: String, now: Double)")
+ws_begin = swift_method(WORKSPACE_SRC, "public func beginObservation(")
+ws_resolve = swift_method(WORKSPACE_SRC, "public func resolveHandle(")
+check('invalidateObservation(contextID: context.id, reason: "release")' in release_body
+      and "workspace.invalidate(" in invalidate_body
+      and "bridgeRetireObservation(" in ws_invalidate
+      and "record.handles.removeAll()" in ws_invalidate
+      and "record.released = retirement.releasedSnapshots" in ws_invalidate
+      and "record.generation = retirement.generation" in ws_invalidate
+      and "record.capturedAt = retirement.capturedAt" in ws_invalidate
       and "released.insert(generation)" in retire_body and "generation: generation + 1" in retire_body
       and "capturedAt: now" in retire_body,
-      "R: release retires the generation through the one shared invalidation (tables emptied, N+1, time=now)")
-check(enclosing_funcs(main, "observationCapturedAt = ") <= {"describe", "invalidateObservation"}
-      and not re.search(r"observationCapturedAt = 0\b", "\n".join(l.split("//", 1)[0] for l in main.splitlines()))
-      and enclosing_funcs(main, "invalidateObservation(reason:") <= {"releaseObservation", "dispatch", "invalidateObservation"},
-      "R/T: the observation time is set only by describe and the shared invalidation, never to 0")
+      "R: release retires the context's generation through the one shared invalidation "
+      "(its handles emptied, N+1, time=now)")
+main_code = "\n".join(l.split("//", 1)[0] for l in main.splitlines())
+check(not re.search(r"\bcapturedAt\s*=", main_code)
+      and set(re.findall(r"record\.capturedAt = [^\n]+", WORKSPACE_SRC))
+          <= {"record.capturedAt = now", "record.capturedAt = retirement.capturedAt"}
+      and "record.capturedAt = now" in ws_begin
+      and not re.search(r"capturedAt = 0\b", WORKSPACE_SRC)
+      and enclosing_funcs(main, "invalidateObservation(contextID:")
+          <= {"releaseObservation", "executeActionRequest", "invalidateObservation"},
+      "R/T: the observation time is set only by a new observation and the shared invalidation, never to 0")
 pre_start = main.index("func elementPreconditions(")
 pre_body = main[pre_start:main.index("\n}\n", pre_start)]
-check(pre_body.index("bridgeReleasedSnapshotRefusal(") < pre_body.index("bridgeObservationExpired("),
-      "R: a released snapshot is refused as `released` before any expiry/age is computed")
+check("workspace.resolveHandle(" in pre_body
+      and ws_resolve.index("bridgeReleasedSnapshotRefusal(") < ws_resolve.index("bridgeObservationExpired(")
+      < ws_resolve.index("bridgeSnapshotRefusal("),
+      "R: a released snapshot is refused as `released` before any expiry/age is computed (per context)")
 
-def top_func(source: str, name: str) -> str:
-    start = source.index("func %s(" % name)
-    return source[start:source.index("\n}\n", start)]
+# ---- W: Multi-App Workspace (0.3.3) -------------------------------------
+check(not re.search(r"^nonisolated\(unsafe\) var (elementTable|elementRoles|elementSubroles|elementContexts|"
+                    r"observationGeneration|observationCapturedAt|releasedSnapshots)\b", main, re.M),
+      "W1: no process-wide element table or generation: handles live in workspace contexts")
+check("traversal.handles[elementID] = BridgeLiveHandle(" in main
+      and "workspace.commit(id: context.id, generation: start.generation, handles: traversal.handles)" in main,
+      "W2: an observation commits its handles into ONE context, under that context's new generation")
+frame_path = main[main.index('if operation == "observation.stream_frame" {'):]
+frame_path = frame_path[:frame_path.index("return\n")]
+check("authorizationLock.lock()" in frame_path and "requestPrincipal(peer: peer" in frame_path
+      and "streamFrameResponse(args, principal: principal)" in frame_path,
+      "W3: frames are served outside dispatchLock only to the principal that owns the stream")
+stream_src = (REPO / "apps/macos/CMMComputerUse/WindowStream.swift").read_text()
+check("windowTitle: pair.0.title, scope: .observe, client: client" in stream_src
+      and "stopWindowStream()" not in stream_src,
+      "W4: a stream is authorized for THIS client's .observe grant (0.3.2 omitted the client)")
+ledger_body = main[main.index("func executeActionWithLedger("):]
+ledger_body = ledger_body[:ledger_body.index("\n}\n")]
+check(ledger_body.count("executeActionRequest(") == 1
+      and not re.search(r"\bwhile\b|\bfor\s+\w+\s+in\b|\brepeat\s*\{", strip_comments(ledger_body)),
+      "W5: an action is executed at most once per request (no retry loop around it)")
+check(main.count("executed = true\n") == 1
+      and main.index("executed = true\n") < main.index("let result = executeAction(kind: kind, params: params)"),
+      "W6: `executed` is set exactly once, immediately before the action is handed to the machine")
 
-
-def strip_comments(source: str) -> str:
-    return "\n".join(l.split("//", 1)[0] for l in source.splitlines())
 
 
 socket_src = (REPO / "apps/macos/Shared/ComputerUseSocketPath.swift").read_text()

@@ -150,22 +150,53 @@ func log(_ message: String) {
     }
 }
 
-// MARK: - Element table (live AX refs stay in-process across requests)
+// MARK: - Workspace (live AX refs stay in-process across requests)
 
-// Single-threaded by construction (one synchronous dispatch loop); the only
-// concurrent scope (screenshot Task) touches only its Sendable box.
-nonisolated(unsafe) var elementTable: [Int: AXUIElement] = [:]
-nonisolated(unsafe) var elementRoles: [Int: String] = [:]
-/// AX subrole per element id, captured with the role: it is what identifies
-/// window controls (AXZoomButton, …) that background mode never presses.
-nonisolated(unsafe) var elementSubroles: [Int: String] = [:]
+/// One element handle: the live AX reference and what it is bound to. Kept
+/// per CONTEXT (Shared/ComputerUseWorkspace.swift), never in a process-wide
+/// table: observing application B no longer replaces application A's handles,
+/// and a handle resolves only for the principal whose context produced it.
+struct BridgeLiveHandle {
+    let element: AXUIElement
+    let role: String
+    /// What identifies window controls (AXZoomButton, …) that background mode
+    /// never presses.
+    let subrole: String?
+    /// The application, process, window and document the handle came from;
+    /// re-validated before every action.
+    let context: BridgeElementContext
+}
+
+// Single-threaded by construction: mutated only under `dispatchLock`. The only
+// concurrent scopes (capture Tasks, stream sinks) touch their own boxes.
+nonisolated(unsafe) var workspace = BridgeWorkspace<BridgeLiveHandle>()
+/// Who is asking, for THIS request: resolved under `dispatchLock` from the
+/// verified client (or the peer's code identity), like `currentClient`.
+nonisolated(unsafe) var currentPrincipal = BridgePrincipal(key: "local", strength: .local)
+/// The context an element action resolved to, for THIS request only. Set by
+/// `elementPreconditions`, cleared with `currentClient` after dispatch.
+nonisolated(unsafe) var requestContext: BridgeContextRecord<BridgeLiveHandle>?
+/// Outcomes of executed actions by operation id (replay instead of re-run).
+nonisolated(unsafe) var operationLedger = BridgeOperationLedger<BridgeLedgerFrame>()
+/// Random per process: a client that sees it change knows the helper
+/// restarted and every context, stream and ledger entry is gone.
+let helperInstanceID = bridgeRandomInstanceID()
 /// Open breaches (Shared/ComputerUseBreachLatch.swift). Persisted next to the
 /// policy file, loaded at start and on `policy.reload`; a restart does NOT
 /// clear it. Only `breach.rearm` from an administrator client does.
 nonisolated(unsafe) var breachLatch: BridgeBreachLatchLoad = .loaded(BridgeBreachLatchState())
-/// What each handle is bound to (application, process, window). Cleared with
-/// the element table; re-validated before every action.
-nonisolated(unsafe) var elementContexts: [Int: BridgeElementContext] = [:]
+
+/// A recorded response frame, replayed for a resent operation id.
+struct BridgeLedgerFrame {
+    let ok: Bool
+    let result: Any?
+    let error: [String: Any?]?
+}
+
+/// The handle of the current request's context, by element id.
+func requestHandle(_ elementID: Int) -> BridgeLiveHandle? {
+    requestContext?.handles[elementID]
+}
 
 // MARK: - Interaction policy (shared rules in ../Shared/ComputerUsePolicy.swift)
 
@@ -175,14 +206,11 @@ nonisolated(unsafe) var elementContexts: [Int: BridgeElementContext] = [:]
 /// log agree about what this process is allowed to do.
 nonisolated(unsafe) var deploymentMode: BridgeInteractionMode = .background
 
-/// Generation of the element table. Every `observation.describe` produces a
-/// new one, so a handle from an older observation is refused instead of being
-/// resolved against a newer one (``bridgeSnapshotRefusal``).
-nonisolated(unsafe) var observationGeneration = 0
-nonisolated(unsafe) var observationCapturedAt: Double = 0
-/// Generations retired by `observation.release` (bounded): their handles are
-/// refused with `reason=released` (Shared: `bridgeReleasedSnapshotRefusal`).
-nonisolated(unsafe) var releasedSnapshots: Set<Int> = []
+// The generation, observation clock and released generations that 0.3.2 kept
+// here as process-wide globals now live in each workspace context
+// (``BridgeContextRecord``): every `observation.describe` produces a new
+// generation IN ITS CONTEXT, so a handle from an older observation of that
+// context is refused, and an observation of another context moves nothing.
 
 /// Where the system cursor is.
 ///
@@ -552,6 +580,36 @@ struct BridgeElementContext {
     let window: AXUIElement?
 }
 
+/// The first web area under `window`, bounded (breadth-first, ≤ 400 nodes).
+/// Used only to re-read the `AXURL` that identified the observed document.
+func currentWebArea(of window: AXUIElement?) -> AXUIElement? {
+    guard let window else { return nil }
+    var queue: [AXUIElement] = [window]
+    var visited = 0
+    while !queue.isEmpty, visited < 400 {
+        let node = queue.removeFirst()
+        visited += 1
+        if (axAttr(node, kAXRoleAttribute) as? String) == "AXWebArea" { return node }
+        if let children = axAttr(node, kAXChildrenAttribute) as? [AXUIElement] {
+            queue.append(contentsOf: children.prefix(maxChildrenPerNode))
+        }
+    }
+    return nil
+}
+
+/// What document a window shows, from supported AX attributes only: the
+/// window's `AXDocument`, else the `AXURL` of the first web area the walk met.
+/// Nothing is inferred from the title (Shared: ``BridgeDocumentIdentity``).
+func documentIdentity(window: AXUIElement?, webArea: AXUIElement?, title: String) -> BridgeDocumentIdentity {
+    let document = window.flatMap { axAttr($0, kAXDocumentAttribute) as? String }
+    var url: String?
+    if let webArea, let raw = axAttr(webArea, kAXURLAttribute) {
+        if let value = raw as? URL { url = value.absoluteString }
+        else if let value = raw as? String { url = value }
+    }
+    return BridgeDocumentIdentity(axDocument: document, axURL: url, title: title)
+}
+
 // MARK: - Interference sampling (during the action, not only around it)
 
 /// Samples the environment while an action runs.
@@ -752,6 +810,11 @@ final class Traversal: @unchecked Sendable {
     /// Pressable, non-window controls the FILTER left out: the window still
     /// offers them, so a filtered projection never reads as "not actionable".
     var filteredOutActionable = 0
+    /// The handles this walk produced. Committed to ONE context afterwards,
+    /// and only if that context's observation is still the current one.
+    var handles: [Int: BridgeLiveHandle] = [:]
+    /// The first web area met: its `AXURL` identifies the document (tab).
+    var webArea: AXUIElement?
 
     init(elementFilter: String = "") {
         budget = BridgeProjectionBudget(
@@ -1014,6 +1077,7 @@ func walk(
     traversal.deepestDepth = max(traversal.deepestDepth, depth)
 
     let role = (axAttr(element, kAXRoleAttribute) as? String) ?? "AXUnknown"
+    if role == "AXWebArea", traversal.webArea == nil { traversal.webArea = element }
     let isTextInput = bridgeTextInputRoles.contains(role)
     var decision: BridgeProjectionBudget.Decision? = nil
     if interactiveRoles.contains(role) {
@@ -1056,15 +1120,14 @@ func walk(
         }
         let value = (axAttr(element, kAXValueAttribute) as? String) ?? ""
         let subrole = axAttr(element, kAXSubroleAttribute) as? String
-        elementTable[elementID] = element
-        elementRoles[elementID] = role
-        if let subrole { elementSubroles[elementID] = subrole }
         // What this handle is allowed to touch, captured now and re-checked
         // before any action: the application, its process, and the window the
         // element was found in.
-        elementContexts[elementID] = BridgeElementContext(
-            pid: owner.pid, bundleID: owner.bundleID, appName: owner.name,
-            windowTitle: windowTitle, window: window)
+        traversal.handles[elementID] = BridgeLiveHandle(
+            element: element, role: role, subrole: subrole,
+            context: BridgeElementContext(
+                pid: owner.pid, bundleID: owner.bundleID, appName: owner.name,
+                windowTitle: windowTitle, window: window))
         var entry: [String: Any] = [
             "element_id": elementID,
             "role": role,
@@ -1200,13 +1263,28 @@ func runningApp(named request: String) -> NSRunningApplication? {
 /// result that a client could mistake for a successful one.
 func describe(
     includeScreenshot: Bool, targetApp: String?, mode: BridgeInteractionMode,
-    includeDiagnostics: Bool = false, elementFilter: String = ""
+    includeDiagnostics: Bool = false, elementFilter: String = "", contextID: String? = nil
 ) -> (result: [String: Any]?, refusal: BridgePolicyRefusal?) {
-    let workspace = NSWorkspace.shared
-    let frontmost = workspace.frontmostApplication
+    // The context first: it is the caller's own, or the request is refused
+    // before any application is touched. No `context_id` is the 0.3.2 caller,
+    // whose implicit default context follows whatever app it names.
+    let context: BridgeContextRecord<BridgeLiveHandle>
+    switch workspace.context(principal: currentPrincipal, id: contextID, now: Date().timeIntervalSince1970) {
+    case .failure(let refusal): return (nil, refusal)
+    case .success(let found): context = found
+    }
+
+    let workspaceApps = NSWorkspace.shared
+    let frontmost = workspaceApps.frontmostApplication
 
     var target: NSRunningApplication? = frontmost
-    if let request = targetApp?.trimmingCharacters(in: .whitespacesAndNewlines), !request.isEmpty {
+    var request = targetApp?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    // An explicit context that is already bound observes its own application
+    // when the caller does not name one.
+    if request.isEmpty, !context.legacy, let bound = context.identity?.bundleID ?? context.boundBundle {
+        request = bound
+    }
+    if !request.isEmpty {
         guard let resolved = runningApp(named: request) else {
             return (nil, BridgePolicyRefusal(
                 code: "COMPUTER_TARGET_UNAVAILABLE",
@@ -1241,7 +1319,8 @@ func describe(
     }
 
     // DENY BY DEFAULT: an application the deployment did not authorize is
-    // refused here, before a single AX attribute is read from it.
+    // refused here, before a single AX attribute is read from it. A context id
+    // never stands in for this decision.
     if let refusal = authorization.decision(
         bundleID: owner.bundleID, name: owner.name,
         windowTitle: captureTitle, scope: .observe, client: currentClient
@@ -1249,13 +1328,11 @@ func describe(
         log("observation refused: \(refusal.detail)")
         return (nil, refusal)
     }
-
-    elementTable.removeAll()
-    elementRoles.removeAll()
-    elementSubroles.removeAll()
-    elementContexts.removeAll()
-    observationGeneration += 1
-    observationCapturedAt = Date().timeIntervalSince1970
+    // A context is ONE application: its handles, stream and panel never
+    // describe two.
+    if let refusal = workspace.targetMismatch(id: context.id, bundleID: owner.bundleID) {
+        return (nil, refusal)
+    }
 
     var traversal = Traversal(elementFilter: elementFilter)
     var enrichment: [String: Any] = ["state": "not_trusted"]
@@ -1285,12 +1362,9 @@ func describe(
             nodeCount: countAXNodes(root, limit: sparseTreeThreshold), access: first.access,
             sparseThreshold: sparseTreeThreshold) {
             enrichment = ensureAccessibilityTree(appElement: appElement, root: root, trigger: trigger)
-            // 3. The tree may have changed: walk again from scratch.
+            // 3. The tree may have changed: walk again from scratch (a new
+            //    traversal carries no handle of the first walk).
             if let state = enrichment["state"] as? String, state.hasPrefix("enabled") {
-                elementTable.removeAll()
-                elementRoles.removeAll()
-                elementSubroles.removeAll()
-                elementContexts.removeAll()
                 traversal = Traversal(elementFilter: elementFilter)
                 walkTarget(traversal)
             }
@@ -1306,6 +1380,22 @@ func describe(
         if includeDiagnostics { diagnostics["after"] = axDeepScan(root) }
     }
 
+    // Commit the walk as a NEW generation of THIS context only. No other
+    // context's generation, clock or handles move.
+    let windows = visibleWindows(frontmostApp: frontmostName, targetPID: target.processIdentifier)
+    let titled = windows.filter { ($0["title"] as? String) == captureTitle }
+    let identity = BridgeContextIdentity(
+        bundleID: owner.bundleID, pid: owner.pid, appName: owner.name,
+        windowID: titled.count == 1 ? titled[0]["window_id"] as? Int : nil,
+        windowTitle: captureTitle,
+        document: documentIdentity(window: windowElement, webArea: traversal.webArea, title: captureTitle))
+    guard let start = workspace.beginObservation(
+        id: context.id, identity: identity, now: Date().timeIntervalSince1970) else {
+        return (nil, bridgeUnknownContextRefusal())
+    }
+    workspace.commit(id: context.id, generation: start.generation, handles: traversal.handles)
+    let committed = workspace.record(id: context.id) ?? context
+
     var screenshotB64: String? = nil
     var screenshotScope = "none"
     var screenshotError: String? = nil
@@ -1317,10 +1407,11 @@ func describe(
             screenshotError = "window_title_unavailable"
             return (buildDescription(
                 frontmostName: frontmostName, frontmost: frontmost, target: target,
-                traversal: traversal, windowTitle: captureTitle, screenshot: nil, scope: "none",
+                traversal: traversal, windowTitle: captureTitle, windows: windows, context: committed,
+                start: start, screenshot: nil, scope: "none",
                 error: screenshotError, enrichment: enrichment, diagnostics: diagnostics), nil)
         }
-        let outcome = captureWindowBase64(app: owner.name, title: captureTitle)
+        let outcome = captureWindowBase64(app: owner.name, title: captureTitle, snapshot: start.generation)
         screenshotB64 = outcome.image
         screenshotScope = outcome.image == nil ? "none" : "window"
         if let refusal = outcome.refusal { screenshotError = refusal.detail }
@@ -1329,7 +1420,8 @@ func describe(
 
     return (buildDescription(
         frontmostName: frontmostName, frontmost: frontmost, target: target,
-        traversal: traversal, windowTitle: captureTitle, screenshot: screenshotB64, scope: screenshotScope,
+        traversal: traversal, windowTitle: captureTitle, windows: windows, context: committed,
+        start: start, screenshot: screenshotB64, scope: screenshotScope,
         error: screenshotError, enrichment: enrichment, diagnostics: diagnostics), nil)
 }
 
@@ -1342,13 +1434,15 @@ func buildDescription(
     target: NSRunningApplication?,
     traversal: Traversal,
     windowTitle: String,
+    windows: [[String: Any]],
+    context: BridgeContextRecord<BridgeLiveHandle>,
+    start: BridgeObservationStart,
     screenshot: String?,
     scope: String,
     error: String?,
     enrichment: [String: Any] = [:],
     diagnostics: [String: Any] = [:]
 ) -> [String: Any] {
-    let windows = visibleWindows(frontmostApp: frontmostName, targetPID: target?.processIdentifier)
     let matches = windows.filter { ($0["title"] as? String) == windowTitle }
     var result: [String: Any] = [
         "frontmost_app": frontmostName,
@@ -1363,9 +1457,15 @@ func buildDescription(
         "content": traversal.content,
         "screenshot_base64": screenshot as Any,
         "screenshot_scope": scope,
-        "snapshot": observationGeneration,
-        "captured_at": observationCapturedAt,
+        // The generation of THIS context (0.3.2: of the process).
+        "snapshot": start.generation,
+        "captured_at": context.capturedAt,
+        // Which context produced the handles, so an action names it back.
+        "context_id": context.id,
+        "context_label": context.label,
+        "identity_changes": start.identityChanges,
     ]
+    if let document = context.identity?.document { result["document"] = document.dictionary }
     if matches.count == 1 { result["target_window_id"] = matches[0]["window_id"] }
     if !enrichment.isEmpty { result["ax_enrichment"] = enrichment }
     // Say it when the tree is useless instead of handing over three title-bar
@@ -1426,14 +1526,16 @@ func encodePNG(_ image: CGImage) -> String? {
 /// the application's and the window server's decision, not ours — a failure
 /// here is reported, never papered over with a display capture.
 func captureWindowBase64(
-    app: String?, title: String
+    app: String?, title: String, snapshot: Int
 ) -> (image: String?, failure: String?, refusal: BridgePolicyRefusal?, identity: [String: Any]?) {
     guard CGPreflightScreenCaptureAccess() else {
         return (nil, "screen_recording_denied", nil, nil)
     }
     let box = WindowCaptureBox()
     let sema = DispatchSemaphore(value: 0)
-    let captureSnapshot = observationGeneration
+    // The generation of the CALLER'S context, so a capture is tied to the
+    // observation line it belongs to (0.3.2: a process-wide counter).
+    let captureSnapshot = snapshot
     Task {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(
@@ -1563,29 +1665,32 @@ func appsList() -> [String: Any] {
 /// on and is remembered as released: an old handle is refused with
 /// `reason=released` before any UI is touched; a fresh observation works as
 /// usual. Idempotent: each call retires the then-current generation.
-func releaseObservation() -> [String: Any] {
-    invalidateObservation(reason: "release")
+func releaseObservation(contextID: String?) -> (result: [String: Any]?, refusal: BridgePolicyRefusal?) {
+    // Only the caller's own context is released: knowing another client's
+    // context id gets the same refusal as an id that never existed.
+    switch workspace.context(principal: currentPrincipal, id: contextID, now: Date().timeIntervalSince1970) {
+    case .failure(let refusal): return (nil, refusal)
+    case .success(let context): return (invalidateObservation(contextID: context.id, reason: "release"), nil)
+    }
 }
 
-/// The single invalidation of the element handles, used by
-/// `observation.release` and by a `USER_TAKEOVER`. The state change is the
-/// pure Shared rule ``bridgeRetireObservation``; this only applies it to the
-/// globals and empties the four handle tables.
+/// The single invalidation of ONE context's element handles, used by
+/// `observation.release` and by a `USER_TAKEOVER` (which retires only the
+/// context the action ran in). The state change is the pure Shared rule
+/// ``bridgeRetireObservation``, applied by ``BridgeWorkspace/invalidate``.
 @discardableResult
-func invalidateObservation(reason: String) -> [String: Any] {
-    let released = elementTable.count
-    elementTable.removeAll()
-    elementRoles.removeAll()
-    elementSubroles.removeAll()
-    elementContexts.removeAll()
-    let retirement = bridgeRetireObservation(
-        generation: observationGeneration, releasedSnapshots: releasedSnapshots,
-        now: Date().timeIntervalSince1970)
-    releasedSnapshots = retirement.releasedSnapshots
-    observationGeneration = retirement.generation
-    observationCapturedAt = retirement.capturedAt
-    log("OBSERVATION_INVALIDATED reason=\(reason) handles=\(released) snapshot=\(retirement.retired) current=\(retirement.generation)")
-    return ["released": released, "invalidated_snapshot": retirement.retired, "snapshot": retirement.generation]
+func invalidateObservation(contextID: String, reason: String) -> [String: Any] {
+    let released = workspace.record(id: contextID)?.handles.count ?? 0
+    // Shared: `BridgeWorkspace.invalidate` empties THIS context's handle table
+    // and applies ``bridgeRetireObservation`` to its generation, its released
+    // set and its clock (now, never 0). No other context moves.
+    guard let retirement = workspace.invalidate(
+        id: contextID, reason: reason, now: Date().timeIntervalSince1970) else {
+        return ["released": 0, "context_id": contextID]
+    }
+    log("OBSERVATION_INVALIDATED reason=\(reason) context=\(contextID) handles=\(released) snapshot=\(retirement.retired) current=\(retirement.generation)")
+    return ["released": released, "invalidated_snapshot": retirement.retired, "snapshot": retirement.generation,
+            "context_id": contextID]
 }
 
 /// The authorization document as diagnostics, never as content.
@@ -1733,7 +1838,9 @@ func resolveElement(params: [String: Any]) -> (Int, AXUIElement)? {
     if let n = rawID as? Int { elementID = n }
     else if let n = rawID as? NSNumber { elementID = n.intValue }
     else { return nil }
-    guard let el = elementTable[elementID] else { return nil }
+    // Only the context this request resolved (``elementPreconditions``):
+    // the same number in another context is another element.
+    guard let el = requestHandle(elementID)?.element else { return nil }
     return (elementID, el)
 }
 
@@ -2071,10 +2178,10 @@ func uiSetValue(_ params: [String: Any]) -> [String: Any] {
     guard let (elementID, el) = resolveElement(params: params) else {
         return ["ok": false, "message": "The referenced UI element is no longer on screen."]
     }
-    if elementRoles[elementID] == "AXSecureTextField" {
+    if requestHandle(elementID)?.role == "AXSecureTextField" {
         return ["ok": false, "message": "secure fields are never modified automatically"]
     }
-    let role = elementRoles[elementID] ?? "AXUnknown"
+    let role = requestHandle(elementID)?.role ?? "AXUnknown"
     var settable: DarwinBoolean = false
     let settableErr = AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable)
     guard settableErr == .success, settable.boolValue else {
@@ -2221,31 +2328,21 @@ func elementPreconditions(
     kind: String, params: [String: Any], mode: BridgeInteractionMode
 ) -> BridgePolicyRefusal? {
     guard kind == "ui.press" || kind == "ui.set_value" || kind == "ui.scroll" else { return nil }
-    if let refusal = bridgeReleasedSnapshotRefusal(
-        requested: (params["snapshot"] as? NSNumber)?.intValue, releasedSnapshots: releasedSnapshots,
-        current: observationGeneration, mode: mode) {
-        return refusal
+    // Shared: ``BridgeWorkspace/resolveHandle`` — the caller's OWN context
+    // (no context id: the 0.3.2 default), then released, expired, superseded
+    // and unknown, in that order (a released generation has no age).
+    let contextID = params["context_id"] as? String
+    let resolved: BridgeResolvedHandle<BridgeLiveHandle>
+    switch workspace.resolveHandle(
+        principal: currentPrincipal, id: contextID,
+        snapshot: (params["snapshot"] as? NSNumber)?.intValue,
+        elementID: (params["element_id"] as? NSNumber)?.intValue,
+        mode: mode, now: Date().timeIntervalSince1970) {
+    case .failure(let refusal): return refusal
+    case .success(let found): resolved = found
     }
-    let now = Date().timeIntervalSince1970
-    if bridgeObservationExpired(capturedAt: observationCapturedAt, now: now, mode: mode) {
-        return BridgePolicyRefusal(
-            code: "ACTION_FAILED",
-            message: "The observation this element belongs to has expired; observe again.",
-            detail: "policy=\(mode.rawValue);reason=expired;age=\(Int(now - observationCapturedAt))s;snapshot=\(observationGeneration)")
-    }
-    let requested = (params["snapshot"] as? NSNumber)?.intValue
-    if let refusal = bridgeSnapshotRefusal(
-        current: observationGeneration, requested: requested, mode: mode) {
-        return refusal
-    }
-    guard let rawID = params["element_id"] as? NSNumber,
-          let context = elementContexts[rawID.intValue]
-    else {
-        return BridgePolicyRefusal(
-            code: "ACTION_FAILED",
-            message: "The referenced UI element is no longer on screen.",
-            detail: "policy=\(mode.rawValue);reason=unknown_element")
-    }
+    requestContext = resolved.context
+    let context = resolved.handle.context
     // The application that was authorized is the one that must still be there.
     guard let app = NSRunningApplication(processIdentifier: context.pid),
           !app.isTerminated,
@@ -2258,17 +2355,29 @@ func elementPreconditions(
     }
     // The window must be the same window, not merely a window with the same title.
     var currentTitle = context.windowTitle
-    if let element = elementTable[rawID.intValue] {
-        if let stored = context.window, let current = axElement(element, kAXWindowAttribute),
-           !CFEqual(current, stored) {
-            return BridgePolicyRefusal(
-                code: "ACTION_FAILED",
-                message: "The window this element belongs to has been replaced.",
-                detail: "policy=\(mode.rawValue);reason=window_changed;pid=\(context.pid)")
-        }
-        if let window = axElement(element, kAXWindowAttribute),
-           let title = axAttr(window, kAXTitleAttribute) as? String {
-            currentTitle = title
+    let element = resolved.handle.element
+    if let stored = context.window, let current = axElement(element, kAXWindowAttribute),
+       !CFEqual(current, stored) {
+        return BridgePolicyRefusal(
+            code: "ACTION_FAILED",
+            message: "The window this element belongs to has been replaced.",
+            detail: "policy=\(mode.rawValue);reason=window_changed;pid=\(context.pid)")
+    }
+    let currentWindow = axElement(element, kAXWindowAttribute) ?? context.window
+    if let currentWindow, let title = axAttr(currentWindow, kAXTitleAttribute) as? String {
+        currentTitle = title
+    }
+    // Same window is not same document: a tab switch keeps the window and
+    // changes what the handles were taken from. Verified identities only;
+    // explicit (0.3.3) contexts are also conservative with a title-only one.
+    if let observed = resolved.context.identity?.document {
+        let current = documentIdentity(
+            window: currentWindow,
+            webArea: observed.source == .axURL ? currentWebArea(of: currentWindow) : nil,
+            title: currentTitle)
+        if let refusal = bridgeDocumentRefusal(
+            observed: observed, current: current, strict: !resolved.context.legacy, mode: mode) {
+            return refusal
         }
     }
     // Authorization is re-evaluated with the CURRENT window title: a window
@@ -2291,9 +2400,9 @@ func actionTargetBundle(kind: String, params: [String: Any]) -> String? {
     switch kind {
     case "ui.press", "ui.set_value", "ui.scroll":
         guard let id = (params["element_id"] as? NSNumber)?.intValue,
-              let context = elementContexts[id]
+              let handle = requestHandle(id)
         else { return nil }
-        return context.bundleID
+        return handle.context.bundleID
     case "app.activate", "app.open":
         let request = (params["app"] as? String) ?? ""
         return runningApp(named: request)?.bundleIdentifier
@@ -2357,8 +2466,8 @@ func elementChromeRefusal(
     kind: String, params: [String: Any], mode: BridgeInteractionMode
 ) -> BridgePolicyRefusal? {
     guard kind == "ui.press", let id = (params["element_id"] as? NSNumber)?.intValue else { return nil }
-    var subrole = elementSubroles[id]
-    if subrole == nil, let element = elementTable[id] {
+    var subrole = requestHandle(id)?.subrole
+    if subrole == nil, let element = requestHandle(id)?.element {
         subrole = axAttr(element, kAXSubroleAttribute) as? String
     }
     return bridgeWindowChromeRefusal(kind: kind, subrole: subrole, mode: mode)
@@ -2367,16 +2476,30 @@ func elementChromeRefusal(
 /// The cached-frame read, factored out of `dispatch`.
 ///
 /// The socket path serves this WITHOUT the global dispatch lock. It touches no
-/// AppKit, AX or window-server resource — only the stream sink's own lock — and
-/// that lock is held for a capture or an action for hundreds of milliseconds.
-/// Queueing the mirror behind those would freeze the viewer exactly while
-/// something is happening, which is the one moment it must be live.
-func streamFrameResponse(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
-    let (frame, failure) = windowStreamFrame()
+/// AppKit, AX or window-server resource — only the stream registry's and the
+/// sink's own locks — and the global lock is held for a capture or an action
+/// for hundreds of milliseconds. Queueing the mirror behind those would freeze
+/// the viewer exactly while something is happening, which is the one moment it
+/// must be live. `principal` is resolved from the connection's verified peer:
+/// a frame is served only to the principal that opened the stream.
+func streamFrameResponse(_ arguments: [String: Any], principal: BridgePrincipal) -> (Bool, Any?, [String: Any?]?) {
+    var streamID: String?
+    if let raw = arguments["stream_id"] {
+        guard let text = raw as? String, bridgeValidOpaqueID(text, prefix: "str") else {
+            return (false, nil, bridgeError(code: "STREAM_UNKNOWN", message: "No such stream for this client.",
+                                            detail: "reason=stream_unknown"))
+        }
+        streamID = text
+    }
+    let (frame, failure) = windowStreamFrame(principal: principal, id: streamID)
     guard let frame else {
         // `stream_warming` is the normal first instant of a stream and
         // `stream_not_active` means the host must fall back to capture;
         // the detail says which, instead of one indistinguishable failure.
+        if failure == "stream_unknown" {
+            return (false, nil, bridgeError(code: "STREAM_UNKNOWN", message: "No such stream for this client.",
+                                            detail: "reason=stream_unknown"))
+        }
         return (false, nil, bridgeError(
             code: "ACTION_FAILED",
             message: "No live frame is available.",
@@ -2386,9 +2509,16 @@ func streamFrameResponse(_ arguments: [String: Any]) -> (Bool, Any?, [String: An
         "screenshot_base64": frame.jpeg.base64EncodedString(),
         "screenshot_scope": "window",
         "media_type": "image/jpeg",
+        "stream_id": frame.streamID,
+        "key": frame.key as Any,
         "frame_index": frame.frameIndex,
         "frame_age_ms": frame.ageMilliseconds,
-        "stale": frame.stale,
+        // Never "live" over an old picture: the phase is the stream's health,
+        // not the presence of an image.
+        "phase": frame.health.phase.rawValue,
+        "phase_reason": frame.health.reason as Any,
+        "unchanged": frame.health.unchanged,
+        "stale": frame.health.phase != .live,
         "view_identity": [
             "bundle": frame.bundleID,
             "pid": frame.pid,
@@ -2396,6 +2526,592 @@ func streamFrameResponse(_ arguments: [String: Any]) -> (Bool, Any?, [String: An
             "window_id": frame.windowID,
         ],
     ], nil)
+}
+
+// MARK: - Workspace operations (0.3.3)
+
+/// The workspace contract this helper implements, for hosts and adapters.
+let workspaceContractName = "cmm-computer-use/workspace"
+let workspaceContractVersion = 1
+
+/// A request field that must be an opaque context id when present.
+/// `.success(nil)`: absent (the 0.3.2 default context).
+func contextIDArgument(_ arguments: [String: Any], _ key: String = "context_id") -> Result<String?, BridgePolicyRefusal> {
+    guard let raw = arguments[key], !(raw is NSNull) else { return .success(nil) }
+    guard let text = raw as? String, bridgeValidContextID(text) else { return .failure(bridgeUnknownContextRefusal()) }
+    return .success(text)
+}
+
+/// Contexts nobody used for `idleSeconds` are dropped with their handles and
+/// their streams. Run before every workspace operation; cheap.
+func reapIdleContexts() {
+    for record in workspace.reap(now: Date().timeIntervalSince1970) {
+        if let streamID = record.streamID { stopWindowStreamInternal(id: streamID, reason: "context_reaped") }
+        log("CONTEXT_REAPED context=\(record.id) label=\(record.label) handles=\(record.handles.count)")
+    }
+}
+
+func principalSummary() -> [String: Any] {
+    [
+        "strength": currentPrincipal.strength.rawValue,
+        "client_id": currentClient?.clientID ?? "",
+    ]
+}
+
+func workspaceLimits() -> [String: Any] {
+    [
+        "max_contexts_per_client": workspace.limits.maxContextsPerPrincipal,
+        "max_contexts": workspace.limits.maxContextsTotal,
+        "max_streams": 2,
+        "context_idle_seconds": Int(workspace.limits.idleSeconds),
+    ]
+}
+
+func contextDescription(_ record: BridgeContextRecord<BridgeLiveHandle>, mode: BridgeInteractionMode) -> [String: Any] {
+    var summary = bridgeContextSummary(record, now: Date().timeIntervalSince1970, mode: mode)
+    if let streamID = record.streamID { summary["stream"] = streamDescription(id: streamID) }
+    return summary
+}
+
+func workspaceStatus() -> (Bool, Any?, [String: Any?]?) {
+    reapIdleContexts()
+    let streams: Any
+    switch windowStreamStatus(id: nil) {
+    case .success(let status): streams = status["streams"] ?? []
+    case .failure: streams = []
+    }
+    return (true, [
+        "contract": workspaceContractName,
+        "contract_version": workspaceContractVersion,
+        "instance_id": helperInstanceID,
+        "principal": principalSummary(),
+        "limits": workspaceLimits(),
+        "contexts": workspace.list(principal: currentPrincipal).map { contextDescription($0, mode: deploymentMode) },
+        "streams": streams,
+    ], nil)
+}
+
+/// Open an explicit context, optionally bound to one application. The app
+/// must be running and authorized for `observe` FOR THIS CLIENT: a context is
+/// never a way to reach an application the policy does not grant.
+func contextCreate(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    reapIdleContexts()
+    if let refusal = clientRequiredRefusal(operation: "workspace.context_create") {
+        return (false, nil, refusalFrame(refusal))
+    }
+    var bound: String?
+    let request = ((arguments["app"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !request.isEmpty {
+        guard let running = runningApp(named: request) else {
+            return (false, nil, refusalFrame(BridgePolicyRefusal(
+                code: "COMPUTER_TARGET_UNAVAILABLE", message: "application not running: \(request)",
+                detail: "target=app")))
+        }
+        let owner = bridgeTargetApp(running)
+        if let refusal = authorization.decision(
+            bundleID: owner.bundleID, name: owner.name, windowTitle: nil, scope: .observe, client: currentClient
+        ).refusal {
+            return (false, nil, refusalFrame(refusal))
+        }
+        bound = owner.bundleID
+    }
+    switch workspace.create(principal: currentPrincipal, target: bound, now: Date().timeIntervalSince1970) {
+    case .failure(let refusal):
+        return (false, nil, refusalFrame(refusal))
+    case .success(let record):
+        log("CONTEXT_CREATED context=\(record.id) label=\(record.label) bound=\(bound ?? "-")")
+        var result = contextDescription(record, mode: deploymentMode)
+        result["instance_id"] = helperInstanceID
+        return (true, result, nil)
+    }
+}
+
+func contextStatus(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    reapIdleContexts()
+    let requested: String?
+    switch contextIDArgument(arguments) {
+    case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+    case .success(let id): requested = id
+    }
+    switch workspace.context(principal: currentPrincipal, id: requested, now: Date().timeIntervalSince1970) {
+    case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+    case .success(let record):
+        var result = contextDescription(record, mode: deploymentMode)
+        result["instance_id"] = helperInstanceID
+        return (true, result, nil)
+    }
+}
+
+/// Close a context: its handles are dropped and its stream is stopped.
+/// Idempotent for the owner.
+func contextClose(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    guard case .success(let requested) = contextIDArgument(arguments), let id = requested else {
+        return (false, nil, refusalFrame(bridgeUnknownContextRefusal()))
+    }
+    switch workspace.close(principal: currentPrincipal, id: id) {
+    case .failure(let refusal):
+        return (false, nil, refusalFrame(refusal))
+    case .success(let closed):
+        if let streamID = closed.streamID { stopWindowStreamInternal(id: streamID, reason: "context_closed") }
+        if closed.closed { log("CONTEXT_CLOSED context=\(id) handles=\(closed.releasedHandles)") }
+        return (true, [
+            "context_id": id, "closed": closed.closed, "already_closed": closed.alreadyClosed,
+            "released_handles": closed.releasedHandles, "stream_stopped": closed.streamID != nil,
+        ], nil)
+    }
+}
+
+// MARK: - Operation ledger (0.3.3 Reliability Engine)
+
+/// Operation ids received but not yet answered, across connections. A resend
+/// of an id that is still in flight is refused (`OPERATION_IN_PROGRESS`)
+/// instead of executing beside the first.
+private let pendingOperationsLock = NSLock()
+nonisolated(unsafe) private var pendingOperations: Set<String> = []
+
+func beginPendingOperation(_ opID: String) -> Bool {
+    pendingOperationsLock.lock()
+    defer { pendingOperationsLock.unlock() }
+    return pendingOperations.insert(opID).inserted
+}
+
+func endPendingOperation(_ opID: String) {
+    pendingOperationsLock.lock()
+    pendingOperations.remove(opID)
+    pendingOperationsLock.unlock()
+}
+
+func operationIsPending(_ opID: String) -> Bool {
+    pendingOperationsLock.lock()
+    defer { pendingOperationsLock.unlock() }
+    return pendingOperations.contains(opID)
+}
+
+/// Attach the execution facts to a response frame, success or failure.
+func annotated(_ frame: (Bool, Any?, [String: Any?]?), execution: [String: Any])
+    -> (Bool, Any?, [String: Any?]?)
+{
+    var (ok, result, error) = frame
+    if ok {
+        var payload = (result as? [String: Any]) ?? [:]
+        payload["execution"] = execution
+        result = payload
+    } else {
+        var failure = error ?? bridgeError(code: "ACTION_FAILED", message: "The computer action could not be executed.")
+        failure["execution"] = execution
+        error = failure
+    }
+    return (ok, result, error)
+}
+
+/// `action.execute` with the operation ledger around it.
+///
+/// * A response always says whether the action was handed to the machine
+///   (`execution.executed`) and its outcome: `not_executed` (refused before
+///   anything ran — safe to send again), `succeeded` or `failed`.
+/// * With an `op_id`, an executed outcome is recorded; resending the SAME id
+///   for the SAME action replays it (`replayed: true`) and never runs it
+///   again; the same id for a different action is refused.
+func executeActionWithLedger(arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    var opID: String?
+    if let raw = arguments["op_id"], !(raw is NSNull) {
+        guard let text = raw as? String, bridgeValidOperationID(text) else {
+            return annotated((false, nil, bridgeError(
+                code: "CAPABILITY_UNSUPPORTED", message: "op_id must be 8-80 characters of [A-Za-z0-9_-].",
+                detail: "reason=invalid_op_id")),
+                execution: ["executed": false, "outcome": BridgeExecutionOutcome.notExecuted.rawValue,
+                            "instance_id": helperInstanceID, "replayed": false])
+        }
+        opID = text
+    }
+    let kind = (arguments["kind"] as? String) ?? ""
+    var params = (arguments["params"] as? [String: Any]) ?? [:]
+    if params["context_id"] == nil, let contextID = arguments["context_id"] as? String { params["context_id"] = contextID }
+    let fingerprint = bridgeActionFingerprint(kind: kind, contextID: params["context_id"] as? String, params: params)
+    if let opID {
+        switch operationLedger.lookup(principal: currentPrincipal, opID: opID, fingerprint: fingerprint) {
+        case .replay(let outcome, let frame):
+            log("OPERATION_REPLAYED op=\(opID) kind=\(kind) outcome=\(outcome.rawValue)")
+            return annotated((frame.ok, frame.result, frame.error), execution: [
+                "executed": true, "outcome": outcome.rawValue, "op_id": opID,
+                "instance_id": helperInstanceID, "replayed": true])
+        case .conflict:
+            return annotated((false, nil, bridgeError(
+                code: "OPERATION_ID_CONFLICT",
+                message: "This op_id was already used for a different action; nothing was executed.",
+                detail: "reason=op_id_conflict")),
+                execution: ["executed": false, "outcome": BridgeExecutionOutcome.notExecuted.rawValue,
+                            "op_id": opID, "instance_id": helperInstanceID, "replayed": false])
+        case .new:
+            break
+        }
+    }
+    var executed = false
+    let frame = executeActionRequest(arguments: arguments, executed: &executed)
+    let outcome = bridgeExecutionOutcome(executed: executed, ok: frame.0)
+    var execution: [String: Any] = [
+        "executed": executed, "outcome": outcome.rawValue,
+        "instance_id": helperInstanceID, "replayed": false,
+    ]
+    if let opID { execution["op_id"] = opID }
+    if let contextID = requestContext?.id { execution["context_id"] = contextID }
+    let answer = annotated(frame, execution: execution)
+    if executed, let opID {
+        operationLedger.record(
+            principal: currentPrincipal, opID: opID, fingerprint: fingerprint, outcome: outcome,
+            payload: BridgeLedgerFrame(ok: answer.0, result: answer.1, error: answer.2),
+            at: Date().timeIntervalSince1970)
+    }
+    return answer
+}
+
+/// What happened to one operation id of the caller. `unknown` is a real
+/// answer: an id the ledger never recorded may still have run (the helper
+/// restarted, or the request is still queued), so it is never `not_executed`.
+func actionOutcome(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    guard let opID = arguments["op_id"] as? String, bridgeValidOperationID(opID) else {
+        return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "action.outcome needs a valid op_id.",
+                                        detail: "reason=invalid_op_id"))
+    }
+    if let record = operationLedger.outcome(principal: currentPrincipal, opID: opID) {
+        return (true, [
+            "op_id": opID, "known": true, "outcome": record.outcome.rawValue,
+            "ok": record.payload.ok, "at": record.at, "instance_id": helperInstanceID,
+        ], nil)
+    }
+    let inFlight = operationIsPending(opID)
+    return (true, [
+        "op_id": opID, "known": false,
+        "outcome": inFlight ? "in_progress" : BridgeExecutionOutcome.unknown.rawValue,
+        "instance_id": helperInstanceID,
+        "reason": inFlight ? "in_progress" : "not_recorded_by_this_instance",
+    ], nil)
+}
+
+// MARK: - Observation operations with contexts
+
+func captureScreenRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    let app = (arguments["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let title = (arguments["window_title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let hasWindowTarget = !(title ?? "").isEmpty
+    let resolved = effectiveMode(arguments)
+    if let refusal = resolved.refusal {
+        return (false, nil, refusalFrame(refusal))
+    }
+    // One authorized window at a time. Under per-app authorization a
+    // display capture would include windows this deployment never granted,
+    // so it is refused rather than special-cased.
+    if let refusal = bridgeAuthorizedCaptureDecision(
+        mode: resolved.mode, hasWindowTarget: hasWindowTarget,
+        authorizationLoaded: authorization.loaded).refusal {
+        return (false, nil, refusalFrame(refusal))
+    }
+    // The capture is tied to the caller's context generation (its own; a
+    // foreign context id is refused like an unknown one).
+    let context: BridgeContextRecord<BridgeLiveHandle>
+    switch contextIDArgument(arguments).flatMap({
+        workspace.context(principal: currentPrincipal, id: $0, now: Date().timeIntervalSince1970)
+    }) {
+    case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+    case .success(let found): context = found
+    }
+    let outcome = captureWindowBase64(
+        app: (app?.isEmpty ?? true) ? nil : app, title: title ?? "", snapshot: context.generation)
+    if let refusal = outcome.refusal {
+        return (false, nil, refusalFrame(refusal))
+    }
+    guard let b64 = outcome.image else {
+        return (false, nil, bridgeError(
+            code: "ACTION_FAILED",
+            message: "The window could not be captured.",
+            detail: outcome.failure ?? ""))
+    }
+    var result: [String: Any] = ["screenshot_base64": b64, "screenshot_scope": "window"]
+    if var identity = outcome.identity {
+        if !context.legacy {
+            identity["context_id"] = context.id
+            identity["context_label"] = context.label
+        }
+        result["view_identity"] = identity
+    }
+    return (true, result, nil)
+}
+
+func streamStartRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    reapIdleContexts()
+    var app = (arguments["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let title = ((arguments["window_title"] as? String) ?? "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    // `window_id` is preferred when the client has it: a title follows the
+    // active tab and a stream keyed on it dies on the next navigation.
+    var requestedWindowID = (arguments["window_id"] as? Int)
+        ?? (arguments["window_id"] as? NSNumber)?.intValue
+    var expectedBundle = (arguments["expected_bundle"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    var expectedPID = (arguments["expected_pid"] as? NSNumber)?.int32Value
+    let resolved = effectiveMode(arguments)
+    if let refusal = resolved.refusal {
+        return (false, nil, refusalFrame(refusal))
+    }
+    // The slot: a context the caller owns (bound to it: its identity is the
+    // expectation), a client label, or nothing (the 0.3.2 single stream).
+    var key: String?
+    var context: BridgeContextRecord<BridgeLiveHandle>?
+    switch contextIDArgument(arguments) {
+    case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+    case .success(let contextID?):
+        switch workspace.context(principal: currentPrincipal, id: contextID, now: Date().timeIntervalSince1970) {
+        case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+        case .success(let found): context = found
+        }
+        key = contextID
+        if let identity = context?.identity {
+            expectedBundle = expectedBundle ?? identity.bundleID
+            expectedPID = expectedPID ?? identity.pid
+            if requestedWindowID == nil, title.isEmpty { requestedWindowID = identity.windowID }
+            if (app ?? "").isEmpty { app = identity.bundleID }
+        } else if let bound = context?.boundBundle {
+            expectedBundle = expectedBundle ?? bound
+            if (app ?? "").isEmpty { app = bound }
+        }
+    case .success(nil):
+        if let label = arguments["stream_key"] as? String {
+            guard bridgeValidStreamKey(label) else {
+                return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED",
+                                                message: "stream_key must be 1-80 characters of [A-Za-z0-9_-].",
+                                                detail: "reason=invalid_stream_key"))
+            }
+            key = "key:" + label
+        }
+    }
+    // A stream is a capture that keeps happening: the same
+    // one-authorized-window rule and the same `.observe` grant apply, and
+    // they are decided before any surface is opened.
+    if let refusal = bridgeAuthorizedCaptureDecision(
+        mode: resolved.mode,
+        hasWindowTarget: !title.isEmpty || requestedWindowID != nil,
+        authorizationLoaded: authorization.loaded).refusal {
+        return (false, nil, refusalFrame(refusal))
+    }
+    let started = startWindowStream(
+        app: (app?.isEmpty ?? true) ? nil : app, title: title, windowID: requestedWindowID,
+        key: key, expectedBundle: expectedBundle, expectedPID: expectedPID)
+    if let refusal = started.refusal {
+        return (false, nil, refusalFrame(refusal))
+    }
+    guard var result = started.result else {
+        return (false, nil, bridgeError(
+            code: "ACTION_FAILED",
+            message: "The window stream could not be started.",
+            detail: started.failure ?? ""))
+    }
+    if let context {
+        workspace.bindStream(id: context.id, streamID: result["stream_id"] as? String)
+        result["context_id"] = context.id
+        result["context_label"] = context.label
+    }
+    return (true, result, nil)
+}
+
+/// The stream an operation names: `stream_id`, else the stream bound to
+/// `context_id`, else (neither) the caller's 0.3.2 stream.
+func streamIDArgument(_ arguments: [String: Any]) -> Result<String?, BridgePolicyRefusal> {
+    if let raw = arguments["stream_id"], !(raw is NSNull) {
+        guard let text = raw as? String, bridgeValidOpaqueID(text, prefix: "str") else {
+            return .failure(BridgePolicyRefusal(code: "STREAM_UNKNOWN", message: "No such stream for this client.",
+                                                detail: "reason=stream_unknown"))
+        }
+        return .success(text)
+    }
+    switch contextIDArgument(arguments) {
+    case .failure(let refusal): return .failure(refusal)
+    case .success(nil): return .success(nil)
+    case .success(let contextID?):
+        switch workspace.context(principal: currentPrincipal, id: contextID, now: Date().timeIntervalSince1970) {
+        case .failure(let refusal): return .failure(refusal)
+        case .success(let record):
+            guard let streamID = record.streamID else {
+                return .failure(BridgePolicyRefusal(code: "STREAM_UNKNOWN", message: "This context has no stream.",
+                                                    detail: "reason=context_has_no_stream"))
+            }
+            return .success(streamID)
+        }
+    }
+}
+
+/// One `action.execute`, unchanged in its checks and their order since 0.3.2,
+/// now resolving element handles inside the caller's context. `executed`
+/// becomes true exactly when the action is handed to the machine, so the
+/// caller can name the outcome (`not_executed` vs `succeeded`/`failed`).
+func executeActionRequest(
+    arguments: [String: Any], executed: inout Bool
+) -> (Bool, Any?, [String: Any?]?) {
+    guard let kind = arguments["kind"] as? String, !kind.isEmpty else {
+        return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "The action has no kind."))
+    }
+    let rawParams = arguments["params"]
+    guard rawParams == nil || rawParams is [String: Any] else {
+        return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "The action params are invalid."))
+    }
+    var params = (rawParams as? [String: Any]) ?? [:]
+    // The context may travel beside the params (as `observe` takes it) or
+    // inside them (beside the snapshot and element id it qualifies).
+    if params["context_id"] == nil, let contextID = arguments["context_id"] as? String {
+        params["context_id"] = contextID
+    }
+    guard allowedActions.contains(kind) else {
+        return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "Unsupported action: \(kind)"))
+    }
+    // Policy BEFORE anything touches the machine: a refused action must
+    // leave no trace on the person's session, not even a click that is
+    // then reported as forbidden.
+    let resolved = effectiveMode(arguments)
+    if let refusal = resolved.refusal {
+        log("refused \(kind) invalid policy")
+        return (false, nil, refusalFrame(refusal))
+    }
+    let mode = resolved.mode
+    if let refusal = bridgeGlobalInputDecision(
+        kind: kind, mode: mode, authorizationLoaded: authorization.loaded).refusal {
+        log("refused \(kind) policy=\(mode.rawValue)")
+        return (false, nil, refusalFrame(refusal))
+    }
+    // Authorization is decided BEFORE the action: a refused target must not
+    // be touched, and the refusal must say which grant was missing.
+    if let refusal = actionAuthorizationRefusal(kind: kind, params: params) {
+        log("refused \(kind) authorization: \(refusal.detail)")
+        return (false, nil, refusalFrame(refusal))
+    }
+    if let refusal = elementPreconditions(kind: kind, params: params, mode: mode) {
+        log("refused \(kind) stale-or-expired observation")
+        return (false, nil, refusalFrame(refusal))
+    }
+    // Measure the invariant around EVERY executed action, success or
+    // failure, and sample DURING it: a before/after pair cannot see a
+    // window that raises itself and drops back.
+    let targetBundle = actionTargetBundle(kind: kind, params: params)
+    if let refusal = elementChromeRefusal(kind: kind, params: params, mode: mode) {
+        log("refused \(kind) window chrome")
+        return (false, nil, refusalFrame(refusal))
+    }
+    // The latch is persistent and independent of the mode a request asks
+    // for: a target that breached stays suspended until CMM Console rearms
+    // it. A latch file that cannot be trusted suspends ALL control.
+    let isControl = bridgeActionClass(kind: kind) == .accessibility
+        && kind != "wait" && kind != "finish"
+    if let refusal = bridgeLatchRefusal(
+        load: breachLatch, targetBundle: targetBundle, isControl: isControl, mode: mode) {
+        log("refused \(kind) breach latch: \(refusal.detail)")
+        return (false, nil, refusalFrame(refusal))
+    }
+    let actionClass = bridgeActionClass(kind: kind) ?? .accessibility
+    let origin = ProcessInfo.processInfo.systemUptime
+    let before = currentEnvironment(origin: origin)
+    let sampler = InterferenceSampler(origin: origin)
+    sampler.start()
+    // From here on the action has been handed to the machine: whatever the
+    // answer, its outcome is `succeeded` or `failed`, never `not_executed`.
+    executed = true
+    let result = executeAction(kind: kind, params: params)
+    // AXPerformAction returns before the window server has acted on what
+    // it triggered. Keep measuring for a bounded settle window instead of
+    // stopping at return — stopping at return is how a press that made
+    // the target frontmost was recorded as `untouched`.
+    if kind != "wait" && kind != "finish" {
+        let window = bridgeSettleWindow(actionClass: actionClass)
+        let returnedAt = ProcessInfo.processInfo.systemUptime
+        while bridgeShouldKeepSettling(
+            window: window,
+            elapsed: ProcessInfo.processInfo.systemUptime - returnedAt,
+            sinceLastChange: sampler.sinceLastChange) {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+    let samples = sampler.stop()
+    let after = currentEnvironment(origin: origin)
+    let report = bridgeInterferenceReport(
+        before: before, after: after, samples: samples,
+        actionClass: actionClass, mode: mode,
+        targetBundle: targetBundle)
+    if report.breach {
+        // The action ran; the promise did not hold. FAIL CLOSED and STOP:
+        // the call is a failure (never success with a footnote) and the
+        // target is latched, durably and audited. Nothing is activated to
+        // "undo" it: re-activating the person's previous application would
+        // be a second interference caused by Computer Use.
+        log("INTERFERENCE_BREACH kind=\(kind) verdict=\(report.verdict.rawValue) transient=\(report.transientFocusChanges) restored=\(report.restored) before=\(report.frontmostBefore) after=\(report.frontmostAfter) target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-") observed_for_ms=\(report.observedForMs)")
+        var breachID = ""
+        if let targetBundle {
+            let record = BridgeBreachRecord(
+                id: UUID().uuidString.lowercased(), targetBundle: targetBundle,
+                targetName: (params["element_id"] as? NSNumber)
+                    .flatMap { requestHandle($0.intValue)?.context.appName } ?? "",
+                clientID: currentClient?.clientID ?? "", kind: kind, policy: mode.rawValue,
+                at: Date().timeIntervalSince1970, verdict: report.verdict.rawValue,
+                focusBecameTarget: report.focusBecameTarget,
+                windowRaisedOverPerson: report.windowRaisedOverPerson,
+                targetFrontAtMs: report.targetFrontAtMs)
+            breachID = record.id
+            // An invalid latch already suspends everything; keep it invalid.
+            if var state = breachLatch.state {
+                state.latch(record)
+                breachLatch = .loaded(state)
+                let durable = saveBreachLatch(state)
+                appendBreachAudit(bridgeBreachAuditEntry(
+                    event: durable ? "latched" : "latch_write_failed",
+                    at: record.at, record: record, actorClientID: record.clientID,
+                    actorSigningID: currentPeer?.identifier, reason: nil))
+            }
+        }
+        var error = bridgeError(
+            code: "INTERFERENCE_BREACH",
+            message: "The action brought the target application in front of the person's work in a mode that promised no interference. Control of it is suspended until CMM Console rearms it.",
+            detail: "policy=\(mode.rawValue);reason=breach;kind=\(kind);action_ok=\(result["ok"] as? Bool == true)" + (breachID.isEmpty ? "" : ";breach_id=\(breachID)"))
+        error["interference"] = report.dictionary()
+        return (false, nil, error)
+    }
+    if report.requiresReobserve {
+        // The PERSON brought the target in front while this action ran:
+        // not a breach, nothing is latched. But the screen is no longer
+        // what the element handles described, so the generation is retired
+        // exactly as `observation.release` does: the next action on an old
+        // handle is refused (`reason=released`, no age) before any UI is
+        // touched, until the client observes again. Never retried here.
+        // Only the AFFECTED context: the one whose handle the action used,
+        // or — for an action without a handle — the caller's contexts on
+        // the target application plus its 0.3.2 default.
+        let affected = requestContext.map { [$0.id] }
+            ?? workspace.list(principal: currentPrincipal)
+                .filter { $0.legacy || $0.identity?.bundleID == targetBundle }.map { $0.id }
+        for contextID in affected {
+            invalidateObservation(contextID: contextID, reason: "user_takeover")
+        }
+        log("USER_TAKEOVER kind=\(kind) attribution=\(report.focusChangeAttribution.rawValue) input=\(report.humanInputKind?.rawValue ?? "-") age_ms=\(report.humanInputAgeMs.map { String($0) } ?? "-") target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-")")
+    }
+    if result["unsupported"] as? Bool == true {
+        var error = bridgeError(
+            code: "CAPABILITY_UNSUPPORTED",
+            message: result["message"] as? String ?? "The action is not supported for this element.",
+            detail: "policy=\(mode.rawValue);kind=\(kind);" + (result["detail"] as? String ?? ""))
+        error["interference"] = report.dictionary()
+        if let scroll = result["scroll"] { error["scroll"] = scroll }
+        if let setValue = result["set_value"] { error["set_value"] = setValue }
+        return (false, nil, error)
+    }
+    if result["ok"] as? Bool == true {
+        var payload = result
+        payload["interference"] = report.dictionary()
+        return (true, payload, nil)
+    }
+    // A failed action still reports what it did to the session: the ledger
+    // is evidence, not a decoration on success.
+    var error = bridgeError(
+        code: kind == "app.open" ? "COMPUTER_TARGET_UNAVAILABLE" : "ACTION_FAILED",
+        message: result["message"] as? String ?? "The computer action could not be executed.",
+        detail: (result["detail"] as? String).map { "policy=\(mode.rawValue);kind=\(kind);" + $0 } ?? "")
+    error["interference"] = report.dictionary()
+    if let scroll = result["scroll"] { error["scroll"] = scroll }
+    if let setValue = result["set_value"] { error["set_value"] = setValue }
+    return (false, nil, error)
 }
 
 func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
@@ -2459,11 +3175,26 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                 // Requirements can be compiled and evaluated on demand, so a
                 // host validates before writing instead of after failing.
                 "requirement_validation": true,
+                // 0.3.3 Multi-App Workspace: per-client contexts with their
+                // own generations and handles, up to two concurrent streams,
+                // per-stream health/recovery, and the operation ledger.
+                "workspace": [
+                    "contract": workspaceContractName,
+                    "contract_version": workspaceContractVersion,
+                    "max_contexts_per_client": workspace.limits.maxContextsPerPrincipal,
+                    "max_streams": 2,
+                    "document_identity": true,
+                    "operation_ledger": true,
+                    "stream_recovery": true,
+                ] as [String: Any],
             ],
             "requirement_contract": bridgeRequirementContractVersion,
-            // Live-stream diagnostics (no frame, no pixels): whether a stream
-            // is open, on which window, and how healthy its delivery is.
-            "window_stream": windowStreamStatus(),
+            // Random per process: a change means the helper restarted and
+            // every context, stream and recorded outcome is gone.
+            "instance_id": helperInstanceID,
+            // Live-stream diagnostics (no frame, no pixels): counts for every
+            // client, details only for the caller's own 0.3.2 stream.
+            "window_stream": windowStreamSummary(),
         ], nil)
     case "policy.status":
         return (true, authorizationStatus(), nil)
@@ -2482,9 +3213,17 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         // Re-read the user-owned allowlist. It can only re-apply
         // min(launch flag, file mode), so a reload never widens what the
         // process was launched with.
-        authorization = loadAuthorizationPolicy()
+        let reloaded = loadAuthorizationPolicy()
+        authorizationLock.lock()
+        authorization = reloaded
+        authorizationLock.unlock()
         applyDeploymentModes()
         reloadBreachLatch()
+        // A stream is a capture that keeps happening: one whose window the new
+        // policy no longer grants to its owner stops now, not at its next frame.
+        revalidateWindowStreams { principal in
+            reloaded.clients.first { "client:" + $0.clientID == principal.key }
+        }
         return (true, authorizationStatus(), nil)
     case "permissions.status":
         return (true, permissionStatus(), nil)
@@ -2504,10 +3243,17 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         if let refusal = resolved.refusal {
             return (false, nil, refusalFrame(refusal))
         }
+        reapIdleContexts()
+        let contextID: String?
+        switch contextIDArgument(arguments) {
+        case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+        case .success(let id): contextID = id
+        }
         let (result, refusal) = describe(
             includeScreenshot: include, targetApp: target, mode: resolved.mode,
             includeDiagnostics: (arguments["include_ax_diagnostics"] as? Bool) ?? false,
-            elementFilter: (arguments["element_filter"] as? String) ?? "")
+            elementFilter: (arguments["element_filter"] as? String) ?? "",
+            contextID: contextID)
         if let refusal {
             return (false, nil, refusalFrame(refusal))
         }
@@ -2516,229 +3262,68 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         }
         return (true, result, nil)
     case "observation.release":
-        return (true, releaseObservation(), nil)
+        let released: (result: [String: Any]?, refusal: BridgePolicyRefusal?)
+        switch contextIDArgument(arguments) {
+        case .failure(let refusal): released = (nil, refusal)
+        case .success(let id): released = releaseObservation(contextID: id)
+        }
+        if let refusal = released.refusal { return (false, nil, refusalFrame(refusal)) }
+        return (true, released.result ?? [:], nil)
     case "observation.capture_screen":
-        let app = (arguments["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = (arguments["window_title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasWindowTarget = !(title ?? "").isEmpty
-        let resolved = effectiveMode(arguments)
-        if let refusal = resolved.refusal {
-            return (false, nil, refusalFrame(refusal))
-        }
-        // One authorized window at a time. Under per-app authorization a
-        // display capture would include windows this deployment never granted,
-        // so it is refused rather than special-cased.
-        if let refusal = bridgeAuthorizedCaptureDecision(
-            mode: resolved.mode, hasWindowTarget: hasWindowTarget,
-            authorizationLoaded: authorization.loaded).refusal {
-            return (false, nil, refusalFrame(refusal))
-        }
-        let outcome = captureWindowBase64(
-            app: (app?.isEmpty ?? true) ? nil : app, title: title ?? "")
-        if let refusal = outcome.refusal {
-            return (false, nil, refusalFrame(refusal))
-        }
-        guard let b64 = outcome.image else {
-            return (false, nil, bridgeError(
-                code: "ACTION_FAILED",
-                message: "The window could not be captured.",
-                detail: outcome.failure ?? ""))
-        }
-        var result: [String: Any] = ["screenshot_base64": b64, "screenshot_scope": "window"]
-        if let identity = outcome.identity { result["view_identity"] = identity }
-        return (true, result, nil)
+        return captureScreenRequest(arguments)
     case "observation.stream_start":
-        let app = (arguments["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = ((arguments["window_title"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // `window_id` is preferred when the client has it: a title follows the
-        // active tab and a stream keyed on it dies on the next navigation.
-        let requestedWindowID = (arguments["window_id"] as? Int)
-            ?? (arguments["window_id"] as? NSNumber)?.intValue
-        let resolved = effectiveMode(arguments)
-        if let refusal = resolved.refusal {
-            return (false, nil, refusalFrame(refusal))
-        }
-        // A stream is a capture that keeps happening: the same
-        // one-authorized-window rule and the same `.observe` grant apply, and
-        // they are decided before any surface is opened.
-        if let refusal = bridgeAuthorizedCaptureDecision(
-            mode: resolved.mode,
-            hasWindowTarget: !title.isEmpty || requestedWindowID != nil,
-            authorizationLoaded: authorization.loaded).refusal {
-            return (false, nil, refusalFrame(refusal))
-        }
-        let started = startWindowStream(
-            app: (app?.isEmpty ?? true) ? nil : app, title: title,
-            windowID: requestedWindowID)
-        if let refusal = started.refusal {
-            return (false, nil, refusalFrame(refusal))
-        }
-        guard let identity = started.identity else {
-            return (false, nil, bridgeError(
-                code: "ACTION_FAILED",
-                message: "The window stream could not be started.",
-                detail: started.failure ?? ""))
-        }
-        return (true, ["stream": "started", "view_identity": identity], nil)
+        return streamStartRequest(arguments)
     case "observation.stream_stop":
-        // Idempotent: stopping nothing is a success, so a client can tear down
-        // on every exit path without tracking whether it started one.
-        return (true, stopWindowStream(), nil)
+        // Idempotent: stopping nothing (or something already stopped) is a
+        // success, so a client can tear down on every exit path. Only the
+        // caller's own streams can be named.
+        switch streamIDArgument(arguments).flatMap({ stopWindowStream(id: $0) }) {
+        case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+        case .success(let result):
+            if let streamID = result["stream_id"] as? String,
+               let bound = workspace.list(principal: currentPrincipal).first(where: { $0.streamID == streamID }) {
+                workspace.bindStream(id: bound.id, streamID: nil)
+            }
+            return (true, result, nil)
+        }
     case "observation.stream_frame":
-        return streamFrameResponse(arguments)
+        return streamFrameResponse(arguments, principal: currentPrincipal)
+    case "observation.stream_status":
+        switch streamIDArgument(arguments).flatMap({ windowStreamStatus(id: $0) }) {
+        case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+        case .success(let result): return (true, result, nil)
+        }
+    case "observation.stream_recover":
+        switch streamIDArgument(arguments) {
+        case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+        case .success(nil):
+            return (false, nil, bridgeError(code: "STREAM_UNKNOWN", message: "stream_recover names one stream.",
+                                            detail: "reason=stream_unknown"))
+        case .success(let streamID?):
+            switch recoverWindowStream(id: streamID) {
+            case .failure(let refusal): return (false, nil, refusalFrame(refusal))
+            case .success(let result): return (true, result, nil)
+            }
+        }
+    case "workspace.status":
+        return workspaceStatus()
+    case "workspace.context_create":
+        return contextCreate(arguments)
+    case "workspace.context_list":
+        reapIdleContexts()
+        return (true, [
+            "contexts": workspace.list(principal: currentPrincipal).map { contextDescription($0, mode: deploymentMode) },
+            "limits": workspaceLimits(),
+            "instance_id": helperInstanceID,
+        ], nil)
+    case "workspace.context_status":
+        return contextStatus(arguments)
+    case "workspace.context_close":
+        return contextClose(arguments)
+    case "action.outcome":
+        return actionOutcome(arguments)
     case "action.execute":
-        guard let kind = arguments["kind"] as? String, !kind.isEmpty else {
-            return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "The action has no kind."))
-        }
-        let rawParams = arguments["params"]
-        guard rawParams == nil || rawParams is [String: Any] else {
-            return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "The action params are invalid."))
-        }
-        let params = (rawParams as? [String: Any]) ?? [:]
-        guard allowedActions.contains(kind) else {
-            return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "Unsupported action: \(kind)"))
-        }
-        // Policy BEFORE anything touches the machine: a refused action must
-        // leave no trace on the person's session, not even a click that is
-        // then reported as forbidden.
-        let resolved = effectiveMode(arguments)
-        if let refusal = resolved.refusal {
-            log("refused \(kind) invalid policy")
-            return (false, nil, refusalFrame(refusal))
-        }
-        let mode = resolved.mode
-        if let refusal = bridgeGlobalInputDecision(
-            kind: kind, mode: mode, authorizationLoaded: authorization.loaded).refusal {
-            log("refused \(kind) policy=\(mode.rawValue)")
-            return (false, nil, refusalFrame(refusal))
-        }
-        // Authorization is decided BEFORE the action: a refused target must not
-        // be touched, and the refusal must say which grant was missing.
-        if let refusal = actionAuthorizationRefusal(kind: kind, params: params) {
-            log("refused \(kind) authorization: \(refusal.detail)")
-            return (false, nil, refusalFrame(refusal))
-        }
-        if let refusal = elementPreconditions(kind: kind, params: params, mode: mode) {
-            log("refused \(kind) stale-or-expired observation")
-            return (false, nil, refusalFrame(refusal))
-        }
-        // Measure the invariant around EVERY executed action, success or
-        // failure, and sample DURING it: a before/after pair cannot see a
-        // window that raises itself and drops back.
-        let targetBundle = actionTargetBundle(kind: kind, params: params)
-        if let refusal = elementChromeRefusal(kind: kind, params: params, mode: mode) {
-            log("refused \(kind) window chrome")
-            return (false, nil, refusalFrame(refusal))
-        }
-        // The latch is persistent and independent of the mode a request asks
-        // for: a target that breached stays suspended until CMM Console rearms
-        // it. A latch file that cannot be trusted suspends ALL control.
-        let isControl = bridgeActionClass(kind: kind) == .accessibility
-            && kind != "wait" && kind != "finish"
-        if let refusal = bridgeLatchRefusal(
-            load: breachLatch, targetBundle: targetBundle, isControl: isControl, mode: mode) {
-            log("refused \(kind) breach latch: \(refusal.detail)")
-            return (false, nil, refusalFrame(refusal))
-        }
-        let actionClass = bridgeActionClass(kind: kind) ?? .accessibility
-        let origin = ProcessInfo.processInfo.systemUptime
-        let before = currentEnvironment(origin: origin)
-        let sampler = InterferenceSampler(origin: origin)
-        sampler.start()
-        let result = executeAction(kind: kind, params: params)
-        // AXPerformAction returns before the window server has acted on what
-        // it triggered. Keep measuring for a bounded settle window instead of
-        // stopping at return — stopping at return is how a press that made
-        // the target frontmost was recorded as `untouched`.
-        if kind != "wait" && kind != "finish" {
-            let window = bridgeSettleWindow(actionClass: actionClass)
-            let returnedAt = ProcessInfo.processInfo.systemUptime
-            while bridgeShouldKeepSettling(
-                window: window,
-                elapsed: ProcessInfo.processInfo.systemUptime - returnedAt,
-                sinceLastChange: sampler.sinceLastChange) {
-                Thread.sleep(forTimeInterval: 0.02)
-            }
-        }
-        let samples = sampler.stop()
-        let after = currentEnvironment(origin: origin)
-        let report = bridgeInterferenceReport(
-            before: before, after: after, samples: samples,
-            actionClass: actionClass, mode: mode,
-            targetBundle: targetBundle)
-        if report.breach {
-            // The action ran; the promise did not hold. FAIL CLOSED and STOP:
-            // the call is a failure (never success with a footnote) and the
-            // target is latched, durably and audited. Nothing is activated to
-            // "undo" it: re-activating the person's previous application would
-            // be a second interference caused by Computer Use.
-            log("INTERFERENCE_BREACH kind=\(kind) verdict=\(report.verdict.rawValue) transient=\(report.transientFocusChanges) restored=\(report.restored) before=\(report.frontmostBefore) after=\(report.frontmostAfter) target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-") observed_for_ms=\(report.observedForMs)")
-            var breachID = ""
-            if let targetBundle {
-                let record = BridgeBreachRecord(
-                    id: UUID().uuidString.lowercased(), targetBundle: targetBundle,
-                    targetName: (params["element_id"] as? NSNumber)
-                        .flatMap { elementContexts[$0.intValue]?.appName } ?? "",
-                    clientID: currentClient?.clientID ?? "", kind: kind, policy: mode.rawValue,
-                    at: Date().timeIntervalSince1970, verdict: report.verdict.rawValue,
-                    focusBecameTarget: report.focusBecameTarget,
-                    windowRaisedOverPerson: report.windowRaisedOverPerson,
-                    targetFrontAtMs: report.targetFrontAtMs)
-                breachID = record.id
-                // An invalid latch already suspends everything; keep it invalid.
-                if var state = breachLatch.state {
-                    state.latch(record)
-                    breachLatch = .loaded(state)
-                    let durable = saveBreachLatch(state)
-                    appendBreachAudit(bridgeBreachAuditEntry(
-                        event: durable ? "latched" : "latch_write_failed",
-                        at: record.at, record: record, actorClientID: record.clientID,
-                        actorSigningID: currentPeer?.identifier, reason: nil))
-                }
-            }
-            var error = bridgeError(
-                code: "INTERFERENCE_BREACH",
-                message: "The action brought the target application in front of the person's work in a mode that promised no interference. Control of it is suspended until CMM Console rearms it.",
-                detail: "policy=\(mode.rawValue);reason=breach;kind=\(kind);action_ok=\(result["ok"] as? Bool == true)" + (breachID.isEmpty ? "" : ";breach_id=\(breachID)"))
-            error["interference"] = report.dictionary()
-            return (false, nil, error)
-        }
-        if report.requiresReobserve {
-            // The PERSON brought the target in front while this action ran:
-            // not a breach, nothing is latched. But the screen is no longer
-            // what the element handles described, so the generation is retired
-            // exactly as `observation.release` does: the next action on an old
-            // handle is refused (`reason=released`, no age) before any UI is
-            // touched, until the client observes again. Never retried here.
-            invalidateObservation(reason: "user_takeover")
-            log("USER_TAKEOVER kind=\(kind) attribution=\(report.focusChangeAttribution.rawValue) input=\(report.humanInputKind?.rawValue ?? "-") age_ms=\(report.humanInputAgeMs.map { String($0) } ?? "-") target_front_at_ms=\(report.targetFrontAtMs.map { String($0) } ?? "-")")
-        }
-        if result["unsupported"] as? Bool == true {
-            var error = bridgeError(
-                code: "CAPABILITY_UNSUPPORTED",
-                message: result["message"] as? String ?? "The action is not supported for this element.",
-                detail: "policy=\(mode.rawValue);kind=\(kind);" + (result["detail"] as? String ?? ""))
-            error["interference"] = report.dictionary()
-            if let scroll = result["scroll"] { error["scroll"] = scroll }
-            if let setValue = result["set_value"] { error["set_value"] = setValue }
-            return (false, nil, error)
-        }
-        if result["ok"] as? Bool == true {
-            var payload = result
-            payload["interference"] = report.dictionary()
-            return (true, payload, nil)
-        }
-        // A failed action still reports what it did to the session: the ledger
-        // is evidence, not a decoration on success.
-        var error = bridgeError(
-            code: kind == "app.open" ? "COMPUTER_TARGET_UNAVAILABLE" : "ACTION_FAILED",
-            message: result["message"] as? String ?? "The computer action could not be executed.",
-            detail: (result["detail"] as? String).map { "policy=\(mode.rawValue);kind=\(kind);" + $0 } ?? "")
-        error["interference"] = report.dictionary()
-        if let scroll = result["scroll"] { error["scroll"] = scroll }
-        if let setValue = result["set_value"] { error["set_value"] = setValue }
-        return (false, nil, error)
+        return executeActionWithLedger(arguments: arguments)
     default:
         return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "Unknown operation: \(operation)"))
     }
@@ -2850,24 +3435,51 @@ func handleLine(_ text: String, sendTo fd: Int32?, peer: BridgePeerCode? = nil) 
     // Frame reads are served outside the dispatch lock on purpose: the sink
     // owns its own lock and a capture or an action can hold the global one for
     // hundreds of milliseconds, which would freeze the mirror precisely while
-    // the machine is doing something worth watching.
+    // the machine is doing something worth watching. The frame still belongs
+    // to one principal: resolved here from the verified peer, against a policy
+    // read under its own lock.
     if operation == "observation.stream_frame" {
-        let (ok, result, error) = streamFrameResponse(args)
+        authorizationLock.lock()
+        let policy = authorization
+        authorizationLock.unlock()
+        let principal = requestPrincipal(peer: peer, client: bridgeMatchingClient(peer, policy: policy))
+        let (ok, result, error) = streamFrameResponse(args, principal: principal)
         respond(["ok": ok, "result": result, "error": error], id: rid)
         return
+    }
+    // An operation id still in flight (its first send is queued behind the
+    // lock on another connection) is refused, never executed beside it.
+    var pendingOpID: String?
+    if operation == "action.execute", let opID = args["op_id"] as? String, bridgeValidOperationID(opID) {
+        guard beginPendingOperation(opID) else {
+            respond(["ok": false, "result": nil, "error": [
+                "code": "OPERATION_IN_PROGRESS",
+                "message": "This op_id is still being executed; ask action.outcome instead of resending.",
+                "detail": "reason=op_in_progress",
+                "execution": ["executed": false, "outcome": BridgeExecutionOutcome.notExecuted.rawValue,
+                              "op_id": opID, "instance_id": helperInstanceID, "replayed": false],
+            ] as [String: Any]], id: rid)
+            return
+        }
+        pendingOpID = opID
     }
     dispatchLock.lock()
     // Resolve the client for this request under the lock, then dispatch. Every
     // authorization decision below reads `currentClient`, so the two must not be
     // separated: the whole operation runs inside this critical section. The peer
     // is published beside it for the same reason: `policy.status` reports the
-    // caller of THIS request, never another connection's.
+    // caller of THIS request, never another connection's. The principal (who
+    // owns contexts and streams) is derived from the same two facts.
     currentPeer = peer
     currentClient = bridgeMatchingClient(peer, policy: authorization)
+    currentPrincipal = requestPrincipal(peer: peer, client: currentClient)
     let (ok, result, error) = dispatch(operation: operation, arguments: args)
+    requestContext = nil
+    currentPrincipal = BridgePrincipal(key: "local", strength: .local)
     currentClient = nil
     currentPeer = nil
     dispatchLock.unlock()
+    if let pendingOpID { endPendingOperation(pendingOpID) }
     respond(["ok": ok, "result": result, "error": error], id: rid)
 }
 
@@ -2949,9 +3561,21 @@ func serveSocket(at path: String) -> Never {
     }
 }
 
-//: Serializes request handling across connection threads. The element table
+//: Serializes request handling across connection threads. The workspace
 //: and every AppKit/AX/Quartz call are single-threaded by contract.
 let dispatchLock = NSLock()
+//: Guards replacing `authorization` against the frame path, which reads it
+//: outside `dispatchLock` to resolve the caller's principal.
+let authorizationLock = NSLock()
+
+/// The principal of one request (Shared: ``bridgePrincipal``): the verified
+/// client, else the peer's validly signed code identity, else its process;
+/// stdio (no peer) is `local`.
+func requestPrincipal(peer: BridgePeerCode?, client: BridgeClientGrant?) -> BridgePrincipal {
+    bridgePrincipal(
+        clientID: client?.clientID, peerIdentifier: peer?.identifier, peerTeamID: peer?.teamID,
+        peerValidSignature: peer?.validSignature ?? false, peerPID: peer?.pid)
+}
 
 func probeSocket(at path: String) -> Bool {
     // Same validation as serveSocket: never connect to a truncated address.
