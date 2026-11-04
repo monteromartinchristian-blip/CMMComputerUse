@@ -25,6 +25,7 @@ REQUIRED = {
     "adapter/cmm_computer_use/__init__.py",
     "adapter/cmm_computer_use/client.py",
     "adapter/cmm_computer_use/mcp_server.py",
+    "adapter/cmm_computer_use/browser.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

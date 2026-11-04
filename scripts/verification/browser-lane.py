@@ -243,19 +243,40 @@ class Browser:
         self.process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         LAUNCHED.add(self.process.pid)
 
+    def pids(self) -> list[int]:
+        """Every process running with THIS profile. Firefox re-executes itself
+        on a new profile (observed live: a new pid, parent launchd), so the
+        Popen pid alone is not the browser."""
+
+        out = subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True).stdout
+        found = []
+        for line in out.splitlines():
+            pid, _, args = line.strip().partition(" ")
+            if str(self.profile) in args and args.split()[0] in (CHROME_BIN, FIREFOX_BIN):
+                found.append(int(pid))
+        return found
+
     def stop(self, sig: int = signal.SIGTERM) -> None:
-        if not self.process or self.process.poll() is not None:
-            return
-        args = subprocess.run(["ps", "-o", "args=", "-p", str(self.process.pid)],
-                              capture_output=True, text=True).stdout
-        if str(self.profile) not in args:
-            raise SystemExit("refusing to signal pid %d: not a lane browser" % self.process.pid)
-        self.process.send_signal(sig)
-        try:
-            self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
+        if self.process and self.process.poll() is None:
+            self.process.send_signal(sig)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            alive = self.pids()
+            if not alive:
+                break
+            for pid in alive:
+                # Only a main browser process whose command line names this
+                # lane profile (checked in pids()) is ever signalled.
+                try:
+                    os.kill(pid, sig if time.time() < deadline - 5 else signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.5)
+        if self.process:
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 LAUNCHED: set[int] = set()
@@ -265,7 +286,10 @@ class PidWitness:
     """Frontmost application (bundle and pid) every 100 ms. A lane browser in
     front is told apart from the person's own Chrome/Firefox by pid."""
 
-    def __init__(self) -> None:
+    def __init__(self, scratch: str = "") -> None:
+        self.scratch = scratch
+        self._args: dict[int, str] = {}
+        self.lane_front: list[int] = []
         self.samples: list[tuple[str, int]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -278,7 +302,12 @@ class PidWitness:
                 pid = int(info.strip().split("=")[-1])
             except ValueError:
                 pid = -1
+            if pid not in self._args:
+                self._args[pid] = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                                                 capture_output=True, text=True).stdout
             self.samples.append((frontmost(), pid))
+            if self.scratch and self.scratch in self._args[pid]:
+                self.lane_front.append(pid)
             self._stop.wait(0.1)
 
     def start(self) -> None:
@@ -307,8 +336,8 @@ def ok(frame: dict) -> dict:
 
 
 def expect(sock, context: str, hint: str | None = None, directory: str | None = None,
-           op_id: str | None = None) -> dict:
-    arguments = {"context_id": context, "op_id": op_id or "op_" + uuid.uuid4().hex}
+           op_id: str | None = None, **extra) -> dict:
+    arguments = {"context_id": context, "op_id": op_id or "op_" + uuid.uuid4().hex, **extra}
     if hint:
         arguments["name_hint"] = hint
     if directory:
@@ -379,7 +408,7 @@ def main() -> int:
         {"bundle_id": FIREFOX, "scopes": ["observe"], "downloads": {"roots": [str(dls["firefox"])]}},
         {"bundle_id": "com.apple.finder", "scopes": ["observe"]},
     ]})
-    witness = PidWitness()
+    witness = PidWitness(str(lane.scratch))
     keepers: list[Browser] = []
     try:
         lane.start()
@@ -398,10 +427,16 @@ def main() -> int:
             idle[kind] = Browser(kind, lane.scratch, dls[kind], "idle")
             idle[kind].open("about:blank")
             keepers.append(idle[kind])
-        time.sleep(3)
         for kind in kinds:
             bundle = CHROME if kind == "chrome" else FIREFOX
-            frame = raw(sock, "workspace.context_create", {"app": bundle})
+            # A browser registers with LaunchServices a few seconds after it
+            # starts (Firefox: after re-executing itself on a new profile).
+            deadline = time.time() + 30
+            while True:
+                frame = raw(sock, "workspace.context_create", {"app": bundle})
+                if frame.get("ok") or time.time() > deadline:
+                    break
+                time.sleep(1)
             contexts[kind] = frame["result"]["context_id"] if frame.get("ok") else None
             record("B1 %s: a context binds to the browser by bundle" % kind, frame.get("ok") is True,
                    json.dumps(frame.get("error") or {"label": frame["result"].get("label")})[:200])
@@ -453,7 +488,9 @@ def main() -> int:
             browser.open(server.url("/delay?ms=5000&to=/cut.bin"))
             try:
                 time.sleep(1.0)
-                declared = ok(expect(sock, context, "cut.bin"))
+                # The server's Content-Length is declared: a browser may keep
+                # a truncated file as if it had finished (Firefox does).
+                declared = ok(expect(sock, context, "cut.bin", expected_bytes=len(FILES["victim.bin"][1])))
                 status = wait(sock, declared["download_id"], 45)
                 leftover = sorted(p.name for p in dl.iterdir() if p.name.startswith("cut"))
                 record("B8 %s: an aborted transfer is seen and reported failed or interrupted, never complete" % kind,
@@ -519,14 +556,18 @@ def main() -> int:
                    foreign.get("error", {}).get("code", ""))
             # B13: roots are exact; a grant without roots watches nothing.
             outside = expect(sock, context, directory=str(lane.scratch))
-            finder = raw(sock, "workspace.context_create", {"app": "com.apple.finder"})
-            no_roots = expect(sock, finder["result"]["context_id"]) if finder.get("ok") else {"error": {}}
+            # This client already holds two contexts: the no-roots grant is
+            # exercised by another client process (its own principal).
+            finder = other(sock, "workspace.context_create", {"app": "com.apple.finder"})
+            no_roots = other(sock, "download.expect", {"context_id": finder["result"]["context_id"],
+                                                       "op_id": "op_" + uuid.uuid4().hex}) \
+                if finder.get("ok") else {"error": {"code": "finder_context:" + str(finder.get("error"))}}
             record("B13 a directory outside the roots is refused; a grant without roots cannot watch",
                    outside.get("error", {}).get("code") == "DOWNLOAD_ROOT_NOT_ALLOWED"
                    and no_roots.get("error", {}).get("code") in ("DOWNLOADS_NOT_ENABLED", "CONTEXT_UNOBSERVED"),
                    "%s / %s" % (outside.get("error", {}).get("code"), no_roots.get("error", {}).get("code")))
             if finder.get("ok"):
-                raw(sock, "workspace.context_close", {"context_id": finder["result"]["context_id"]})
+                other(sock, "workspace.context_close", {"context_id": finder["result"]["context_id"]})
             # B14: a long wait does not hold the helper.
             pending = ok(expect(sock, context, "never.bin"))
             box: dict = {}
@@ -548,9 +589,11 @@ def main() -> int:
         for browser in keepers:
             browser.stop()
         server.stop()
-        deadline = time.time() + 10
-        while time.time() < deadline and [p for p in lane_processes(lane.scratch) if "CMMComputerUse" not in p]:
-            time.sleep(0.5)
+        for kind in ("chrome", "firefox"):
+            for profile in lane.scratch.glob("profile-%s-*" % kind):
+                stray = Browser.__new__(Browser)
+                stray.profile, stray.process = profile, None
+                stray.stop()
         leftovers = lane_processes(lane.scratch)
         # Lane helper first (its image is checked inside), then anything else of ours.
         lane.stop()
@@ -559,7 +602,7 @@ def main() -> int:
         lane.teardown(args.evidence)
     helper_pid = lane.process.pid if lane.process else -1
     lane_front = [s for s in witness.samples
-                  if s[1] in LAUNCHED or s[1] == helper_pid or lane_mod.LANE_BUNDLE in s[0]]
+                  if s[1] in LAUNCHED or s[1] == helper_pid or lane_mod.LANE_BUNDLE in s[0]] + witness.lane_front
     record("B16 no lane process (headless browser or lane helper) came to the front (witness every 100 ms)",
            not lane_front and len(witness.samples) > 10,
            "%d samples; fronts seen: %s" % (len(witness.samples), sorted({s[0] for s in witness.samples}))[:300])

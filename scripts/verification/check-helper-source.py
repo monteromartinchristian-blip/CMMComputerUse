@@ -281,9 +281,9 @@ check("withRequestState(peer: peer)" in wait_body and "dispatchLock" not in wait
       and wait_body.index("withRequestState(peer: peer)") < wait_body.index("Thread.sleep("),
       "F2: waits take dispatchLock per sample only (never across the sleep)")
 check(browser_code.count("FileHandle(forReadingAtPath:") == 1
-      and 'arguments["checksum"] as? Bool == true' in browser_code
+      and 'arguments["checksum"] as? Bool == true || expected != nil' in browser_code
       and "Data(contentsOf" not in browser_code and "contentsOfFile" not in browser_code,
-      "F3: a downloaded file's bytes are read only for an explicit checksum request")
+      "F3: a downloaded file's bytes are read only for an explicit checksum or a declared expected_sha256")
 check('"browser.select_tab", "browser.save_dialog":\n        return .accessibility' in POLICY_SRC.replace(
           '"ui.press", "ui.set_value", "ui.scroll", "wait", "finish",\n         ', '')
       and "browserPreconditions(kind: kind, params: params, mode: mode)" in main,

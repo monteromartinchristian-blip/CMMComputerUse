@@ -84,7 +84,7 @@ public func bridgePartialDownload(name: String, isDirectory: Bool) -> BridgePart
         guard let stem = base(".part") else { return BridgePartialName(format: .gecko, finalName: nil) }
         // Current Firefox inserts an 8-character random token before the
         // extension (observed live: `slow.ap041uWi.bin.part` for `slow.bin`).
-        let pattern = #"^(.+)\.[A-Za-z0-9]{8}(\.[^.]+)?$"#
+        let pattern = #"^(.+)\.[A-Za-z0-9_-]{8}(\.[^.]+)?$"#
         if let regex = try? NSRegularExpression(pattern: pattern),
            let found = regex.firstMatch(in: stem, range: NSRange(stem.startIndex..., in: stem)) {
             let head = Range(found.range(at: 1), in: stem).map { String(stem[$0]) } ?? stem
@@ -197,6 +197,11 @@ public final class BridgeDownloadMonitor {
         let root: String
         let opID: String?
         let nameHint: String?
+        /// What the caller knows the file must be (e.g. the server's size):
+        /// a browser can present a truncated transfer as finished (observed
+        /// live with Firefox), which file metadata alone cannot see.
+        let expectedBytes: Int64?
+        let expectedSHA256: String?
         let createdAt: Double
         /// Folds up to and including the baseline: artifacts first seen in
         /// them predate the expectation and are never its download.
@@ -254,7 +259,8 @@ public final class BridgeDownloadMonitor {
     /// (principal, opID): a resent expect returns the same expectation.
     public func expect(
         principal: BridgePrincipal, contextID: String?, bundleID: String, root: String,
-        entries: [BridgeDirectoryEntry], opID: String?, nameHint: String?, now: Double
+        entries: [BridgeDirectoryEntry], opID: String?, nameHint: String?, now: Double,
+        expectedBytes: Int64? = nil, expectedSHA256: String? = nil
     ) -> Result<String, BridgePolicyRefusal> {
         reap(now: now)
         if let opID, let existing = order.first(where: {
@@ -284,7 +290,8 @@ public final class BridgeDownloadMonitor {
         let hint = nameHint.flatMap { $0.isEmpty ? nil : $0 }
         expectations[id] = Expectation(
             id: id, principal: principal, contextID: contextID, bundleID: bundleID, root: root,
-            opID: opID, nameHint: hint, createdAt: now, afterFold: folds)
+            opID: opID, nameHint: hint, expectedBytes: expectedBytes,
+            expectedSHA256: expectedSHA256?.lowercased(), createdAt: now, afterFold: folds)
         order.append(id)
         return .success(id)
     }
@@ -309,6 +316,13 @@ public final class BridgeDownloadMonitor {
     }
 
     public func contextID(of id: String) -> String? { expectations[id]?.contextID }
+
+    /// The checksum the caller declared, if any (the helper compares it once
+    /// the file is complete; that is an explicit request to read it).
+    public func expectedSHA256(of id: String, principal: BridgePrincipal) -> String? {
+        guard let expectation = expectations[id], expectation.principal == principal else { return nil }
+        return expectation.expectedSHA256
+    }
 
     public func list(principal: BridgePrincipal, now: Double) -> [BridgeDownloadStatus] {
         order.filter { expectations[$0]?.principal == principal }.map { describe(id: $0, now: now) }
@@ -411,7 +425,11 @@ public final class BridgeDownloadMonitor {
                 updateFinal(id: id, entry: entry, now: now)
                 continue
             }
-            guard changed, !entry.isDirectory else { continue }
+            // An EMPTY new file is not a download yet: Firefox creates its
+            // 0-byte placeholder before (sometimes a scan before) the part
+            // file that will replace it — observed live. It becomes an
+            // artifact only once it has content.
+            guard changed, !entry.isDirectory, entry.size > 0 else { continue }
             // Link to a vanished partial: same inode (renamed in place), else
             // the partial's announced final name, else the only vanished one.
             let vanished = artifacts.values.filter { $0.root == root && $0.partialGoneAt != nil && $0.finalInode == nil }
@@ -492,7 +510,11 @@ public final class BridgeDownloadMonitor {
             // Without a final name yet, an artifact waits for one only when
             // several expectations are open and all of them are hinted.
             let unhinted = open.first { $0.nameHint == nil }
-            let pick = hinted ?? unhinted ?? (artifact.finalName != nil || open.count == 1 ? open.first : nil)
+            // A NAMED artifact that matches no hint is never handed to a
+            // hinted expectation while another one is open: that is how two
+            // simultaneous downloads were swapped in the live lane. With one
+            // open expectation it is that expectation's (a renamed download).
+            let pick = hinted ?? unhinted ?? (open.count == 1 ? open.first : nil)
             guard let pick else { continue }
             expectations[pick.id]?.artifact = artifact.id
         }
@@ -516,12 +538,18 @@ public final class BridgeDownloadMonitor {
         let renamed = expectation.nameHint.map { hint in
             artifact.finalName.map { $0 != hint } ?? false
         } ?? false
+        var state = artifact.state
+        var reason = artifact.reason
+        if state == .complete, let expected = expectation.expectedBytes, artifact.bytes != expected {
+            state = .failed
+            reason = "size_mismatch;expected=\(expected);got=\(artifact.bytes)"
+        }
         return BridgeDownloadStatus(
-            downloadID: id, state: artifact.state, root: expectation.root, fileName: artifact.finalName,
+            downloadID: id, state: state, root: expectation.root, fileName: artifact.finalName,
             bytes: artifact.bytes, partialFormat: artifact.format, renamed: renamed,
             replacedExisting: artifact.replacedExisting,
             resumable: artifact.state == .interrupted && artifact.partialName != nil,
-            resumed: artifact.resumed, reason: artifact.reason, elapsed: now - expectation.createdAt)
+            resumed: artifact.resumed, reason: reason, elapsed: now - expectation.createdAt)
     }
 }
 

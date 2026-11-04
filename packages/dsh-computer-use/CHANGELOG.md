@@ -6,6 +6,11 @@ The full project changelog, including the macOS helper, lives in the repository.
 
 ## Unreleased
 
+- F-09 browser and downloads: `computer_use_browser_state`, `_browser_wait`,
+  `_browser_select_tab`, `_download`, `_download_expect`, `_download_status`,
+  `_save_dialog`. The PiP mirror keeps its stream across tab switches and
+  navigation (same window id); page changes and download steps keep the panel.
+
 - 0.3.3 Multi-App Workspace: optional `context` on observe / capture / press /
   set_value / scroll / release; `computer_use_workspace_status`,
   `computer_use_context_open`, `computer_use_context_close`; `execution` line on

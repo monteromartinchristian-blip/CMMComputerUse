@@ -290,6 +290,15 @@ class DownloadTests(Base):
         self.assertEqual(len(sent), 2)
         self.assertEqual(sent[0]["arguments"]["op_id"], sent[1]["arguments"]["op_id"])
 
+    def test_a_known_size_and_checksum_travel_with_the_expectation(self):
+        self.call("computer_use_download", {"context": CTX, "element_id": 7, "snapshot": 3,
+                                            "expected_bytes": 2000000, "expected_sha256": "ab" * 32})
+        expect = self.frames("download.expect")[0]["arguments"]
+        self.assertEqual(expect["expected_bytes"], 2000000)
+        self.assertEqual(expect["expected_sha256"], "ab" * 32)
+        self.call("computer_use_download_expect", {"context": CTX})
+        self.assertNotIn("expected_bytes", self.frames("download.expect")[1]["arguments"])
+
     def test_status_with_checksum_is_explicit(self):
         self.helper.download_states = [{"state": "complete", "extra": {"sha256": "ab" * 32}}]
         text = text_of(self.call("computer_use_download_status", {"download_id": DL, "checksum": True}))

@@ -90,3 +90,26 @@ The helper and the plugin can be upgraded separately, but not in any order:
 | Hosts without MCP | not compatible without an adapter | write one against [workspace-contract.md](workspace-contract.md) |
 
 A PASS for one harness is not extrapolated to another.
+
+## Browser and download matrix (F-09, contract `cmm-computer-use/browser` v1)
+
+Columns separate what was proven live from what is implemented but
+unproven. "Live" means the real helper binary and a real browser; see the F-09
+report for the evidence.
+
+| Capability | Chrome | Firefox | Safari |
+|---|---|---|---|
+| Verified downloads (direct, PDF, ZIP, redirect, script-triggered, two at once) | **tested live** (headless, isolated profile) | **tested live** (headless, isolated profile) | implemented (`.download` bundle format, XCTest); **not run live**: Safari cannot run isolated from the person's session |
+| Aborted / stalled transfer never reported complete | **tested live** | **tested live** (a cut transfer is caught only with `expected_bytes`/`expected_sha256`: Firefox keeps the truncated file as finished) | XCTest only |
+| Browser crash affects only its own context | **tested live** (Chrome vs Firefox) | **tested live** | not run |
+| Tabs, page lifecycle, `select_tab` (AX) | implemented; XCTest on the model; **not run live** (needs Accessibility for a test helper) | same | same |
+| Save dialog (AX, name conflict, explicit overwrite) | implemented; XCTest on the recognizer; **not run live** | same | same |
+| Resume of an interrupted download | detection tested live (`interrupted`, `resumable`); pressing Resume is an ordinary AX press, **not run live** | same | same |
+| Save As of a PDF shown inline (no download link) | **not implemented in background**: needs the File menu (AX menu press) or ⌘S (global keyboard, unrestricted only) | same | same |
+
+| Harness | Browser tools |
+|---|---|
+| MCP adapter (Python) | tested (contract tests against a scripted helper; real helper in the live lane) |
+| Reference harness | uses the same client API (`browser.py` is harness-neutral) |
+| DeepSeek Harness (projection/PiP) | tested at code level: tab switches, navigation and download steps keep the panel; not in a running DSH |
+| Other MCP hosts | available, not tested |

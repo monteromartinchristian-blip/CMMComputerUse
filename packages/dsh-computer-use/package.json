@@ -46,6 +46,7 @@
     "adapter/serve.sh",
     "adapter/cmm_computer_use/__init__.py",
     "adapter/cmm_computer_use/client.py",
+    "adapter/cmm_computer_use/browser.py",
     "adapter/cmm_computer_use/mcp_server.py",
     "README.md",
     "CHANGELOG.md",

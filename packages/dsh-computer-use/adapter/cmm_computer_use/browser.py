@@ -106,6 +106,8 @@ def download_by_pressing(
     directory: Optional[str] = None,
     start_timeout: float = 15.0,
     finish_timeout: float = 120.0,
+    expected_bytes: Optional[int] = None,
+    expected_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Press a download control once and verify the finished file.
 
@@ -115,7 +117,8 @@ def download_by_pressing(
     it is not: look for a save dialog, a viewer, or report.
     """
 
-    expectation = client.download_expect(context_id, directory=directory, name_hint=name_hint)
+    expectation = client.download_expect(context_id, directory=directory, name_hint=name_hint,
+                                         expected_bytes=expected_bytes, expected_sha256=expected_sha256)
     download_id = expectation["download_id"]
     press: Dict[str, Any] = {"outcome": None}
     try:

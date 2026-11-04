@@ -148,6 +148,9 @@ scripts/verify-release.sh
 Architecture, module map and the reason for each layer:
 [docs/architecture.md](docs/architecture.md). The wire protocol is a separate,
 versioned contract: [docs/computer-bridge-protocol.md](docs/computer-bridge-protocol.md).
+Browsers and verified downloads (tabs, page lifecycle, save dialogs, files
+reported only when complete on disk) have their own contract:
+[docs/browser-contract.md](docs/browser-contract.md).
 
 ## License
 

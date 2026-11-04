@@ -707,7 +707,8 @@ class BridgeClient:
                             timeout=timeout + 10.0)
 
     def download_expect(self, context_id: Optional[str] = None, *, directory: Optional[str] = None,
-                        name_hint: Optional[str] = None, op_id: Optional[str] = None) -> Any:
+                        name_hint: Optional[str] = None, op_id: Optional[str] = None,
+                        expected_bytes: Optional[int] = None, expected_sha256: Optional[str] = None) -> Any:
         """Declare a download BEFORE triggering it. Returns its ``download_id``.
 
         Always carries an op_id: a resend after a lost answer returns the same
@@ -718,6 +719,12 @@ class BridgeClient:
             arguments["directory"] = directory
         if name_hint:
             arguments["name_hint"] = name_hint
+        # What the file must be, when known (size from the page, a published
+        # checksum): a browser can present a truncated transfer as finished.
+        if expected_bytes:
+            arguments["expected_bytes"] = int(expected_bytes)
+        if expected_sha256:
+            arguments["expected_sha256"] = expected_sha256
         return self.request("download.expect", _with_context(arguments, context_id))
 
     def download_status(self, download_id: str, *, checksum: bool = False) -> Any:

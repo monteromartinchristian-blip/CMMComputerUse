@@ -7,7 +7,36 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The helper and the plugin version independently; this file tracks the plugin
 (`@cmm/dsh-computer-use`) and notes helper-visible changes explicitly.
 
-## Unreleased — helper 0.3.3 build 6 (Multi-App Workspace, 2026-11-03)
+## Unreleased — F-09 Browser Reliability & Download Management (2026-11-04)
+
+Branch `feature/computer-use-033-browser` (on top of 0.3.3); not integrated,
+not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
+
+### Added
+
+- `browser.state` / `browser.wait`: windows and tabs with stable ids, redacted
+  URL, load state, open dialogs, and the transition since the last look
+  (`tab_switched`, `navigated`, `reloaded`, `tab_closed`, `window_closed`,
+  `app_closed`): a tab switch is no longer reported as a lost connection.
+- AX-only actions `browser.select_tab` and `browser.save_dialog` (name
+  conflict stops; overwrite only on explicit request and a positively
+  identified Replace button).
+- Verified downloads: `download.expect` / `status` / `wait` / `list` /
+  `forget` over directories the policy grant declares
+  (`"downloads": {"roots": [...]}`); WebKit, Chromium and Gecko partial
+  formats; a file is reported only when complete, non-empty and stable.
+- Adapter `browser.py` (failure classification, `download_by_pressing` that
+  never presses twice) and seven MCP tools; automatic re-observation after a
+  page/tab change (read only).
+- `observation.describe` takes `window_id`; explicit contexts keep their window.
+
+### Fixed
+
+- The PiP restarted its live stream whenever the window title changed (every
+  tab switch / navigation); a page change cleared the panel as if the window
+  were lost.
+
+
 
 Development branch `feature/computer-use-033`; not integrated, not deployed.
 Contract: [docs/workspace-contract.md](docs/workspace-contract.md).

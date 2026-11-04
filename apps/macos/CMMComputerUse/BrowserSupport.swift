@@ -625,6 +625,15 @@ func downloadExpectRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
                                         detail: "reason=op_id_invalid"))
     }
     let hint = (arguments["name_hint"] as? String).flatMap { bridgeValidSaveName($0) ? $0 : nil }
+    let expectedBytes = (arguments["expected_bytes"] as? NSNumber)?.int64Value
+    let expectedSHA = (arguments["expected_sha256"] as? String).flatMap {
+        $0.count == 64 && $0.allSatisfy { $0.isHexDigit } ? $0 : nil
+    }
+    if (arguments["expected_bytes"] != nil && (expectedBytes ?? 0) <= 0)
+        || (arguments["expected_sha256"] != nil && expectedSHA == nil) {
+        return (false, nil, bridgeError(code: "CAPABILITY_UNSUPPORTED", message: "expected_bytes / expected_sha256 is malformed.",
+                                        detail: "reason=expected_invalid"))
+    }
     let entries: [BridgeDirectoryEntry]
     switch scanDownloadRoot(root) {
     case .failure(let refusal): return (false, nil, refusalFrame(refusal))
@@ -632,7 +641,8 @@ func downloadExpectRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
     }
     switch downloadMonitor.expect(
         principal: currentPrincipal, contextID: context.id, bundleID: owner.bundleID, root: root,
-        entries: entries, opID: opID, nameHint: hint, now: Date().timeIntervalSince1970) {
+        entries: entries, opID: opID, nameHint: hint, now: Date().timeIntervalSince1970,
+        expectedBytes: expectedBytes, expectedSHA256: expectedSHA) {
     case .failure(let refusal): return (false, nil, refusalFrame(refusal))
     case .success(let id):
         log("download expectation \(id) context=\(context.label) bundle=\(owner.bundleID)")
@@ -654,10 +664,20 @@ func downloadStatusRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
     case .success(let status):
         var result = status.dictionary
         if entries == nil { result["scan"] = "unavailable" }
-        if arguments["checksum"] as? Bool == true, status.state == .complete, let path = status.path,
-           let digest = sha256(ofFileAt: path) {
-            // Only on explicit request: the one read of a downloaded file's bytes.
+        let expected = downloadMonitor.expectedSHA256(of: id, principal: currentPrincipal)
+        if arguments["checksum"] as? Bool == true || expected != nil, status.state == .complete,
+           let path = status.path, let digest = sha256(ofFileAt: path) {
+            // Only on explicit request (`checksum`, or an expected_sha256 the
+            // caller declared): the one read of a downloaded file's bytes.
             result["sha256"] = digest
+            if let expected, expected != digest {
+                result["state"] = BridgeDownloadState.failed.rawValue
+                result["terminal"] = true
+                result["reason"] = "checksum_mismatch"
+                result.removeValue(forKey: "path")
+            } else if expected != nil {
+                result["integrity"] = "sha256_verified"
+            }
         }
         return (true, result, nil)
     }

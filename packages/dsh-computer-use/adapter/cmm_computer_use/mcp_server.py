@@ -414,6 +414,10 @@ class ToolRegistry:
                                   "description": "Expected file name, if known (helps with simultaneous downloads)."},
                     "directory": {"type": "string", "maxLength": 1024,
                                   "description": "A download directory the policy allows (default: its first)."},
+                    "expected_bytes": {"type": "integer", "minimum": 1,
+                                       "description": "Exact size, if known: a truncated file is then reported failed."},
+                    "expected_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
+                                        "description": "Published SHA-256, if known (the helper then reads the file to compare)."},
                     "timeout": {"type": "number", "minimum": 1, "maximum": 120, "default": 120},
                 }, required=["element_id", "snapshot"]),
             },
@@ -428,6 +432,10 @@ class ToolRegistry:
                     "context": CONTEXT_PROPERTY,
                     "name_hint": {"type": "string", "maxLength": 255},
                     "directory": {"type": "string", "maxLength": 1024},
+                    "expected_bytes": {"type": "integer", "minimum": 1,
+                                       "description": "Exact size, if known: a truncated file is then reported failed."},
+                    "expected_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
+                                        "description": "Published SHA-256, if known (the helper then reads the file to compare)."},
                 }),
             },
             {
@@ -620,7 +628,8 @@ class ToolRegistry:
             if name == "computer_use_download_expect":
                 result = self.client.download_expect(
                     _context(arguments), directory=_opt_text(arguments, "directory"),
-                    name_hint=_opt_text(arguments, "name_hint"))
+                    name_hint=_opt_text(arguments, "name_hint"), expected_bytes=arguments.get("expected_bytes"),
+                    expected_sha256=_opt_text(arguments, "expected_sha256"))
                 return _text(_render_download(result, declared=True))
             if name == "computer_use_download_status":
                 download_id = str(arguments.get("download_id") or "")
@@ -824,7 +833,8 @@ class ToolRegistry:
             self.client, element_id=_int(arguments, "element_id"), snapshot=_int(arguments, "snapshot"),
             context_id=_context(arguments), name_hint=_opt_text(arguments, "name_hint"),
             directory=_opt_text(arguments, "directory"),
-            finish_timeout=float(arguments.get("timeout", 120)))
+            finish_timeout=float(arguments.get("timeout", 120)),
+            expected_bytes=arguments.get("expected_bytes"), expected_sha256=_opt_text(arguments, "expected_sha256"))
         lines = ["press: %s" % (outcome["press"].get("outcome"),)]
         if outcome.get("download"):
             lines.append(_render_download(outcome["download"]))
@@ -1540,6 +1550,8 @@ def _render_download(result: Any, declared: bool = False) -> str:
         parts.append("reason=%s" % result["reason"])
     if result.get("sha256"):
         parts.append("sha256=%s" % result["sha256"])
+    if result.get("integrity"):
+        parts.append("integrity=%s" % result["integrity"])
     if result.get("state") == "interrupted":
         parts.append("the browser may offer Resume; press it, then wait again")
     return "; ".join(parts)

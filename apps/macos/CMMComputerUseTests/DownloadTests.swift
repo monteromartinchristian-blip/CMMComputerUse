@@ -143,6 +143,21 @@ final class DownloadTests: XCTestCase {
         XCTAssertFalse(s.replacedExisting)
     }
 
+    /// Live-lane finding: Firefox's placeholder can appear one scan BEFORE its
+    /// part file; it must not become a second download.
+    func testLiveFirefoxPlaceholderSeenFirstIsNotASecondDownload() {
+        let m = monitor()
+        let id = expect(m, [], hint: "direct.csv", at: 0)
+        XCTAssertEqual(state(m, id, [file("direct.csv", 0, inode: 500)], at: 0.5).state, .notStarted)
+        _ = state(m, id, [file("direct.csv", 0, inode: 500), file("direct.Qw12Er34.csv.part", 4000, inode: 501)], at: 1)
+        let done = [file("direct.csv", 31899, inode: 501, at: 2)]
+        _ = state(m, id, done, at: 2)
+        let s = state(m, id, done, at: 3.5)
+        XCTAssertEqual(s.state, .complete)
+        XCTAssertEqual(s.fileName, "direct.csv")
+        XCTAssertEqual(s.bytes, 31899)
+    }
+
     /// The trace Chrome (headless, new mode) wrote in the live lane: a hidden
     /// temporary file first, then `Name.crdownload`, renamed in place.
     func testLiveChromeTraceIgnoresTheHiddenTemporaryFile() {
@@ -346,6 +361,34 @@ final class DownloadTests: XCTestCase {
                                                     entries: entries, opID: nil, nameHint: nil, now: 100)
         else { return XCTFail("open expectations must stay bounded") }
         XCTAssertEqual(refusal.code, "DOWNLOAD_LIMIT")
+    }
+
+    /// Live-lane finding: Firefox turned a transfer cut at 300 kB of 2 MB into a
+    /// finished-looking file. A declared size catches it.
+    func testATruncatedFileIsFailedWhenTheExpectedSizeIsKnown() {
+        let m = monitor()
+        guard case .success(let id) = m.expect(principal: dsh, contextID: nil, bundleID: "b", root: root, entries: [],
+                                               opID: nil, nameHint: "cut.bin", now: 0, expectedBytes: 2_000_000)
+        else { return XCTFail() }
+        let done = [file("cut.bin", 300_000, inode: 900)]
+        _ = state(m, id, done, at: 1)
+        let s = state(m, id, done, at: 2.5)
+        XCTAssertEqual(s.state, .failed)
+        XCTAssertTrue(s.reason?.hasPrefix("size_mismatch") ?? false)
+    }
+
+    /// Live-lane finding: two Firefox downloads were swapped when a hinted name
+    /// did not match. A named artifact that matches no hint waits.
+    func testANamedDownloadMatchingNoHintIsNotGivenToAnotherHint() {
+        let m = monitor()
+        let a = expect(m, [], hint: "slow-a.bin", at: 0)
+        let b = expect(m, [], hint: "slow-b.bin", at: 0.1)
+        _ = state(m, a, [file("other.bin.crdownload", 10, inode: 910)], at: 1)
+        XCTAssertEqual(state(m, a, nil, at: 1).state, .notStarted)
+        XCTAssertEqual(state(m, b, nil, at: 1).state, .notStarted)
+        _ = state(m, a, [file("other.bin.crdownload", 20, inode: 910), file("slow-b.Ab_d-Fg1.bin.part", 5, inode: 911)], at: 2)
+        XCTAssertEqual(state(m, b, nil, at: 2).fileName, "slow-b.bin", "a token with - and _ is still Firefox's")
+        XCTAssertEqual(state(m, a, nil, at: 2).state, .notStarted)
     }
 
     // MARK: roots
