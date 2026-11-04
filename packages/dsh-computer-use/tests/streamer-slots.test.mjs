@@ -239,3 +239,27 @@ test('backpressure is per viewer: a panel that stops reading never stalls the ot
     await helper.close();
   }
 });
+
+test('F-09: a title change on the same window id keeps the helper stream (tab switch)', async () => {
+  const helper = await fakeHelper();
+  const live = await streamer(helper.path);
+  try {
+    const a = await mirror(live.port, 'A', 1);
+    // The same panel re-opened after a tab switch renamed the window.
+    const renamed = await new Promise((resolve, reject) => {
+      const request = get(`http://127.0.0.1:${live.port}/stream.mjpg?token=cmm-cu-live&app=AppA&window=Other%20page`
+        + '&window_id=11&slot=A&bundle=com.example.A&pid=501', response => {
+        response.once('data', () => resolve({request}));
+      });
+      request.on('error', error => { if (error.code !== 'ECONNRESET') reject(error); });
+    });
+    const starts = helper.calls.filter(c => c.operation === 'observation.stream_start');
+    assert.equal(starts.length, 1, 'no second helper stream for the same window');
+    assert.equal(helper.calls.filter(c => c.operation === 'observation.stream_stop').length, 0,
+      'the running stream was not torn down');
+    a.request.destroy(); renamed.request.destroy();
+  } finally {
+    await live.close();
+    await helper.close();
+  }
+});

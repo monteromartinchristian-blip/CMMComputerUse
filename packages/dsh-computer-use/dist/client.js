@@ -10,7 +10,18 @@ const RETENTION_MS = 60000;
 const STALE_MS = 10000;
 const PREFIX = 'mcp__cmm-computer-use__computer_use_';
 const TOOLS = new Set(['status','list_apps','observe','capture_window','press','set_value','scroll','release',
-  'workspace_status','context_open','context_close']);
+  'workspace_status','context_open','context_close',
+  // F-09 browser and downloads.
+  'browser_state','browser_wait','browser_select_tab','download','download_expect','download_status','save_dialog']);
+/** F-09 tools that act on the browser window (one AX action each). */
+const BROWSER_ACTIONS = new Set(['browser_select_tab','download','save_dialog']);
+/** F-09 tools: their failures are about a page, a tab, a dialog or a file —
+ * never about the window's authority — so they keep the panel. */
+const BROWSER = new Set([...BROWSER_ACTIONS,'browser_state','browser_wait','download_expect','download_status']);
+/** Reasons that revoke what the panel shows, whatever tool reported them. */
+const HARD_REASON = /(?:^|[\[; =])reason=(app_not_granted|window_changed|pid_changed|expired|released|stale_snapshot|global_input_not_scoped|breach_latch_invalid|breach|app_closed)(?:[; \n\]]|$)/m;
+const HARD_CODES = ['APPROVAL_REJECTED','COMPUTER_PERMISSION_DENIED','COMPUTER_RUNTIME_UNAVAILABLE','UNAVAILABLE',
+  'INTERFERENCE_BREACH','CONTEXT_UNKNOWN','CONTEXT_CLOSED'];
 /** 0.3.3: a context id as the adapter prints and accepts it. */
 const CTX = /^ctx_[0-9a-f]{32}$/;
 /** Panels the PiP can split into: one per context, two at most (two streams). */
@@ -19,7 +30,7 @@ const MAX_LANES = 2;
  * pending calls) is the session's and shared by every panel. */
 const LANE_FIELDS = ['target','frame','error','message','attempt','ledger','guiRevision','attemptRevision'];
 /** Results that mean "the agent tried to show or touch a window". */
-const GUI = new Set(['observe','capture_window','press','set_value','scroll']);
+const GUI = new Set(['observe','capture_window','press','set_value','scroll','browser_select_tab','download','save_dialog']);
 const clean = x => typeof x === 'string' ? x.replace(/[\u0000-\u001f\u007f]/g,'').slice(0,200) : '';
 const token = x => typeof x === 'string' ? x.replace(/[^\w.:/@-]/g,'').slice(0,80) : '';
 function initialState() {
@@ -355,7 +366,7 @@ function foldCore(state, event) {
   let next={...state,pending,lastAt:Number.isFinite(at)?at:0};
   // Any GUI attempt is new activity for the view; only proven results grant pixels.
   if(GUI.has(call.name)) next={...next,attemptRevision:(state.attemptRevision||0)+1};
-  const action=call.name==='press'||call.name==='set_value'||call.name==='scroll';
+  const action=call.name==='press'||call.name==='set_value'||call.name==='scroll'||BROWSER_ACTIONS.has(call.name);
   if(action) {
     const ledger={};
     for(const key of ['cursor_events_posted','cursor_moved_by_action','external_activity','focus_became_target','window_raised_over_person']) {
@@ -389,6 +400,18 @@ function foldCore(state, event) {
   if(call.revision!==state.revision&&call.name!=='status')return {...state,pending};
   if(msg.isError || /^REFUSED /m.test(text)) {
     const code=text.match(/^REFUSED ([A-Z_]+)/m)?.[1];
+    // F-09: a page that changed under an element (tab switch, navigation),
+    // or a browser/download step that did not finish, is not a loss of the
+    // window: the panel keeps its verified target (same bundle, pid and
+    // window id; the live mirror is window-level) and says what happened.
+    // Only the static frame of the old page is dropped.
+    const documentChanged=/(?:^|[\[; =])reason=(document_changed|document_unverified)(?:[; \n\]]|$)/m.test(text);
+    if((documentChanged||BROWSER.has(call.name))&&state.target&&!HARD_REASON.test(text)&&!HARD_CODES.includes(code)) {
+      const soft=documentChanged?'document_changed':(code||(/NOT VERIFIED/.test(text)?'NOT_VERIFIED':'BROWSER_STEP'));
+      return {...next,frame:documentChanged?null:next.frame,error:soft,
+        message:documentChanged?'page changed · re-observe':(code?'REFUSED '+code:'not verified'),
+        attempt:{name:call.name,at:next.lastAt,failed:true,code:soft}};
+    }
     const reason=text.match(/(?:^|[; =])reason=(app_not_granted|window_changed|pid_changed|expired|released|stale_snapshot|global_input_not_scoped|breach_latch_invalid|breach)(?:[; \n\]]|$)/m)?.[1];
     const known=['APPROVAL_REJECTED','ACTION_FAILED','CAPABILITY_UNSUPPORTED','TIMEOUT','UNAVAILABLE','COMPUTER_RUNTIME_UNAVAILABLE','COMPUTER_PERMISSION_DENIED','COMPUTER_TARGET_UNAVAILABLE','INTERFERENCE_BREACH'];
     const statusFailure=call.name==='status';
@@ -634,8 +657,8 @@ function pipPresentation(state,{sessionId,view,now=Date.now()}={}) {
   if(!verified&&['frame-live','frame-stale','observed-no-frame','expired'].includes(phase))
     return {...model,visible:true,phase:'error',status:'error',tone:'error',app:null,appGeneric:false,window:null,technical:technicalFacts(state,null)};
   const pending=Object.values(state.pending||{}).at(-1)?.name;
-  const busy=pending==='status'?'connecting':pending==='press'||pending==='set_value'?'interacting'
-    :pending==='observe'||pending==='capture_window'?'observing':null;
+  const busy=pending==='status'?'connecting':pending==='press'||pending==='set_value'||BROWSER_ACTIONS.has(pending)?'interacting'
+    :pending==='observe'||pending==='capture_window'||pending==='browser_state'||pending==='browser_wait'?'observing':null;
   if(busy) model.status=busy;
   model.visible=true;
   const fresh=(phase==='frame-live'||phase==='frame-stale')&&freshness!=='none'&&freshness!=='expired';
@@ -804,8 +827,15 @@ function overlayPosition(position,frame,card) {
         // Split view: each panel is its own streamer slot (its own helper
         // stream, counters and recovery). The verified bundle and pid travel
         // so the helper refuses to mirror a relaunched or different process.
+        // F-09: with a window id the URL must not change when only the title
+        // does (a tab switch or a navigation renames the window): the title
+        // travels as it was when this window id was first mirrored, so the
+        // <img> and its helper stream survive normal browsing.
+        const titleFor=React.useRef({id:null,title:''});
+        if(target&&target.windowId&&titleFor.current.id!==target.windowId)titleFor.current={id:target.windowId,title:target.window};
+        const urlTitle=target&&target.windowId?titleFor.current.title:(target?target.window:'');
         const liveUrl=liveEnabled?'http://127.0.0.1:47183/stream.mjpg?token=cmm-cu-live'
-          +'&app='+encodeURIComponent(target.bundle)+'&window='+encodeURIComponent(target.window)
+          +'&app='+encodeURIComponent(target.bundle)+'&window='+encodeURIComponent(urlTitle)
           +(target.windowId?'&window_id='+target.windowId:'')
           +(label?'&slot='+label+'&bundle='+encodeURIComponent(target.bundle)+(target.pid?'&pid='+target.pid:''):'')
           +(streamNonce?'&rearm='+streamNonce:''):null;

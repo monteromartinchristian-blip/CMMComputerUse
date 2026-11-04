@@ -121,7 +121,10 @@ function runStreamer(socket, port = LIVE_PORT) {
   const activeSlots = () => [...slots.values()].filter(slot => slot.live).length;
 
   const acquire = (name, slot, target) => serialized(slot, async () => {
-    const key = [target.app, target.window, target.windowId || '', target.bundle || '', target.pid || ''].join('\u0000');
+    // A window id IS the window: a title change (tab switch, navigation) on
+    // the same id must not restart its helper stream (F-09).
+    const key = [target.app, target.windowId ? '' : target.window, target.windowId || '', target.bundle || '',
+      target.pid || ''].join('\u0000');
     if (slot.live && slot.live.key === key) { slot.live.viewers += 1; slot.stats.viewers = slot.live.viewers; return slot.live; }
     if (slot.live) {
       const previous = slot.live;

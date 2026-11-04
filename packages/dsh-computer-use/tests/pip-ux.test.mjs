@@ -392,3 +392,19 @@ test('the stale badge is rendered over the kept frame',()=>{
   assert.equal(text(tree).includes('pausedBadge'),true,'stale frame must say "View paused"');
   assert.equal(text(tree).includes('Esperando'),false);
 });
+
+test('F-09: a tab switch (same window id, new title) keeps the live mirror URL', () => {
+  const first = observed(undefined, Date.now());
+  const s = seat(first);
+  const src = tree => nodes(tree, 'img').map(i => String(i.props.src)).find(u => u.includes('/stream.mjpg?'));
+  const before = src(s.draw({sessionId: 'a', mode: 'mini'}));
+  assert.ok(before, 'the mirror is drawn');
+  // The page in the same window changed: the observation reports another
+  // title for the SAME window id.
+  const renamed = OBSERVE.replace(JSON.stringify(view).replace('—', '\\u2014'),
+    JSON.stringify({...view, window: 'Another page — Docs'}).replace(/—/g, '\\u2014'));
+  assert.notEqual(renamed, OBSERVE);
+  s.setState(say(call(first, 'observe', {app: APP}, Date.now()), renamed, Date.now()));
+  const after = src(s.draw({sessionId: 'a', mode: 'mini'}));
+  assert.equal(after, before, 'same <img> source: the stream is not reopened');
+});

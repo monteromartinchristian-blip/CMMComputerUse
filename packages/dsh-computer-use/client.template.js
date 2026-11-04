@@ -128,8 +128,15 @@ window.__ModuleLoader__.load({
         // Split view: each panel is its own streamer slot (its own helper
         // stream, counters and recovery). The verified bundle and pid travel
         // so the helper refuses to mirror a relaunched or different process.
+        // F-09: with a window id the URL must not change when only the title
+        // does (a tab switch or a navigation renames the window): the title
+        // travels as it was when this window id was first mirrored, so the
+        // <img> and its helper stream survive normal browsing.
+        const titleFor=React.useRef({id:null,title:''});
+        if(target&&target.windowId&&titleFor.current.id!==target.windowId)titleFor.current={id:target.windowId,title:target.window};
+        const urlTitle=target&&target.windowId?titleFor.current.title:(target?target.window:'');
         const liveUrl=liveEnabled?'http://127.0.0.1:47183/stream.mjpg?token=cmm-cu-live'
-          +'&app='+encodeURIComponent(target.bundle)+'&window='+encodeURIComponent(target.window)
+          +'&app='+encodeURIComponent(target.bundle)+'&window='+encodeURIComponent(urlTitle)
           +(target.windowId?'&window_id='+target.windowId:'')
           +(label?'&slot='+label+'&bundle='+encodeURIComponent(target.bundle)+(target.pid?'&pid='+target.pid:''):'')
           +(streamNonce?'&rearm='+streamNonce:''):null;
