@@ -153,8 +153,10 @@ def download_by_pressing(
             hint = ("the browser opened the file in its viewer instead of downloading it: press the "
                     "viewer's download/save control, then wait on download %s" % download_id)
         else:
-            hint = ("no download started; the press outcome was %s. Observe the page before "
-                    "deciding anything (do not press again blindly)" % press["outcome"])
+            hint = ("no download started in %s; the press outcome was %s. The browser may save to "
+                    "another folder than this one (its own download setting, e.g. iCloud Drive) or be "
+                    "asking for permission to download. Observe the page before deciding anything "
+                    "(do not press again blindly)" % (started.get("directory"), press["outcome"]))
         return {"press": press, "download": started, "verified": False, "next": hint,
                 "browser": state}
     final = client.download_wait(download_id, until="terminal", timeout=finish_timeout)

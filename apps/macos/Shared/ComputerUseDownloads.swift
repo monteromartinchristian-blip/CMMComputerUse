@@ -171,8 +171,13 @@ public struct BridgeDownloadStatus: Equatable, Sendable {
     public let resumed: Bool
     public let reason: String?
     public let elapsed: Double
+    /// The browser unpacked the archive into this folder and removed the
+    /// archive (Safari's "Open safe files after downloading", observed live).
+    public var extractedTo: String? = nil
 
-    public var path: String? { fileName.map { (root as NSString).appendingPathComponent($0) } }
+    public var path: String? {
+        (extractedTo ?? fileName).map { (root as NSString).appendingPathComponent($0) }
+    }
 
     public var dictionary: [String: Any] {
         var out: [String: Any] = [
@@ -184,6 +189,11 @@ public struct BridgeDownloadStatus: Equatable, Sendable {
         if state == .complete, let path { out["path"] = path }
         if let partialFormat { out["partial_format"] = partialFormat.rawValue }
         if let reason { out["reason"] = reason }
+        if let extractedTo {
+            out["extracted_by_browser"] = true
+            out["archive_name"] = fileName as Any
+            out["extracted_to"] = extractedTo
+        }
         return out
     }
 }
@@ -227,6 +237,7 @@ public final class BridgeDownloadMonitor {
         var finalModified: Double?
         var stableSince: Double?
         var replacedExisting = false
+        var extractedTo: String?
         var stalled = false
         var resumed = false
         var state: BridgeDownloadState = .inProgress
@@ -425,6 +436,16 @@ public final class BridgeDownloadMonitor {
                 updateFinal(id: id, entry: entry, now: now)
                 continue
             }
+            if entry.isDirectory {
+                if let id = artifactID(root: root, where: { $0.extractedTo == entry.name }) {
+                    updateExtracted(id: id, entry: entry, now: now)
+                } else if changed, let id = extractionSource(root: root, folder: entry.name) {
+                    artifacts[id]?.extractedTo = entry.name
+                    artifacts[id]?.finalInode = entry.inode
+                    updateExtracted(id: id, entry: entry, now: now)
+                }
+                continue
+            }
             // An EMPTY new file is not a download yet: Firefox creates its
             // 0-byte placeholder before (sometimes a scan before) the part
             // file that will replace it — observed live. It becomes an
@@ -455,6 +476,39 @@ public final class BridgeDownloadMonitor {
         }
         claim(root: root)
         for id in order { markEnded(id, now: now) }
+    }
+
+    /// A vanished partial of an ARCHIVE whose stem is `folder` (or `stem N`):
+    /// the browser unpacked it there and deleted the archive.
+    private func extractionSource(root: String, folder: String) -> Int? {
+        let archives: Set<String> = ["zip"]
+        return artifacts.values.filter { artifact in
+            guard artifact.root == root, artifact.partialGoneAt != nil, artifact.finalInode == nil,
+                  let name = artifact.finalName, archives.contains((name as NSString).pathExtension.lowercased())
+            else { return false }
+            let stem = (name as NSString).deletingPathExtension
+            return folder == stem || folder.range(of: "^" + NSRegularExpression.escapedPattern(for: stem) + #" \d+$"#,
+                                                  options: .regularExpression) != nil
+        }.map { $0.id }.min()
+    }
+
+    /// An extracted folder is complete once its modification time held still
+    /// for the settle interval.
+    private func updateExtracted(id: Int, entry: BridgeDirectoryEntry, now: Double) {
+        guard var artifact = artifacts[id] else { return }
+        if artifact.finalModified != entry.modified {
+            artifact.finalModified = entry.modified
+            artifact.stableSince = now
+        }
+        artifact.partialName = nil
+        if let since = artifact.stableSince, now - since >= timings.settleSeconds {
+            artifact.state = .complete
+            artifact.reason = nil
+        } else {
+            artifact.state = .inProgress
+            artifact.reason = "settling"
+        }
+        artifacts[id] = artifact
     }
 
     private func updateFinal(id: Int, entry: BridgeDirectoryEntry, now: Double) {
@@ -540,7 +594,8 @@ public final class BridgeDownloadMonitor {
         } ?? false
         var state = artifact.state
         var reason = artifact.reason
-        if state == .complete, let expected = expectation.expectedBytes, artifact.bytes != expected {
+        if state == .complete, artifact.extractedTo == nil, let expected = expectation.expectedBytes,
+           artifact.bytes != expected {
             state = .failed
             reason = "size_mismatch;expected=\(expected);got=\(artifact.bytes)"
         }
@@ -549,7 +604,8 @@ public final class BridgeDownloadMonitor {
             bytes: artifact.bytes, partialFormat: artifact.format, renamed: renamed,
             replacedExisting: artifact.replacedExisting,
             resumable: artifact.state == .interrupted && artifact.partialName != nil,
-            resumed: artifact.resumed, reason: reason, elapsed: now - expectation.createdAt)
+            resumed: artifact.resumed, reason: reason, elapsed: now - expectation.createdAt,
+            extractedTo: artifact.extractedTo)
     }
 }
 

@@ -1,0 +1,182 @@
+[
+  {
+    "check": "B0 ping advertises the browser contract and verified downloads",
+    "result": "PASS",
+    "evidence": "{\"contract\": \"cmm-computer-use/browser\", \"window_targeting\": true, \"save_dialog\": true, \"select_tab\": true, \"tabs\": true, \"contract_version\": 1, \"page_lifecycle\": true}"
+  },
+  {
+    "check": "B1 chrome: a context binds to the browser by bundle",
+    "result": "PASS",
+    "evidence": "{\"label\": \"A\"}"
+  },
+  {
+    "check": "B1 firefox: a context binds to the browser by bundle",
+    "result": "PASS",
+    "evidence": "{\"label\": \"B\"}"
+  },
+  {
+    "check": "B2 without Accessibility browser.state and select_tab fail closed (nothing executed)",
+    "result": "PASS",
+    "evidence": "COMPUTER_PERMISSION_DENIED / COMPUTER_PERMISSION_DENIED"
+  },
+  {
+    "check": "B3 chrome: direct download verified on disk (SHA-256 equals what was served)",
+    "result": "PASS",
+    "evidence": "file=direct.csv bytes=31899 sha=280a0ac1def3\u2026 served=280a0ac1def3\u2026"
+  },
+  {
+    "check": "B4 chrome: PDF download verified",
+    "result": "PASS",
+    "evidence": "file=paper.pdf bytes=60127 sha=24179f1e845f\u2026 served=24179f1e845f\u2026"
+  },
+  {
+    "check": "B5 chrome: ZIP download verified",
+    "result": "PASS",
+    "evidence": "file=archive.zip bytes=46861 sha=9b4973f0d8a2\u2026 served=9b4973f0d8a2\u2026"
+  },
+  {
+    "check": "B6 chrome: 302 redirect to a dynamically named file, no hint",
+    "result": "PASS",
+    "evidence": "file=generated-124c9c.txt bytes=9600 sha=1ef24b747ccf\u2026 served=1ef24b747ccf\u2026"
+  },
+  {
+    "check": "B7 chrome: two simultaneous downloads, each verified and attributed to its own expectation",
+    "result": "PASS",
+    "evidence": "file=slow-a.bin bytes=600000 sha=630c3c6748fd\u2026 served=630c3c6748fd\u2026 | file=slow-b.bin bytes=600000 sha=644320d61ef4\u2026 served=644320d61ef4\u2026 | first seen in_progress"
+  },
+  {
+    "check": "B8 chrome: an aborted transfer is seen and reported failed or interrupted, never complete",
+    "result": "PASS",
+    "evidence": "state=failed reason=partial_removed resumable=False on_disk=[]"
+  },
+  {
+    "check": "B9 chrome: a stalled transfer is reported interrupted (resumable), never complete",
+    "result": "PASS",
+    "evidence": "started=in_progress end=interrupted reason=no_growth bytes=200000"
+  },
+  {
+    "check": "B3 firefox: direct download verified on disk (SHA-256 equals what was served)",
+    "result": "PASS",
+    "evidence": "file=direct.csv bytes=31899 sha=280a0ac1def3\u2026 served=280a0ac1def3\u2026"
+  },
+  {
+    "check": "B4 firefox: PDF download verified",
+    "result": "PASS",
+    "evidence": "file=paper.pdf bytes=60127 sha=24179f1e845f\u2026 served=24179f1e845f\u2026"
+  },
+  {
+    "check": "B5 firefox: ZIP download verified",
+    "result": "PASS",
+    "evidence": "file=archive.zip bytes=46861 sha=9b4973f0d8a2\u2026 served=9b4973f0d8a2\u2026"
+  },
+  {
+    "check": "B6 firefox: 302 redirect to a dynamically named file, no hint",
+    "result": "PASS",
+    "evidence": "file=generated-561cf8.txt bytes=9600 sha=c8c3c9f046ab\u2026 served=c8c3c9f046ab\u2026"
+  },
+  {
+    "check": "B7 firefox: two simultaneous downloads, each verified and attributed to its own expectation",
+    "result": "PASS",
+    "evidence": "file=slow-a.bin bytes=600000 sha=630c3c6748fd\u2026 served=630c3c6748fd\u2026 | file=slow-b.bin bytes=600000 sha=644320d61ef4\u2026 served=644320d61ef4\u2026 | first seen in_progress"
+  },
+  {
+    "check": "B8 firefox: an aborted transfer is seen and reported failed or interrupted, never complete",
+    "result": "PASS",
+    "evidence": "state=failed reason=size_mismatch;expected=2000000;got=300000 resumable=False on_disk=['cut.bin']"
+  },
+  {
+    "check": "B9 firefox: a stalled transfer is reported interrupted (resumable), never complete",
+    "result": "PASS",
+    "evidence": "started=in_progress end=interrupted reason=no_growth bytes=200000"
+  },
+  {
+    "check": "B10 a browser crash mid-download leaves the other context and its download intact",
+    "result": "PASS",
+    "evidence": "survivor: file=slow-a (1).bin bytes=600000 sha=630c3c6748fd\u2026 served=630c3c6748fd\u2026 | victim: state=interrupted reason=no_growth"
+  },
+  {
+    "check": "B11 a resent download.expect with the same op_id is the same expectation",
+    "result": "PASS",
+    "evidence": "dl_c25a80de7\u2026"
+  },
+  {
+    "check": "B12 another client process cannot read this expectation",
+    "result": "PASS",
+    "evidence": "DOWNLOAD_UNKNOWN"
+  },
+  {
+    "check": "B13 a directory outside the roots is refused; a grant without roots cannot watch",
+    "result": "PASS",
+    "evidence": "DOWNLOAD_ROOT_NOT_ALLOWED / DOWNLOADS_NOT_ENABLED"
+  },
+  {
+    "check": "B14 a 6 s download.wait does not block other requests",
+    "result": "PASS",
+    "evidence": "workspace.status in 3 ms while waiting; wait ended timed_out=True"
+  },
+  {
+    "check": "S1 safari: a context binds to the person's running Safari (bundle only; no AX read)",
+    "result": "PASS",
+    "evidence": "{\"label\": \"A\"}"
+  },
+  {
+    "check": "S3 safari: direct download verified on disk (SHA-256 equals what was served)",
+    "result": "PASS",
+    "evidence": "file=cmm-lane-641973bb-direct.csv bytes=31899 sha=280a0ac1def3\u2026 served=280a0ac1def3\u2026 format=webkit_bundle"
+  },
+  {
+    "check": "S4 safari: PDF download verified",
+    "result": "PASS",
+    "evidence": "file=cmm-lane-641973bb-paper.pdf bytes=60127 sha=24179f1e845f\u2026 served=24179f1e845f\u2026 format=webkit_bundle"
+  },
+  {
+    "check": "S5 safari: ZIP download verified",
+    "result": "PASS",
+    "evidence": "extracted_by_browser to=cmm-lane-641973bb-archive members=['part-0.txt', 'part-1.txt', 'part-2.txt', 'part-3.txt', 'part-4.txt'] format=webkit_bundle"
+  },
+  {
+    "check": "S6 safari: 302 redirect to a dynamically named file, no hint",
+    "result": "PASS",
+    "evidence": "file=generated-cmm-lane-641973bb.txt bytes=14000 sha=6595ecaea335\u2026 served=6595ecaea335\u2026"
+  },
+  {
+    "check": "S7 safari: two simultaneous downloads, each verified and attributed to its own expectation",
+    "result": "PASS",
+    "evidence": "file=cmm-lane-641973bb-slow-a.bin bytes=600000 sha=630c3c6748fd\u2026 served=630c3c6748fd\u2026 | file=cmm-lane-641973bb-slow-b.bin bytes=600000 sha=644320d61ef4\u2026 served=644320d61ef4\u2026 | format=webkit_bundle"
+  },
+  {
+    "check": "S8 safari: an aborted transfer is seen and reported failed or interrupted, never complete",
+    "result": "PASS",
+    "evidence": "state=interrupted reason=no_growth format=webkit_bundle resumable=True"
+  },
+  {
+    "check": "S9 safari: a stalled transfer is reported interrupted (resumable), never complete",
+    "result": "PASS",
+    "evidence": "started=in_progress end=interrupted reason=no_growth format=webkit_bundle"
+  },
+  {
+    "check": "S10 safari: only this run's files (token cmm-lane-641973bb) were moved to the Trash",
+    "result": "PASS",
+    "evidence": "moved=8 ['cmm-lane-641973bb-archive', 'cmm-lane-641973bb-cut.bin.download', 'cmm-lane-641973bb-direct.csv', 'cmm-lane-641973bb-paper.pdf', 'cmm-lane-641973bb-slow-a.bin', 'cmm-lane-641973bb-slow-b.bin', 'cmm-lane-641973bb-stall.bin.download', 'generated-cmm-lane-641973bb.txt'] left=[]"
+  },
+  {
+    "check": "B15 every browser the lane started is stopped (pids checked against the lane path)",
+    "result": "PASS",
+    "evidence": "60550 /var/folders/zq/st7gxvzs77gcq_czwvlfyrlw0000gn/T/cmm-ws-lane-8cm0n3yi/CMMComputerUseLane.app/Contents/MacOS/CMMComputerUse --serve-socket /var/folders/zq/st7gxvzs77gcq_czwvlfyrlw0000gn/T/cmmwsb8bks3iq/b.sock --policy background --policy-file /var/folders/zq/st7gxvzs77gcq_czwvlfyrlw0000gn/T/cmm"
+  },
+  {
+    "check": "B16 no lane process (headless browser or lane helper) came to the front (witness every 100 ms)",
+    "result": "PASS",
+    "evidence": "2350 samples; fronts seen: ['\"CFBundleIdentifier\"=\"com.anthropic.claudefordesktop\"', '\"CFBundleIdentifier\"=\"com.apple.TextEdit\"', '\"CFBundleIdentifier\"=\"com.apple.UserNotificationCenter\"', '\"CFBundleIdentifier\"=\"com.apple.finder\"', '\"CFBundleIdentifier\"=\"com.deepseek.dsh\"', '\"CFBundleIdentifier\"=\"com.google.Chrome\"', '\"CFBundleIdentifier\"=\"com.microsoft.Word\"', '\"CFBundleIdentifier\"=\"es.trivium.app\"']"
+  },
+  {
+    "check": "S11 safari: no background open brought Safari to the front (8 opens)",
+    "result": "PASS",
+    "evidence": "none"
+  },
+  {
+    "check": "B17 production unchanged (policy, latch, audit, socket, LaunchAgent, helper binary, helper pid)",
+    "result": "PASS",
+    "evidence": "identical"
+  }
+]

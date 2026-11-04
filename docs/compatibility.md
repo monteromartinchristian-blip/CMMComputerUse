@@ -99,13 +99,19 @@ report for the evidence.
 
 | Capability | Chrome | Firefox | Safari |
 |---|---|---|---|
-| Verified downloads (direct, PDF, ZIP, redirect, script-triggered, two at once) | **tested live** (headless, isolated profile) | **tested live** (headless, isolated profile) | implemented (`.download` bundle format, XCTest); **not run live**: Safari cannot run isolated from the person's session |
-| Aborted / stalled transfer never reported complete | **tested live** | **tested live** (a cut transfer is caught only with `expected_bytes`/`expected_sha256`: Firefox keeps the truncated file as finished) | XCTest only |
-| Browser crash affects only its own context | **tested live** (Chrome vs Firefox) | **tested live** | not run |
+| Verified downloads (direct, PDF, ZIP, redirect, two at once) | **tested live** (headless, isolated profile) | **tested live** (headless, isolated profile) | **tested live** (the person's own Safari, background tabs, with their authorization) |
+| ZIP unpacked by the browser ("Open safe files") | n/a | n/a | **tested live**: reported `complete` with `extracted_by_browser` |
+| Aborted / stalled transfer never reported complete | **tested live** | **tested live** (a cut transfer is caught only with `expected_bytes`/`expected_sha256`: Firefox keeps the truncated file as finished) | **tested live** (`interrupted`, resumable `.download` bundle) |
+| Browser crash affects only its own context | **tested live** (Chrome vs Firefox) | **tested live** | not run (the lane never kills the person's Safari) |
 | Tabs, page lifecycle, `select_tab` (AX) | implemented; XCTest on the model; **not run live** (needs Accessibility for a test helper) | same | same |
 | Save dialog (AX, name conflict, explicit overwrite) | implemented; XCTest on the recognizer; **not run live** | same | same |
 | Resume of an interrupted download | detection tested live (`interrupted`, `resumable`); pressing Resume is an ordinary AX press, **not run live** | same | same |
 | Save As of a PDF shown inline (no download link) | **not implemented in background**: needs the File menu (AX menu press) or ⌘S (global keyboard, unrestricted only) | same | same |
+
+The download root must be the folder the browser really uses. The helper
+cannot read browser settings. Observed live: this person's Safari saves to
+iCloud Drive › Downloads, not `~/Downloads`. A wrong root answers
+`not_started` and never claims a download.
 
 | Harness | Browser tools |
 |---|---|

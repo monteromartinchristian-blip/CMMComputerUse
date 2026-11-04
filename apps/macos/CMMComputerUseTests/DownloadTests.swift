@@ -158,6 +158,31 @@ final class DownloadTests: XCTestCase {
         XCTAssertEqual(s.bytes, 31899)
     }
 
+    /// Live-lane finding (the person's Safari): "Open safe files after
+    /// downloading" unpacks a ZIP into a folder and deletes the archive.
+    func testSafariUnpackingAZipIsACompleteDownloadExtractedByTheBrowser() {
+        let m = monitor()
+        let id = expect(m, [], hint: "run-archive.zip", at: 0)
+        _ = state(m, id, [bundle("run-archive.zip.download", 40000, inode: 700)], at: 1)
+        let unpacked = [BridgeDirectoryEntry(name: "run-archive", isDirectory: true, size: 0, inode: 701, modified: 2)]
+        XCTAssertEqual(state(m, id, unpacked, at: 2).state, .inProgress)
+        let s = state(m, id, unpacked, at: 3.5)
+        XCTAssertEqual(s.state, .complete)
+        XCTAssertEqual(s.extractedTo, "run-archive")
+        XCTAssertEqual(s.path, root + "/run-archive")
+        XCTAssertEqual(s.dictionary["extracted_by_browser"] as? Bool, true)
+        XCTAssertEqual(s.dictionary["archive_name"] as? String, "run-archive.zip")
+    }
+
+    func testAnUnrelatedFolderIsNotTakenForAnExtraction() {
+        let m = monitor()
+        let id = expect(m, [], hint: "a.pdf", at: 0)
+        _ = state(m, id, [bundle("a.pdf.download", 400, inode: 710)], at: 1)
+        let folder = [BridgeDirectoryEntry(name: "a", isDirectory: true, size: 0, inode: 711, modified: 2)]
+        _ = state(m, id, folder, at: 2)
+        XCTAssertEqual(state(m, id, folder, at: 6).state, .failed, "only an archive is unpacked into a folder")
+    }
+
     /// The trace Chrome (headless, new mode) wrote in the live lane: a hidden
     /// temporary file first, then `Name.crdownload`, renamed in place.
     func testLiveChromeTraceIgnoresTheHiddenTemporaryFile() {

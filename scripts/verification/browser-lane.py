@@ -45,8 +45,10 @@ import os
 import pathlib
 import signal
 import socket
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -121,7 +123,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.connection.shutdown(socket.SHUT_RDWR)
                     return
                 if stall and sent >= 200_000:
-                    time.sleep(90)  # keep the connection open, send nothing
+                    # Keep the connection open sending nothing (the stall),
+                    # then cut it so no browser is left waiting forever.
+                    time.sleep(45)
+                    self.connection.shutdown(socket.SHUT_RDWR)
                     return
                 self.wfile.write(body[sent:sent + step])
                 self.wfile.flush()
@@ -161,16 +166,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             filename = "generated-%s.txt" % query.get("n", "1")
             SERVED[filename] = hashlib.sha256(body).hexdigest()
             return self._attachment(filename, "text/plain", body)
+        alias = query.get("as")  # unique name for runs in the person's own Downloads
+        if alias is not None and (not alias.startswith("cmm-lane-") or "/" in alias):
+            alias = None
         if name == "cut.bin":
             body = FILES["victim.bin"][1]
             # Slow enough that the partial file is visible before the cut.
-            return self._attachment("cut.bin", "application/octet-stream", body, slow=True, cut=300_000)
+            return self._attachment(alias or "cut.bin", "application/octet-stream", body, slow=True, cut=300_000)
         if name == "stall.bin":
             body = FILES["victim.bin"][1]
-            return self._attachment("stall.bin", "application/octet-stream", body, stall=True)
+            return self._attachment(alias or "stall.bin", "application/octet-stream", body, stall=True)
         if name in FILES:
             mime, body = FILES[name]
-            return self._attachment(name, mime, body, slow=name in SLOW)
+            return self._attachment(alias or name, mime, body, slow=name in SLOW)
         self.send_response(404)
         self.end_headers()
 
@@ -290,7 +298,7 @@ class PidWitness:
         self.scratch = scratch
         self._args: dict[int, str] = {}
         self.lane_front: list[int] = []
-        self.samples: list[tuple[str, int]] = []
+        self.samples: list[tuple[str, int, float]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -305,7 +313,7 @@ class PidWitness:
             if pid not in self._args:
                 self._args[pid] = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
                                                  capture_output=True, text=True).stdout
-            self.samples.append((frontmost(), pid))
+            self.samples.append((frontmost(), pid, time.time()))
             if self.scratch and self.scratch in self._args[pid]:
                 self.lane_front.append(pid)
             self._stop.wait(0.1)
@@ -381,6 +389,128 @@ def scenario(sock, server, lane, kind, context, dl, label, path, hint, served_na
         browser.stop()
 
 
+SAFARI = "com.apple.Safari"
+SAFARI_OPENS: list[float] = []
+
+
+def safari_open(url: str) -> None:
+    """A background tab in the person's OWN Safari: `open -g` (no activation).
+    The lane never quits, signals or reconfigures Safari."""
+
+    SAFARI_OPENS.append(time.time())
+    subprocess.run(["open", "-g", "-a", "Safari", url], check=True, capture_output=True)
+
+
+def trash_lane_files(directory: pathlib.Path, token: str) -> list[str]:
+    """Move ONLY the files this run created (their names carry its random
+    token) to the Trash: recoverable, never deleted."""
+
+    names = sorted(p.name for p in directory.iterdir() if token in p.name)
+    if names:
+        # FileManager.trashItem is refused (NSCocoaError 513) for files in
+        # iCloud Drive that Safari just wrote; a move into ~/.Trash works and
+        # stays recoverable from the Finder's Trash.
+        bin_dir = pathlib.Path.home() / ".Trash" / token
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            shutil.move(str(directory / name), str(bin_dir / name))
+    return names
+
+
+def safari_checks(sock, server, home_dl: pathlib.Path) -> None:
+    """The person's own Safari, with their authorization: background tabs,
+    files in their Downloads under a random token, moved to the Trash after."""
+
+    token = "cmm-lane-" + uuid.uuid4().hex[:8]
+    created = raw(sock, "workspace.context_create", {"app": SAFARI})
+    record("S1 safari: a context binds to the person's running Safari (bundle only; no AX read)",
+           created.get("ok") is True, json.dumps(created.get("error") or {"label": created["result"].get("label")}))
+    if not created.get("ok"):
+        return
+    context = created["result"]["context_id"]
+    root = str(home_dl)
+
+    def one(check: str, title: str, path: str, served: str, name: str) -> None:
+        declared = ok(expect(sock, context, name, directory=root))
+        safari_open(server.url(path + "?as=" + urllib.parse.quote(name)))
+        status = wait(sock, declared["download_id"], 60)
+        if status.get("extracted_by_browser"):
+            # Safari unpacked the archive and removed it: the archive's members
+            # (names only) must be in the folder it reports.
+            folder = pathlib.Path(status["path"])
+            members = sorted(zipfile.ZipFile(io.BytesIO(FILES[served][1])).namelist())
+            present = sorted(p.name for p in folder.iterdir()) if folder.is_dir() else []
+            good = status.get("state") == "complete" and present == members and status.get("archive_name") == name
+            evidence = "extracted_by_browser to=%s members=%s" % (folder.name, present)
+        else:
+            good, evidence = verified(sock, status, home_dl, served)
+            good = good and status.get("file_name") == name
+        record("%s safari: %s" % (check, title), good, evidence + " format=%s" % status.get("partial_format"))
+        raw(sock, "download.forget", {"download_id": declared["download_id"]})
+
+    try:
+        one("S3", "direct download verified on disk (SHA-256 equals what was served)", "/direct.csv",
+            "direct.csv", token + "-direct.csv")
+        one("S4", "PDF download verified", "/paper.pdf", "paper.pdf", token + "-paper.pdf")
+        one("S5", "ZIP download verified", "/archive.zip", "archive.zip", token + "-archive.zip")
+        declared = ok(expect(sock, context, None, directory=root))
+        safari_open(server.url("/redirect?n=" + token))
+        status = wait(sock, declared["download_id"], 60)
+        good, evidence = verified(sock, status, home_dl, "generated-%s.txt" % token)
+        record("S6 safari: 302 redirect to a dynamically named file, no hint", good, evidence)
+        a = ok(expect(sock, context, token + "-slow-a.bin", directory=root))
+        b = ok(expect(sock, context, token + "-slow-b.bin", directory=root))
+        safari_open(server.url("/slow-a.bin?as=" + token + "-slow-a.bin"))
+        safari_open(server.url("/slow-b.bin?as=" + token + "-slow-b.bin"))
+        sa, sb = wait(sock, a["download_id"], 60), wait(sock, b["download_id"], 60)
+        ga, ea = verified(sock, sa, home_dl, "slow-a.bin")
+        gb, eb = verified(sock, sb, home_dl, "slow-b.bin")
+        record("S7 safari: two simultaneous downloads, each verified and attributed to its own expectation",
+               ga and gb and sa.get("file_name") == token + "-slow-a.bin"
+               and sb.get("file_name") == token + "-slow-b.bin",
+               "%s | %s | format=%s" % (ea, eb, sa.get("partial_format")))
+        cut = ok(expect(sock, context, token + "-cut.bin", directory=root,
+                        expected_bytes=len(FILES["victim.bin"][1])))
+        safari_open(server.url("/cut.bin?as=" + token + "-cut.bin"))
+        status = wait(sock, cut["download_id"], 45)
+        record("S8 safari: an aborted transfer is seen and reported failed or interrupted, never complete",
+               status.get("state") in ("failed", "interrupted"),
+               "state=%s reason=%s format=%s resumable=%s" % (status.get("state"), status.get("reason"),
+                                                             status.get("partial_format"), status.get("resumable")))
+        stall = ok(expect(sock, context, token + "-stall.bin", directory=root))
+        safari_open(server.url("/stall.bin?as=" + token + "-stall.bin"))
+        started = wait(sock, stall["download_id"], 20, until="started")
+        status = wait(sock, stall["download_id"], 40)
+        record("S9 safari: a stalled transfer is reported interrupted (resumable), never complete",
+               status.get("state") == "interrupted" and status.get("resumable") is True,
+               "started=%s end=%s reason=%s format=%s" % (started.get("state"), status.get("state"),
+                                                          status.get("reason"), status.get("partial_format")))
+    finally:
+        forget_all(sock)
+        raw(sock, "workspace.context_close", {"context_id": context})
+        time.sleep(50)  # the server cuts the stalled transfer at 45 s: let Safari finish with it
+        moved = trash_lane_files(home_dl, token)
+        left = sorted(p.name for p in home_dl.iterdir() if token in p.name)
+        record("S10 safari: only this run's files (token %s) were moved to the Trash" % token,
+               not left, "moved=%d %s left=%s" % (len(moved), moved[:8], left))
+
+
+def safari_front_check(witness) -> None:
+    """Safari must not come to the front because of a background open: a
+    sample just before each open that is NOT Safari, followed by Safari in
+    front within 2 s, is a violation. Safari already in front (the person
+    using it) is not."""
+
+    violations = []
+    for opened in SAFARI_OPENS:
+        before = [s for s in witness.samples if s[2] < opened]
+        after = [s for s in witness.samples if opened <= s[2] <= opened + 2]
+        if before and SAFARI not in before[-1][0] and any(SAFARI in s[0] for s in after):
+            violations.append(round(opened, 1))
+    record("S11 safari: no background open brought Safari to the front (%d opens)" % len(SAFARI_OPENS),
+           not violations and len(SAFARI_OPENS) > 0, "violations at %s" % violations if violations else "none")
+
+
 def forget_all(sock) -> None:
     """Client hygiene: an interrupted download stays open until forgotten."""
 
@@ -393,9 +523,16 @@ def main() -> int:
     parser.add_argument("--app", required=True, type=pathlib.Path, help="built CMMComputerUse.app (dev)")
     parser.add_argument("--evidence", type=pathlib.Path, default=None)
     parser.add_argument("--browsers", default="chrome,firefox")
+    parser.add_argument("--safari-downloads", default="~/Downloads",
+                        help="the folder the person's Safari saves into (Safari › Settings › General)")
     args = parser.parse_args()
     assert_isolated(args.app)
-    kinds = [k for k in args.browsers.split(",") if k]
+    requested = [k for k in args.browsers.split(",") if k]
+    kinds = [k for k in requested if k in ("chrome", "firefox")]
+    # Safari saves where ITS settings say (observed: iCloud Drive › Downloads,
+    # not ~/Downloads). The helper cannot read Safari's settings, so the
+    # folder is given explicitly and must be the one Safari really uses.
+    home_dl = pathlib.Path(os.path.expanduser(args.safari_downloads))
 
     before = production_snapshot()
     lane = Lane(args.app)
@@ -407,6 +544,9 @@ def main() -> int:
         {"bundle_id": CHROME, "scopes": ["observe"], "downloads": {"roots": [str(dls["chrome"])]}},
         {"bundle_id": FIREFOX, "scopes": ["observe"], "downloads": {"roots": [str(dls["firefox"])]}},
         {"bundle_id": "com.apple.finder", "scopes": ["observe"]},
+        # The person's own Safari: observe only (the lane helper has no AX),
+        # and their real download folder, authorized by the person for this.
+        {"bundle_id": SAFARI, "scopes": ["observe"], "downloads": {"roots": [str(home_dl)]}},
     ]})
     witness = PidWitness(str(lane.scratch))
     keepers: list[Browser] = []
@@ -584,6 +724,11 @@ def main() -> int:
                    "workspace.status in %.0f ms while waiting; wait ended timed_out=%s" % (latency * 1000,
                                                                                          box.get("timed_out")))
             raw(sock, "download.forget", {"download_id": pending["download_id"]})
+        if "safari" in requested:
+            for context in contexts.values():
+                if context:
+                    raw(sock, "workspace.context_close", {"context_id": context})
+            safari_checks(sock, server, home_dl)
     finally:
         witness.stop()
         for browser in keepers:
@@ -606,6 +751,8 @@ def main() -> int:
     record("B16 no lane process (headless browser or lane helper) came to the front (witness every 100 ms)",
            not lane_front and len(witness.samples) > 10,
            "%d samples; fronts seen: %s" % (len(witness.samples), sorted({s[0] for s in witness.samples}))[:300])
+    if "safari" in requested:
+        safari_front_check(witness)
     after = production_snapshot()
     diff = {k: (before[k], after.get(k)) for k in before if before[k] != after.get(k)}
     record("B17 production unchanged (policy, latch, audit, socket, LaunchAgent, helper binary, helper pid)",

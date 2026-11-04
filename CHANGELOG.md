@@ -30,6 +30,10 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
   page/tab change (read only).
 - `observation.describe` takes `window_id`; explicit contexts keep their window.
 
+- Downloads verified live in Chrome, Firefox and Safari. A ZIP that Safari
+  unpacks is reported as `extracted_by_browser`. `expected_bytes` and
+  `expected_sha256` catch truncated files a browser keeps as finished.
+
 ### Fixed
 
 - The PiP restarted its live stream whenever the window title changed (every

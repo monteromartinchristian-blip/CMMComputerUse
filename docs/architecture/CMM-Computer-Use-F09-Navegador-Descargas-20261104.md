@@ -99,12 +99,12 @@ Las suites se ejecutaron sobre el árbol final de esta rama.
 
 | Suite | Comando | Resultado |
 |---|---|---|
-| XCTest (helper + Shared) | `xcodebuild test -scheme CMMComputerUse` | **293/293** (253 previas + 40 nuevas), sin avisos nuevos |
+| XCTest (helper + Shared) | `xcodebuild test -scheme CMMComputerUse` | **295/295** (253 previas + 42 nuevas), sin avisos nuevos |
 | Guardas de código | `python3 scripts/verification/check-helper-source.py` | **44/44** (+F1–F5 y BrowserSupport en el build) |
 | Adaptador Python | `python3 -m unittest discover -s tests` | **128/128** (+21) |
 | Node (proyección, PiP, streamer) | `node --test tests/*.test.mjs`, 3 ejecuciones | **151/151** en las tres (+8) |
 | Manifest, cliente renderizado, `test_patch.py`, tarball | `verify-manifest.mjs`, `check-tarball.py` | PASS (16 ficheros: ahora incluye `browser.py`) |
-| Lane en vivo con navegadores reales | `scripts/verification/browser-lane.py` | **26/26** en dos ejecuciones seguidas (§5) |
+| Lane en vivo con navegadores reales | `scripts/verification/browser-lane.py` | Chrome y Firefox: **26/26** en dos ejecuciones seguidas. Con Safari: **36/36** (§5) |
 
 ## 5. Pruebas en vivo
 
@@ -147,6 +147,33 @@ Checks comunes:
 - **B16:** ningún proceso del lane pasó a primer plano. En primer plano solo aparecieron las apps de la persona.
 - **B17:** producción quedó idéntica.
 
+### 5.2b Safari (tu Safari, con tu autorización)
+
+Se probó en tu propio Safari, no en una copia aislada:
+
+- **Pestañas.** Se abrieron en segundo plano con `open -g`, sin activar Safari, y el lane nunca cierra, configura ni mata Safari.
+- **Archivos.** Llegaron a la carpeta real de Safari, iCloud Drive › Descargas, con un token aleatorio en el nombre. Al terminar se movieron a la Papelera, de donde se pueden recuperar.
+- **Evidencia:** `docs/architecture/evidence/f09-browser-lane-run9-safari.json`.
+
+| Check | Resultado |
+|---|---|
+| S3 descarga directa: SHA-256 en disco = enviado | PASS (formato `.download`) |
+| S4 PDF | PASS |
+| S5 ZIP | PASS: Safari lo descomprimió y borró el `.zip`. Se informa `extracted_by_browser` y en la carpeta están exactamente los miembros del ZIP |
+| S6 redirección a un nombre generado | PASS |
+| S7 dos descargas simultáneas atribuidas correctamente | PASS |
+| S8 transferencia cortada | PASS (`interrupted`; el `.download` queda reanudable) |
+| S9 transferencia bloqueada | PASS (`interrupted`) |
+| S10 solo se movieron a la Papelera los archivos de esta ejecución | PASS |
+| S11 ninguna apertura en segundo plano puso Safari delante | PASS (8 aperturas) |
+
+Hallazgos con Safari, corregidos o documentados:
+
+- **Carpeta de descargas.** Tu Safari guarda en iCloud Drive › Descargas, no en `~/Descargas`. Con la raíz equivocada, el helper respondió `not_started` y nunca afirmó una descarga. Ahora el adaptador avisa de esa posibilidad, y la política debe declarar la carpeta real.
+- **ZIP descomprimido por el navegador.** Al descomprimir, Safari borra el archivo. Antes se informaba como fallo; ahora es `complete` con `extracted_by_browser`.
+- **Papelera en iCloud.** `FileManager.trashItem` falla (513) con archivos recién escritos en iCloud. El lane los mueve a `~/.Trash/<token>/`.
+- **Safari Technology Preview.** Se instaló para aislar la prueba, pero no aísla: guarda siempre en `~/Descargas`. Se descartó.
+
 ### 5.3 Defectos que encontraron las pruebas en vivo
 
 Los cinco están corregidos y cubiertos por una prueba de regresión:
@@ -168,29 +195,26 @@ El lane también tuvo que corregirse a sí mismo. Firefox se re-ejecuta con otro
 | 1 | Cambio de pestaña sin desconexión | **IMPLEMENTADO; probado a nivel de código** (XCTest del modelo, adaptador y DSH). **En vivo: NO EJECUTADO**, requiere Accesibilidad | `tab_switched` con el contexto vivo; el PiP conserva el stream |
 | 2 | Navegación y recarga | igual que el 1 | `navigated` / `reloaded`; observación nueva automática |
 | 3 | Abrir y cerrar pestañas y ventanas | igual que el 1 | `opened_tabs`, `closed_tabs`, `window_closed` |
-| 4 | Descarga directa | **VERIFICADO EN VIVO** con Chrome y Firefox | B3 |
-| 5 | PDF | **VERIFICADO EN VIVO** con Chrome y Firefox, como descarga | B4. El visor PDF en línea, ver §7 |
-| 6 | ZIP | **VERIFICADO EN VIVO** con Chrome y Firefox | B5 |
-| 7 | Redirección | **VERIFICADO EN VIVO** con Chrome y Firefox | B6 |
+| 4 | Descarga directa | **VERIFICADO EN VIVO** con Chrome, Firefox y Safari | B3, S3 |
+| 5 | PDF | **VERIFICADO EN VIVO** con Chrome, Firefox y Safari, como descarga | B4, S4. El visor PDF en línea, ver §7 |
+| 6 | ZIP | **VERIFICADO EN VIVO** con Chrome, Firefox y Safari (que lo descomprime) | B5, S5 |
+| 7 | Redirección | **VERIFICADO EN VIVO** con Chrome, Firefox y Safari | B6, S6 |
 | 8 | Cuadro de diálogo de destino | **IMPLEMENTADO**; reconocedor en XCTest. **En vivo: NO EJECUTADO**, requiere Accesibilidad | `browser.save_dialog` |
-| 9 | Interrupción y recuperación | Detección **VERIFICADA EN VIVO** (B8, B9). Pulsar "Reanudar" es una pulsación AX normal, **no ejecutada en vivo** | `interrupted` → `in_progress` → `resumed` en XCTest |
-| 10 | Dos descargas simultáneas | **VERIFICADO EN VIVO** con Chrome y Firefox | B7 |
+| 9 | Interrupción y recuperación | Detección **VERIFICADA EN VIVO** con los tres navegadores (B8, B9, S8, S9). Pulsar "Reanudar" es una pulsación AX normal, **no ejecutada en vivo** | `interrupted` → `in_progress` → `resumed` en XCTest |
+| 10 | Dos descargas simultáneas | **VERIFICADO EN VIVO** con Chrome, Firefox y Safari | B7, S7 |
 | 11 | Cambio de pestaña con una descarga en curso | El seguimiento de la descarga no depende de la pestaña (prueba de diseño). **En vivo: NO EJECUTADO** | — |
 | 12 | Recuperación del navegador sin afectar a otros contextos ni al segundo panel | **VERIFICADO EN VIVO** con un navegador caído y el otro intacto (B10). Carril B intacto en el PiP (Node) | B10, `browser-lanes.test.mjs` |
 
-Safari no se ha ejecutado en vivo en ningún criterio. El formato `.download` está implementado y cubierto por XCTest.
+Safari se ejecutó en vivo (§5.2b) para los criterios 4–7, 9 (detección) y 10, igual que Chrome y Firefox. El criterio 12 se probó solo entre Chrome y Firefox: el lane no mata nunca tu Safari.
 
 ## 7. Límites y lo que queda pendiente
 
 - **Accesibilidad en vivo.** Pestañas, `select_tab`, cuadro de guardado y "Reanudar" necesitan un helper de prueba con Accesibilidad. Concederla es un cambio de TCC y requiere tu autorización.
-- **Safari en vivo.** No se puede ejecutar aislado de tu sesión: hay un solo proceso por usuario y la carpeta de descargas es global. Las alternativas están en la sección 8.
 - **"Guardar como" de un PDF mostrado en línea, sin enlace de descarga.** Requiere el menú Archivo, mediante una pulsación AX de menú, o ⌘S, que es teclado global. No está implementado en segundo plano. El caso de DSH que motivó parte de F-09 (⌘S con el navegador delante) queda resuelto con `computer_use_download` cuando la página tiene un enlace o botón de descarga.
 - **Selección de carpeta en el cuadro de guardado.** Se usa la carpeta que muestra el cuadro. Navegar a otra carpeta no forma parte de la v1.
 - **Integridad.** Sin `expected_bytes` o `expected_sha256`, una descarga truncada que el navegador da por terminada no se puede detectar (pasa con Firefox).
 - **Integración.** Para producción, la política tiene que declarar `downloads.roots`, y macOS puede pedir acceso a la carpeta Descargas para el helper. Ambas cosas forman parte de la integración, que no se ha hecho.
 
-## 8. Safari en vivo: opciones
+## 8. Safari en vivo
 
-1. **Safari Technology Preview (recomendada).** Es una app de Apple separada, con su propio proceso, ajustes y datos, aislada de tu Safari. Habría que instalarla. Después el lane la usaría, con su carpeta de descargas apuntando al directorio del lane. Esto cubre las descargas sin Accesibilidad.
-2. **Tu Safari, de forma explícita.** El lane abriría pestañas en segundo plano (`open -g`) en tu sesión, y los archivos irían a tu carpeta de descargas. Esto toca tu sesión abierta.
-3. **Las pruebas de pestañas y del cuadro de guardado** necesitan además un helper de prueba con Accesibilidad, en cualquier navegador.
+Ejecutado con tu Safari y tu autorización (§5.2b). Safari Technology Preview queda instalado sin uso. Desinstalarlo pide tu contraseña.

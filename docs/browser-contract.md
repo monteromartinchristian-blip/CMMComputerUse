@@ -144,6 +144,19 @@ finished writing a non-empty, stable file". With them:
 - the wrong hash is reported as `failed` with `reason=checksum_mismatch`. A
   declared hash is an explicit request to read the file.
 
+**Archives unpacked by the browser.** With "Open safe files after
+downloading", Safari unpacks a ZIP into a folder and deletes the archive
+(observed live). The download is reported `complete` with:
+
+- `extracted_by_browser: true`;
+- `archive_name`;
+- `extracted_to`;
+- `path`, pointing at the folder.
+
+**The root must be the browser's real folder.** The helper cannot read browser
+settings. A Safari that saves to iCloud Drive › Downloads needs that folder as
+its root.
+
 **Lost answers.** If a trigger press returns `OUTCOME_UNKNOWN`, the client does not press again. It asks the expectation whether a download started.
 
 ## 5. Client rules (adapter `browser.py`)
