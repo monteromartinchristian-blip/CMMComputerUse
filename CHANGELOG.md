@@ -54,6 +54,18 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
   `download.status`. A declared `expected_sha256` is never listed as
   `complete` with a path unless verified; without a declared checksum the
   list reads no file.
+- Final audit A1: a `complete` download is re-checked with `lstat` at every
+  read (`status`, `wait`, `list`). If its path is gone, or is no longer the
+  same regular file (inode and size) or unpacked folder, it is `failed` with
+  `file_missing` / `file_changed`, without a path, and nothing is read.
+- Final audit A2 / R2: the checksum reader opens with `O_NOFOLLOW |
+  O_NONBLOCK`, accepts only a regular file (checked with `fstat`, with the
+  inode that was verified), reads exactly its size, and refuses files over
+  2 GiB. A link (including one to `/dev/zero`), a FIFO or a device is refused
+  without blocking. Digests are reused while the exact file is unchanged.
+- Final audit R1: an expectation past its maximum age stops answering on
+  every read, and a context that expires by inactivity forgets its download
+  expectations, as an explicit close does.
 - The PiP restarted its live stream whenever the window title changed (every
   tab switch / navigation); a page change cleared the panel as if the window
   were lost.

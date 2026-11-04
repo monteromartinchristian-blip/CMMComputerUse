@@ -2585,7 +2585,10 @@ func contextIDArgument(_ arguments: [String: Any], _ key: String = "context_id")
 func reapIdleContexts() {
     for record in workspace.reap(now: Date().timeIntervalSince1970) {
         if let streamID = record.streamID { stopWindowStreamInternal(id: streamID, reason: "context_reaped") }
-        log("CONTEXT_REAPED context=\(record.id) label=\(record.label) handles=\(record.handles.count)")
+        // An expired context's download expectations end with it, exactly as
+        // on an explicit close (audit R1).
+        let forgotten = downloadMonitor.forget(principal: record.principal, contextID: record.id)
+        log("CONTEXT_REAPED context=\(record.id) label=\(record.label) handles=\(record.handles.count) downloads=\(forgotten)")
     }
 }
 

@@ -29,6 +29,10 @@ nonisolated(unsafe) var browserTabElements: [String: [String: AXUIElement]] = [:
 /// The page a context saw last (observation or browser.state), for transitions.
 nonisolated(unsafe) var browserLastPage: [String: BridgePageState] = [:]
 nonisolated(unsafe) var downloadMonitor = BridgeDownloadMonitor()
+/// Digests already computed, by path, valid only for the exact file they
+/// were computed from (inode, size, modification time): repeated `status` /
+/// `list` reads do not re-read a large file under the lock (audit A2).
+nonisolated(unsafe) var downloadDigestCache: [String: (probe: BridgeFileProbe, digest: String)] = [:]
 /// The AX target a browser action resolved to, for THIS request only.
 nonisolated(unsafe) var requestBrowserTarget: BrowserActionTarget?
 
@@ -650,6 +654,7 @@ func downloadExpectRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
 }
 
 func downloadStatusRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    reapIdleContexts()
     guard let id = arguments["download_id"] as? String, bridgeValidOpaqueID(id, prefix: "dl"),
           let root = downloadMonitor.root(of: id, principal: currentPrincipal) else {
         return (false, nil, bridgeError(code: "DOWNLOAD_UNKNOWN", message: "No such download expectation for this client.",
@@ -670,7 +675,7 @@ func downloadStatusRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
         // caller declared) are a downloaded file's bytes read.
         var result = bridgeDownloadReport(
             status, expectedSHA256: downloadMonitor.expectedSHA256(of: id, principal: currentPrincipal),
-            requested: arguments["checksum"] as? Bool == true, digestOf: bridgeSHA256(ofFileAt:))
+            requested: arguments["checksum"] as? Bool == true, probe: bridgeProbeFile, digestOf: cachedDigest)
         if entries == nil { result["scan"] = "unavailable" }
         return (true, result, nil)
     }
@@ -689,12 +694,24 @@ func revokedDownloadRefusal(_ id: String) -> BridgePolicyRefusal? {
 }
 
 func downloadListRequest() -> (Bool, Any?, [String: Any?]?) {
+    reapIdleContexts()
     let now = Date().timeIntervalSince1970
     for id in downloadMonitor.ids(principal: currentPrincipal) { _ = revokedDownloadRefusal(id) }
     // The same integrity rule as `download.status`: a declared checksum is
     // never listed as complete unless verified (audit N1).
     return (true, ["downloads": downloadMonitor.listReports(
-        principal: currentPrincipal, now: now, digestOf: bridgeSHA256(ofFileAt:))], nil)
+        principal: currentPrincipal, now: now, probe: bridgeProbeFile, digestOf: cachedDigest)], nil)
+}
+
+/// The SHA-256 of the regular file `probe` describes (never a link, never a
+/// different inode, bounded), reused while that exact file is unchanged.
+func cachedDigest(_ path: String, _ probe: BridgeFileProbe) -> String? {
+    if let cached = downloadDigestCache[path], cached.probe == probe { return cached.digest }
+    downloadDigestCache.removeValue(forKey: path)
+    guard let digest = bridgeSHA256(ofFileAt: path, expectedInode: probe.inode) else { return nil }
+    if downloadDigestCache.count >= 64 { downloadDigestCache.removeAll() }
+    downloadDigestCache[path] = (probe, digest)
+    return digest
 }
 
 func downloadForgetRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {

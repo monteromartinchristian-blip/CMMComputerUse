@@ -285,18 +285,28 @@ status_body = browser_code[browser_code.index("func downloadStatusRequest("):]
 status_body = status_body[:status_body.index("\n}\n")]
 report_body = downloads_code[downloads_code.index("public func bridgeDownloadReport("):]
 report_body = report_body[:report_body.index("\n}\n")]
-check("FileHandle(forReadingAtPath:" not in browser_code
-      and browser_code.count("bridgeSHA256(") == browser_code.count("digestOf: bridgeSHA256(ofFileAt:)") == 2
-      and "if requested || expectedSHA256 != nil, status.state == .complete {" in report_body
-      and report_body.index("status.state == .complete") < report_body.index("digestOf)")
-      and "requested: false, digestOf: digestOf)" in downloads_code
-      and downloads_code.count("FileHandle(forReadingAtPath:") == 1 and "try? handle.read" not in downloads_code
+reader_body = downloads_code[downloads_code.index("public func bridgeSHA256("):]
+reader_body = reader_body[:reader_body.index("\n}\n")]
+digest_body = browser_code[browser_code.index("func cachedDigest("):]
+digest_body = digest_body[:digest_body.index("\n}\n")]
+check("FileHandle(forReadingAtPath:" not in browser_code + downloads_code
+      and browser_code.count("bridgeSHA256(") == 1 and "bridgeSHA256(ofFileAt: path, expectedInode: probe.inode)" in digest_body
+      and browser_code.count("probe: bridgeProbeFile, digestOf: cachedDigest)") == 2
+      and "open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK" in reader_body
+      and "fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG" in reader_body
+      and "Int64(info.st_size) <= maxBytes" in reader_body and "try?" not in reader_body
+      and "guard let found = probe(path)" in report_body
+      and report_body.index("guard let found = probe(path)") < report_body.index("if requested || expectedSHA256 != nil")
+      < report_body.index("digestOf(path, found)")
+      and "requested: false, probe: probe, digestOf: digestOf)" in downloads_code
       and "Data(contentsOf" not in browser_code + downloads_code
       and "contentsOfFile" not in browser_code + downloads_code,
-      "F3: a downloaded file's bytes are read only for an explicit checksum or a declared expected_sha256, "
-      "and a read error yields no digest")
+      "F3: a finished download is re-checked with lstat at every read; its bytes are read only for an explicit "
+      "checksum or a declared expected_sha256, from a regular file opened without following links, bounded")
 list_body = browser_code[browser_code.index("func downloadListRequest("):]
 list_body = list_body[:list_body.index("\n}\n")]
+reap_body = main[main.index("func reapIdleContexts("):]
+reap_body = reap_body[:reap_body.index("\n}\n")]
 close_body = main[main.index("func contextClose("):]
 close_body = close_body[:close_body.index("\n}\n")]
 check("revokedDownloadRefusal(id)" in status_body
@@ -305,9 +315,12 @@ check("revokedDownloadRefusal(id)" in status_body
       and "downloadMonitor.listReports(" in list_body and ".dictionary" not in list_body
       and "bridgeDownloadReport(" in status_body and ".dictionary" not in status_body
       and "bridgeDownloadAuthorizationRefusal(" in browser_code
-      and "downloadMonitor.forget(principal: currentPrincipal, contextID: id)" in close_body,
+      and "downloadMonitor.forget(principal: currentPrincipal, contextID: id)" in close_body
+      and "{\n    reapIdleContexts()\n" in status_body and "{\n    reapIdleContexts()\n" in list_body
+      and "downloadMonitor.forget(principal: record.principal, contextID: record.id)" in reap_body
+      and downloads_code.count("        reap(now: now)\n") >= 4,
       "F6: every download read is re-decided against the policy before scanning, status and list share one "
-      "integrity rule; a closed context's expectations end")
+      "integrity rule; a closed or expired context's expectations end")
 check('"browser.select_tab", "browser.save_dialog":\n        return .accessibility' in POLICY_SRC.replace(
           '"ui.press", "ui.set_value", "ui.scroll", "wait", "finish",\n         ', '')
       and "browserPreconditions(kind: kind, params: params, mode: mode)" in main,

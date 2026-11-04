@@ -568,29 +568,126 @@ final class DownloadTests: XCTestCase {
         }
         var reads: [String] = []
         let (mismatch, _) = completedExpectation(sha: digestA)
-        let bad = mismatch.listReports(principal: dsh, now: 3) { reads.append($0); return self.digestB }
+        let bad = mismatch.listReports(principal: dsh, now: 3, probe: intact) { path, _ in reads.append(path); return self.digestB }
         XCTAssertEqual(bad.first?["state"] as? String, "failed")
         XCTAssertEqual(bad.first?["reason"] as? String, "checksum_mismatch")
         XCTAssertNil(bad.first?["path"], "an unverified file is not listed as the result")
         XCTAssertEqual(reads, [root + "/f.bin"])
 
         let (unreadable, _) = completedExpectation(sha: digestA)
-        let none = unreadable.listReports(principal: dsh, now: 3) { _ in nil }
+        let none = unreadable.listReports(principal: dsh, now: 3, probe: intact) { _, _ in nil }
         XCTAssertEqual(none.first?["reason"] as? String, "checksum_unavailable")
         XCTAssertNil(none.first?["path"])
 
         let (verified, _) = completedExpectation(sha: digestA)
-        let good = verified.listReports(principal: dsh, now: 3) { _ in self.digestA }
+        let good = verified.listReports(principal: dsh, now: 3, probe: intact) { _, _ in self.digestA }
         XCTAssertEqual(good.first?["state"] as? String, "complete")
         XCTAssertEqual(good.first?["integrity"] as? String, "sha256_verified")
 
         reads = []
         let (plain, _) = completedExpectation(sha: nil)
-        let listed = plain.listReports(principal: dsh, now: 3) { reads.append($0); return nil }
+        let listed = plain.listReports(principal: dsh, now: 3, probe: intact) { path, _ in reads.append(path); return nil }
         XCTAssertEqual(listed.first?["state"] as? String, "complete")
         XCTAssertNil(listed.first?["checksum"], "a list never asks for a checksum by itself")
         XCTAssertEqual(reads, [], "no integrity declared: no file is read to build the list")
-        XCTAssertEqual(plain.listReports(principal: other, now: 3) { _ in nil }.count, 0)
+        XCTAssertEqual(plain.listReports(principal: other, now: 3, probe: intact) { _, _ in nil }.count, 0)
+    }
+
+    /// The finished file of `completedFile()` as `lstat` would show it, unchanged.
+    private func intact(_ path: String) -> BridgeFileProbe? {
+        BridgeFileProbe(kind: .regular, inode: 950, size: 10, modified: 0)
+    }
+
+    private func completedFile(sha: String? = nil, bytes: Int64? = nil) -> (BridgeDownloadMonitor, String) {
+        let m = monitor()
+        guard case .success(let id) = m.expect(principal: dsh, contextID: nil, bundleID: "b", root: root,
+                                               entries: [], opID: nil, nameHint: "f.bin", now: 0,
+                                               expectedBytes: bytes, expectedSHA256: sha) else { XCTFail(); fatalError() }
+        let done = [file("f.bin", 10, inode: 950)]
+        _ = state(m, id, done, at: 1)
+        XCTAssertEqual(state(m, id, done, at: 2.5).state, .complete)
+        return (m, id)
+    }
+
+    private func report(_ m: BridgeDownloadMonitor, _ id: String, sha: String? = nil, requested: Bool = false,
+                        probe: (String) -> BridgeFileProbe?,
+                        digest: @escaping (String, BridgeFileProbe) -> String? = { _, _ in nil }) -> [String: Any] {
+        guard case .success(let status) = m.status(principal: dsh, id: id, entries: nil, now: 3) else {
+            XCTFail(); return [:]
+        }
+        return bridgeDownloadReport(status, expectedSHA256: sha, requested: requested, probe: probe, digestOf: digest)
+    }
+
+    // MARK: finished file re-checked at every read (audit A1)
+
+    /// A complete download is only complete while its file is still THERE and
+    /// still the same file: deleted, swapped for a link or another file, it is
+    /// no longer reported (and nothing is hashed).
+    func testACompleteDownloadIsRecheckedAgainstTheFileAtEveryRead() {
+        let (m, id) = completedFile()
+        var hashed = 0
+        let digest: (String, BridgeFileProbe) -> String? = { _, _ in hashed += 1; return self.digestA }
+        let ok = report(m, id, requested: true, probe: intact, digest: digest)
+        XCTAssertEqual(ok["state"] as? String, "complete")
+        XCTAssertEqual(ok["path"] as? String, root + "/f.bin")
+        XCTAssertEqual(hashed, 1)
+
+        let gone = report(m, id, requested: true, probe: { _ in nil }, digest: digest)
+        XCTAssertEqual(gone["state"] as? String, "failed")
+        XCTAssertEqual(gone["terminal"] as? Bool, true)
+        XCTAssertEqual(gone["reason"] as? String, "file_missing")
+        XCTAssertNil(gone["path"])
+
+        let link = report(m, id, requested: true, probe: { _ in
+            BridgeFileProbe(kind: .other, inode: 951, size: 30, modified: 0) }, digest: digest)
+        XCTAssertEqual(link["reason"] as? String, "file_changed", "a symlink in its place is not the download")
+        XCTAssertNil(link["path"])
+        XCTAssertNil(link["sha256"])
+
+        let swapped = report(m, id, probe: { _ in BridgeFileProbe(kind: .regular, inode: 952, size: 10, modified: 0) })
+        XCTAssertEqual(swapped["reason"] as? String, "file_changed")
+        let truncated = report(m, id, probe: { _ in BridgeFileProbe(kind: .regular, inode: 950, size: 4, modified: 0) })
+        XCTAssertEqual(truncated["reason"] as? String, "file_changed")
+        XCTAssertEqual(hashed, 1, "a changed or missing file is never hashed")
+    }
+
+    func testTheListRechecksTheFinishedFileToo() {
+        let (m, _) = completedFile()
+        let listed = m.listReports(principal: dsh, now: 3, probe: { _ in nil }) { _, _ in nil }
+        XCTAssertEqual(listed.first?["reason"] as? String, "file_missing")
+        XCTAssertNil(listed.first?["path"])
+    }
+
+    func testAnUnpackedFolderMustStillBeThatFolder() {
+        let m = monitor()
+        let id = expect(m, [], hint: "run-archive.zip", at: 0)
+        _ = state(m, id, [bundle("run-archive.zip.download", 40000, inode: 700)], at: 1)
+        let unpacked = [BridgeDirectoryEntry(name: "run-archive", isDirectory: true, size: 0, inode: 701, modified: 2)]
+        _ = state(m, id, unpacked, at: 2)
+        XCTAssertEqual(state(m, id, unpacked, at: 3.5).state, .complete)
+        let same = report(m, id, probe: { _ in BridgeFileProbe(kind: .directory, inode: 701, size: 0, modified: 2) })
+        XCTAssertEqual(same["state"] as? String, "complete")
+        let replaced = report(m, id, probe: { _ in BridgeFileProbe(kind: .regular, inode: 701, size: 5, modified: 2) })
+        XCTAssertEqual(replaced["reason"] as? String, "file_changed")
+    }
+
+    // MARK: expiry is applied at every read (audit R1)
+
+    func testAnExpiredExpectationStopsAnsweringOnEveryReadPath() {
+        var next = 0
+        let m = BridgeDownloadMonitor(timings: timings, limits: BridgeDownloadLimits(maxAgeSeconds: 100),
+                                      makeID: { next += 1; return "dl_\(next)" })
+        let id = expect(m, [], at: 0)
+        XCTAssertEqual(state(m, id, nil, at: 50).state, .notStarted)
+        guard case .failure(let refusal) = m.status(principal: dsh, id: id, entries: nil, now: 101) else {
+            return XCTFail("an expectation past its maximum age must be gone")
+        }
+        XCTAssertEqual(refusal.code, "DOWNLOAD_UNKNOWN")
+        let other = expect(m, [], at: 200)
+        XCTAssertEqual(m.listReports(principal: dsh, now: 250, probe: intact) { _, _ in nil }.count, 1)
+        XCTAssertEqual(m.listReports(principal: dsh, now: 301, probe: intact) { _, _ in nil }.count, 0)
+        XCTAssertNil(m.subject(of: other, principal: dsh))
+        XCTAssertEqual(m.count, 0, "nothing of an expired expectation is kept")
     }
 
     func testAMatchingChecksumIsVerifiedAndAMismatchFails() {
@@ -622,5 +719,57 @@ final class DownloadTests: XCTestCase {
                        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         XCTAssertNil(bridgeSHA256(ofFileAt: dir.path))
         XCTAssertNil(bridgeSHA256(ofFileAt: dir.appendingPathComponent("absent").path))
+    }
+
+    // MARK: the reader opens only the regular file it was given (audit A2 / R2)
+
+    private func inode(_ path: String) -> UInt64 {
+        var info = stat()
+        XCTAssertEqual(lstat(path, &info), 0)
+        return UInt64(info.st_ino)
+    }
+
+    func testTheReaderNeverFollowsALinkAndChecksTheRealFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let outside = dir.appendingPathComponent("outside.txt")
+        try Data("secret".utf8).write(to: outside)
+        let link = dir.appendingPathComponent("f.bin")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+        XCTAssertNil(bridgeSHA256(ofFileAt: link.path), "a link in place of the download is never followed")
+        let zero = dir.appendingPathComponent("zero.bin")
+        try FileManager.default.createSymbolicLink(atPath: zero.path, withDestinationPath: "/dev/zero")
+        XCTAssertNil(bridgeSHA256(ofFileAt: zero.path), "a link to an endless device is refused, not read")
+        XCTAssertNil(bridgeSHA256(ofFileAt: "/dev/zero"), "a device is not a regular file")
+
+        let real = dir.appendingPathComponent("real.bin")
+        try Data("abc".utf8).write(to: real)
+        let node = inode(real.path)
+        XCTAssertEqual(bridgeSHA256(ofFileAt: real.path, expectedInode: node),
+                       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        XCTAssertNil(bridgeSHA256(ofFileAt: real.path, expectedInode: node + 1),
+                     "a file swapped since it was checked is not hashed")
+        XCTAssertNil(bridgeSHA256(ofFileAt: real.path, maxBytes: 2), "larger than the limit: refused, not read")
+    }
+
+    /// A FIFO is opened non-blocking and refused by type: the reader never
+    /// waits for a writer. Run off the main thread with a deadline so a
+    /// regression fails the test instead of hanging the suite.
+    func testAFifoIsRefusedWithoutBlocking() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fifo = dir.appendingPathComponent("f.bin").path
+        XCTAssertEqual(mkfifo(fifo, 0o600), 0)
+        let done = expectation(description: "the reader returned")
+        let result = UnsafeMutablePointer<String?>.allocate(capacity: 1)
+        result.initialize(to: "unset")
+        Thread.detachNewThread {
+            result.pointee = bridgeSHA256(ofFileAt: fifo)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 2)
+        XCTAssertNil(result.pointee)
     }
 }

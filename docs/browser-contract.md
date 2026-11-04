@@ -107,6 +107,10 @@ Pressing a download control proves nothing. A download is `complete` only when a
 | `download.wait {download_id, until: terminal\|started, timeout ≤ 120}` | read | Bounded wait outside the helper lock. |
 | `download.list` / `download.forget` | read / idempotent | The caller's own expectations only. |
 
+An expectation that never ends is forgotten 2 hours after it was declared; a
+finished one, 1 hour after it ended. Both limits apply at every read. A context
+that is closed, or that expires by inactivity, takes its expectations with it.
+
 States:
 
 - `not_started`;
@@ -147,6 +151,21 @@ finished writing a non-empty, stable file". With them:
 - a declared hash that cannot be computed is reported as `failed` with
   `reason=checksum_unavailable`, and no path is returned. This covers a folder
   the browser unpacked, an unreadable file and a read error half-way.
+
+**A finished download stays checked.** At every read, a `complete` download
+is checked again with `lstat`, without following links. Its path must still be
+the same regular file, with the same inode and size, or the same unpacked
+folder. If the file is gone, the answer is `failed` with `reason=file_missing`.
+If it was replaced, by a link or another file, the answer is `failed` with
+`reason=file_changed`. In both cases no path is returned and no byte is read.
+
+**How a checksum is read.**
+- The file is opened with `O_NOFOLLOW | O_NONBLOCK`.
+- It must be a regular file, checked with `fstat`, and still have the inode
+  that was verified.
+- Exactly its size is read, and files over 2 GiB are refused.
+- A link, FIFO, device or socket is refused, never read and never waited on.
+- A digest is reused while that exact file is unchanged.
 
 `download.status`, `download.wait` and `download.list` apply the same rule:
 the list never shows a download with a declared checksum as `complete` unless

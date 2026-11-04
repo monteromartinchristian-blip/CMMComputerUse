@@ -175,6 +175,9 @@ public struct BridgeDownloadStatus: Equatable, Sendable {
     /// The browser unpacked the archive into this folder and removed the
     /// archive (Safari's "Open safe files after downloading", observed live).
     public var extractedTo: String? = nil
+    /// The inode of the finished file (or unpacked folder) when it was seen
+    /// complete: every read checks the path still IS that file (audit A1).
+    public var finalInode: UInt64? = nil
 
     public var path: String? {
         (extractedTo ?? fileName).map { (root as NSString).appendingPathComponent($0) }
@@ -241,6 +244,7 @@ public final class BridgeDownloadMonitor {
         var stableSince: Double?
         var replacedExisting = false
         var extractedTo: String?
+        var extractedInode: UInt64?
         var stalled = false
         var resumed = false
         var state: BridgeDownloadState = .inProgress
@@ -314,6 +318,7 @@ public final class BridgeDownloadMonitor {
     public func status(
         principal: BridgePrincipal, id: String, entries: [BridgeDirectoryEntry]?, now: Double
     ) -> Result<BridgeDownloadStatus, BridgePolicyRefusal> {
+        reap(now: now)
         guard let expectation = expectations[id], expectation.principal == principal else {
             return .failure(BridgePolicyRefusal(
                 code: "DOWNLOAD_UNKNOWN",
@@ -339,17 +344,19 @@ public final class BridgeDownloadMonitor {
     }
 
     public func list(principal: BridgePrincipal, now: Double) -> [BridgeDownloadStatus] {
-        order.filter { expectations[$0]?.principal == principal }.map { describe(id: $0, now: now) }
+        reap(now: now)
+        return order.filter { expectations[$0]?.principal == principal }.map { describe(id: $0, now: now) }
     }
 
     /// What `download.list` answers: every expectation of `principal` with the
     /// SAME integrity rule as `download.status` (`bridgeDownloadReport`). A
     /// declared checksum is read through `digestOf`; nothing else is read.
-    public func listReports(principal: BridgePrincipal, now: Double,
-                            digestOf: (String) -> String?) -> [[String: Any]] {
-        order.filter { expectations[$0]?.principal == principal }.map { id in
+    public func listReports(principal: BridgePrincipal, now: Double, probe: (String) -> BridgeFileProbe?,
+                            digestOf: (String, BridgeFileProbe) -> String?) -> [[String: Any]] {
+        reap(now: now)
+        return order.filter { expectations[$0]?.principal == principal }.map { id in
             bridgeDownloadReport(describe(id: id, now: now), expectedSHA256: expectations[id]?.expectedSHA256,
-                                 requested: false, digestOf: digestOf)
+                                 requested: false, probe: probe, digestOf: digestOf)
         }
     }
 
@@ -533,8 +540,9 @@ public final class BridgeDownloadMonitor {
     /// for the settle interval.
     private func updateExtracted(id: Int, entry: BridgeDirectoryEntry, now: Double) {
         guard var artifact = artifacts[id] else { return }
-        if artifact.finalModified != entry.modified {
+        if artifact.finalModified != entry.modified || artifact.extractedInode != entry.inode {
             artifact.finalModified = entry.modified
+            artifact.extractedInode = entry.inode
             artifact.stableSince = now
         }
         artifact.partialName = nil
@@ -648,7 +656,8 @@ public final class BridgeDownloadMonitor {
             replacedExisting: artifact.replacedExisting,
             resumable: artifact.state == .interrupted && artifact.partialName != nil,
             resumed: artifact.resumed, reason: reason, elapsed: now - expectation.createdAt,
-            extractedTo: artifact.extractedTo)
+            extractedTo: artifact.extractedTo,
+            finalInode: artifact.extractedTo != nil ? artifact.extractedInode : artifact.finalInode)
     }
 }
 
@@ -716,38 +725,110 @@ public func bridgeDownloadAuthorizationRefusal(
 
 // MARK: - Integrity
 
-/// SHA-256 of a regular file, or nil when it cannot be read completely (a
-/// folder, a missing or unreadable file, a read error half-way): never the
-/// digest of a prefix.
-public func bridgeSHA256(ofFileAt path: String) -> String? {
-    var isDirectory: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue,
-          let handle = FileHandle(forReadingAtPath: path) else { return nil }
-    defer { try? handle.close() }
-    var hasher = SHA256()
-    do {
-        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
-            hasher.update(data: chunk)
-        }
-    } catch {
-        return nil
+/// What `lstat` says about a path: its own type (a symbolic link is `.other`,
+/// never what it points to), inode, size and modification time.
+public struct BridgeFileProbe: Equatable, Sendable {
+    public enum Kind: Sendable { case regular, directory, other }
+    public let kind: Kind
+    public let inode: UInt64
+    public let size: Int64
+    public let modified: Double
+
+    public init(kind: Kind, inode: UInt64, size: Int64, modified: Double) {
+        self.kind = kind
+        self.inode = inode
+        self.size = size
+        self.modified = modified
     }
+}
+
+/// `lstat` of `path`, or nil when nothing is there. Never follows a link.
+public func bridgeProbeFile(_ path: String) -> BridgeFileProbe? {
+    var info = stat()
+    guard lstat(path, &info) == 0 else { return nil }
+    let type = info.st_mode & S_IFMT
+    let kind: BridgeFileProbe.Kind = type == S_IFREG ? .regular : type == S_IFDIR ? .directory : .other
+    return BridgeFileProbe(kind: kind, inode: UInt64(info.st_ino), size: Int64(info.st_size),
+                           modified: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9)
+}
+
+/// The largest file the helper hashes: the read runs inside one request, so
+/// it is bounded instead of open-ended (audit A2).
+public let bridgeChecksumMaxBytes: Int64 = 2 << 30
+
+/// SHA-256 of the REGULAR file at `path`, or nil — never the digest of a
+/// prefix and never of anything else:
+/// * opened with `O_NOFOLLOW | O_NONBLOCK`: a symbolic link is refused, not
+///   followed, and a FIFO or device cannot make the open wait;
+/// * `fstat` of the opened descriptor must be a regular file (no device, FIFO,
+///   socket or folder), with `expectedInode` when given (the file that was
+///   checked is the file that is read) and at most `maxBytes`;
+/// * exactly the size `fstat` reported is read; a read error, a short file or
+///   a file still growing gives nil.
+public func bridgeSHA256(ofFileAt path: String, expectedInode: UInt64? = nil,
+                         maxBytes: Int64 = bridgeChecksumMaxBytes) -> String? {
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var info = stat()
+    guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+          expectedInode.map({ UInt64(info.st_ino) == $0 }) ?? true,
+          info.st_size >= 0, Int64(info.st_size) <= maxBytes else { return nil }
+    let size = Int64(info.st_size)
+    var hasher = SHA256()
+    var buffer = [UInt8](repeating: 0, count: 1 << 20)
+    var total: Int64 = 0
+    while total < size {
+        let wanted = Int(min(Int64(buffer.count), size - total))
+        let got = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, wanted) }
+        if got < 0 && errno == EINTR { continue }
+        guard got > 0 else { return nil }
+        hasher.update(data: buffer[0..<got])
+        total += Int64(got)
+    }
+    var extra: UInt8 = 0
+    guard read(fd, &extra, 1) == 0 else { return nil }
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
 
-/// The answer for one expectation with integrity folded in — the one rule
-/// every read path (`download.status`, `download.wait`, `download.list`)
-/// applies. The file is read (`digestOf`) only for a complete download with a
-/// declared checksum or an explicit `checksum` request.
+/// The answer for one expectation — the one rule every read path
+/// (`download.status`, `download.wait`, `download.list`) applies:
+/// 1. a COMPLETE download is re-checked against the file system (`probe`, an
+///    `lstat`): its path must still be the same regular file (inode and size)
+///    or, for an archive the browser unpacked, the same folder. Otherwise it is
+///    `failed` with `file_missing` / `file_changed`, without a path, and
+///    nothing is read (audit A1);
+/// 2. the file's bytes are read (`digestOf`) only for a declared checksum or
+///    an explicit `checksum` request.
 public func bridgeDownloadReport(
-    _ status: BridgeDownloadStatus, expectedSHA256: String?, requested: Bool, digestOf: (String) -> String?
+    _ status: BridgeDownloadStatus, expectedSHA256: String?, requested: Bool,
+    probe: (String) -> BridgeFileProbe?, digestOf: (String, BridgeFileProbe) -> String?
 ) -> [String: Any] {
     var result = status.dictionary
-    if requested || expectedSHA256 != nil, status.state == .complete {
-        let digest = status.path.flatMap(digestOf)
+    guard status.state == .complete, let path = status.path else { return result }
+    let unpacked = status.extractedTo != nil
+    guard let found = probe(path) else {
+        withdraw(&result, reason: "file_missing")
+        return result
+    }
+    let sameKind = unpacked ? found.kind == .directory : found.kind == .regular
+    guard sameKind, found.inode == status.finalInode, unpacked || found.size == status.bytes else {
+        withdraw(&result, reason: "file_changed")
+        return result
+    }
+    if requested || expectedSHA256 != nil {
+        let digest = unpacked ? nil : digestOf(path, found)
         bridgeApplyIntegrity(&result, expectedSHA256: expectedSHA256, digest: digest, requested: requested)
     }
     return result
+}
+
+/// A download that is no longer what was verified: failed, without its path.
+private func withdraw(_ result: inout [String: Any], reason: String) {
+    result["state"] = BridgeDownloadState.failed.rawValue
+    result["terminal"] = true
+    result["reason"] = reason
+    result.removeValue(forKey: "path")
 }
 
 /// Fold a checksum into a COMPLETE status. `digest` is nil when the file could
