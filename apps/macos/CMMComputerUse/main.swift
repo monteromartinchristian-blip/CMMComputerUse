@@ -1310,36 +1310,53 @@ func describe(
     // windows of the app are observable, and authorization must be decided
     // against the window that is actually going to be walked.
     var windowElement: AXUIElement?
+    var windowResolution: BridgeWindowResolution?
     var captureTitle = ""
     var windowFollow = "focused"
     let appElement = AXUIElementCreateApplication(owner.pid)
     if AXIsProcessTrusted() {
-        windowElement = axElement(appElement, kAXFocusedWindowAttribute)
-            ?? axElement(appElement, kAXMainWindowAttribute)
-            ?? (axAttr(appElement, kAXWindowsAttribute) as? [AXUIElement])?.first
         // F-09: a window is named by its CGWindowID, never by focus or order.
         // An explicit window_id must exist; an explicit context keeps the
         // window it observed last (same process) instead of following focus,
         // so two contexts on two windows of one browser never swap.
         let bound = context.legacy ? nil
             : (context.identity?.pid == owner.pid ? context.identity?.windowID : nil)
-        if let wanted = windowID ?? bound {
-            let windows = (axAttr(appElement, kAXWindowsAttribute) as? [AXUIElement]) ?? []
-            if let match = windows.first(where: { cgWindowID(of: $0, pid: owner.pid) == wanted }) {
-                windowElement = match
-                windowFollow = windowID != nil ? "requested" : "bound"
-            } else if windowID != nil {
-                return (nil, BridgePolicyRefusal(
-                    code: "COMPUTER_TARGET_UNAVAILABLE",
-                    message: "That window of the application is not open.",
-                    detail: "policy=\(mode.rawValue);target=window;reason=window_not_found"))
-            } else {
-                windowFollow = "bound_window_closed"
+        func resolveWindow() -> BridgeWindowResolution {
+            var follow = "focused"
+            windowElement = axElement(appElement, kAXFocusedWindowAttribute)
+                ?? axElement(appElement, kAXMainWindowAttribute)
+                ?? (axAttr(appElement, kAXWindowsAttribute) as? [AXUIElement])?.first
+            if let wanted = windowID ?? bound {
+                let windows = (axAttr(appElement, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+                if let match = windows.first(where: { cgWindowID(of: $0, pid: owner.pid) == wanted }) {
+                    windowElement = match
+                    follow = windowID != nil ? "requested" : "bound"
+                } else {
+                    follow = windowID != nil ? "requested_missing" : "bound_window_closed"
+                }
             }
+            var title: AnyObject?
+            let error = windowElement.map {
+                AXUIElementCopyAttributeValue($0, kAXTitleAttribute as CFString, &title)
+            } ?? .noValue
+            return BridgeWindowResolution(follow: follow, title: error == .success ? (title as? String) ?? "" : "",
+                                          titleError: error.rawValue)
         }
-        if let windowElement {
-            captureTitle = (axAttr(windowElement, kAXTitleAttribute) as? String) ?? ""
+        // A bound window not matched, or a title that cannot be read, is
+        // looked at once more before anything is decided (acceptance D6).
+        let resolved = bridgeResolveWindow(resolveWindow, pause: { Thread.sleep(forTimeInterval: 0.1) })
+        windowResolution = resolved.resolution
+        if resolved.attempts > 1 {
+            log("WINDOW_RESOLVE_RETRY first=\(resolved.first.diagnostics) second=\(resolved.resolution.diagnostics)")
         }
+        if resolved.resolution.follow == "requested_missing" {
+            return (nil, BridgePolicyRefusal(
+                code: "COMPUTER_TARGET_UNAVAILABLE",
+                message: "That window of the application is not open.",
+                detail: "policy=\(mode.rawValue);target=window;reason=window_not_found"))
+        }
+        windowFollow = resolved.resolution.follow
+        captureTitle = resolved.resolution.title
     }
 
     // DENY BY DEFAULT: an application the deployment did not authorize is
@@ -1349,8 +1366,11 @@ func describe(
         bundleID: owner.bundleID, name: owner.name,
         windowTitle: captureTitle, scope: .observe, client: currentClient
     ).refusal {
-        log("observation refused: \(refusal.detail)")
-        return (nil, refusal)
+        // Say what the window decision was made on: a refusal of an authorized
+        // window must be diagnosable from its own detail (acceptance D6).
+        let detail = refusal.detail + (windowResolution.map { ";" + $0.diagnostics } ?? "")
+        log("observation refused: \(detail)")
+        return (nil, BridgePolicyRefusal(code: refusal.code, message: refusal.message, detail: detail))
     }
     // A context is ONE application: its handles, stream and panel never
     // describe two.

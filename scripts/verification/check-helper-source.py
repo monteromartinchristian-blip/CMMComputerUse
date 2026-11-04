@@ -329,6 +329,17 @@ check('scope: .control' in browser_code and "bridgeDownloadRootAllowed(root, roo
       and "downloadRoots ?? []" in browser_code,
       "F5: browser actions need a control grant; downloads watch only the grant's declared roots")
 
+describe_body = main[main.index("func describe("):]
+describe_body = describe_body[:describe_body.index("\n}\n")]
+browser_shared = strip_comments((REPO / "apps/macos/Shared/ComputerUseBrowser.swift").read_text())
+resolve_body = browser_shared[browser_shared.index("public func bridgeResolveWindow("):]
+resolve_body = resolve_body[:resolve_body.index("\n}")]
+check("bridgeResolveWindow(resolveWindow, pause:" in describe_body
+      and describe_body.index("bridgeResolveWindow(") < describe_body.index("authorization.decision(")
+      and "windowResolution.map { \";\" + $0.diagnostics }" in describe_body
+      and resolve_body.count("resolve()") == 2 and resolve_body.count("pause()") == 1,
+      "F7: an observation resolves its window with ONE bounded retry before deciding, and a refusal says what it decided on")
+
 build = BUILD.read_text()
 check("BrowserSupport.swift" in build, "build-helper.sh compiles BrowserSupport.swift")
 shared = sorted(p.name for p in (REPO / "apps/macos/Shared").glob("*.swift"))

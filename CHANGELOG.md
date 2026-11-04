@@ -63,6 +63,12 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
   inode that was verified), reads exactly its size, and refuses files over
   2 GiB. A link (including one to `/dev/zero`), a FIFO or a device is refused
   without blocking. Digests are reused while the exact file is unchanged.
+- Acceptance finding D6: an observation now resolves its window with one
+  bounded second look (100 ms) when the context's bound window is not matched
+  or its title cannot be read, instead of deciding at once. Under load an
+  authorized window was refused (`window_not_granted`). A window refusal now
+  carries what it was decided on: `follow=…;title_len=…;title_ax_error=…`. A
+  retry is logged as `WINDOW_RESOLVE_RETRY`.
 - Final audit R1: an expectation past its maximum age stops answering on
   every read, and a context that expires by inactivity forgets its download
   expectations, as an explicit close does.

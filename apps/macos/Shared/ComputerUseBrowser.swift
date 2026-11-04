@@ -589,3 +589,47 @@ public func bridgeValidSaveName(_ name: String) -> Bool {
     guard !trimmed.hasPrefix("."), !trimmed.contains("/"), !trimmed.contains(":") else { return false }
     return !trimmed.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
 }
+
+// MARK: - Window resolution for an observation
+
+/// One attempt at naming the window an observation will authorize and walk.
+/// `follow`: `requested` / `bound` / `bound_window_closed` / `focused` /
+/// `requested_missing`. `titleError` is the AXError of reading its title
+/// (0 = success).
+public struct BridgeWindowResolution: Equatable, Sendable {
+    public let follow: String
+    public let title: String
+    public let titleError: Int32
+
+    public init(follow: String, title: String, titleError: Int32) {
+        self.follow = follow
+        self.title = title
+        self.titleError = titleError
+    }
+
+    /// Worth one more look before deciding: the bound (or requested) window
+    /// was not matched, or its title could not be read or came back empty.
+    /// Under load a transient AX failure looks exactly like this, and a window
+    /// grant would refuse an authorized window on it (acceptance finding D6).
+    public var uncertain: Bool {
+        follow == "bound_window_closed" || follow == "requested_missing" || titleError != 0 || title.isEmpty
+    }
+
+    /// What the decision was made on, for a refusal's detail and the log.
+    public var diagnostics: String {
+        "follow=\(follow);title_len=\(title.count);title_ax_error=\(titleError)"
+    }
+}
+
+/// Resolve the window once; if that is uncertain, `pause` and resolve ONCE
+/// more. Bounded: never a third attempt. A result that is still uncertain is
+/// returned as it is, and the caller decides on it (the policy still fails
+/// closed). `first` keeps the first attempt for the diagnostics.
+public func bridgeResolveWindow(
+    _ resolve: () -> BridgeWindowResolution, pause: () -> Void
+) -> (resolution: BridgeWindowResolution, first: BridgeWindowResolution, attempts: Int) {
+    let first = resolve()
+    guard first.uncertain else { return (first, first, 1) }
+    pause()
+    return (resolve(), first, 2)
+}

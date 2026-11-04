@@ -253,4 +253,52 @@ final class BrowserTests: XCTestCase {
         XCTAssertFalse(bridgeValidSaveName("line\nbreak.pdf"))
         XCTAssertFalse(bridgeValidSaveName(String(repeating: "a", count: 256)))
     }
+
+    // MARK: window resolution under load (acceptance finding D6)
+
+    private func resolution(_ follow: String, _ title: String, _ error: Int32 = 0) -> BridgeWindowResolution {
+        BridgeWindowResolution(follow: follow, title: title, titleError: error)
+    }
+
+    /// A bound window that is found with a readable title is decided at once.
+    func testACertainResolutionIsNotRetried() {
+        var pauses = 0
+        let out = bridgeResolveWindow({ resolution("bound", "CMM-ACC-Destino.txt") }, pause: { pauses += 1 })
+        XCTAssertEqual(out.attempts, 1)
+        XCTAssertEqual(pauses, 0)
+        XCTAssertEqual(out.resolution.follow, "bound")
+    }
+
+    /// Live finding D6: under load the bound window was momentarily not matched,
+    /// or its title could not be read, and an authorized window was refused.
+    /// One short second look decides on the real window instead.
+    func testAnUncertainResolutionIsRetriedExactlyOnce() {
+        for first in [resolution("bound_window_closed", "Otra"), resolution("bound", "", -25204),
+                      resolution("bound", "")] {
+            var answers = [first, resolution("bound", "CMM-ACC-Destino.txt")]
+            var pauses = 0
+            let out = bridgeResolveWindow({ answers.removeFirst() }, pause: { pauses += 1 })
+            XCTAssertEqual(out.attempts, 2, "\(first)")
+            XCTAssertEqual(pauses, 1)
+            XCTAssertEqual(out.resolution.title, "CMM-ACC-Destino.txt")
+            XCTAssertEqual(out.first, first, "the first attempt is kept for the diagnostics")
+        }
+    }
+
+    func testTheRetryIsBoundedAndStillFailsClosed() {
+        var calls = 0
+        var pauses = 0
+        let out = bridgeResolveWindow({ calls += 1; return resolution("bound_window_closed", "", -25204) },
+                                      pause: { pauses += 1 })
+        XCTAssertEqual(calls, 2, "never more than one retry")
+        XCTAssertEqual(pauses, 1)
+        XCTAssertTrue(out.resolution.uncertain, "still uncertain: the caller decides on it and refuses")
+    }
+
+    func testARefusalCarriesWhatWasDecided() {
+        let r = resolution("bound_window_closed", "Abc", -25204)
+        XCTAssertEqual(r.diagnostics, "follow=bound_window_closed;title_len=3;title_ax_error=-25204")
+        XCTAssertFalse(resolution("focused", "x").uncertain)
+        XCTAssertTrue(resolution("requested_missing", "").uncertain)
+    }
 }
