@@ -148,6 +148,10 @@ finished writing a non-empty, stable file". With them:
   `reason=checksum_unavailable`, and no path is returned. This covers a folder
   the browser unpacked, an unreadable file and a read error half-way.
 
+`download.status`, `download.wait` and `download.list` apply the same rule:
+the list never shows a download with a declared checksum as `complete` unless
+the checksum was verified. Without a declared checksum, the list reads no file.
+
 A `checksum: true` request on a file that cannot be read completely answers
 `checksum: "unavailable"` and no `sha256`: never the digest of part of a file.
 

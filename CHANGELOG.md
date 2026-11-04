@@ -50,6 +50,10 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
   `checksum` request without a digest answers `checksum: "unavailable"`.
   Likewise, a declared `expected_bytes` on an archive the browser unpacked is
   `failed` with `reason=size_unavailable;archive_unpacked_by_browser`.
+- Independent audit N1: `download.list` applies the same integrity rule as
+  `download.status`. A declared `expected_sha256` is never listed as
+  `complete` with a path unless verified; without a declared checksum the
+  list reads no file.
 - The PiP restarted its live stream whenever the window title changed (every
   tab switch / navigation); a page change cleared the panel as if the window
   were lost.

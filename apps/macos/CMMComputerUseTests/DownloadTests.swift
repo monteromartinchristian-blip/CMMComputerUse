@@ -552,6 +552,47 @@ final class DownloadTests: XCTestCase {
         XCTAssertNil(result["sha256"])
     }
 
+    /// Independent audit N1: `download.list` must apply the same integrity rule
+    /// as `download.status` — a declared checksum is never listed as complete
+    /// unless it was verified, and nothing else is read to build the list.
+    func testTheListAppliesTheDeclaredChecksumLikeStatus() {
+        func completedExpectation(sha: String?) -> (BridgeDownloadMonitor, String) {
+            let m = monitor()
+            guard case .success(let id) = m.expect(principal: dsh, contextID: nil, bundleID: "b", root: root,
+                                                   entries: [], opID: nil, nameHint: "f.bin", now: 0,
+                                                   expectedSHA256: sha) else { XCTFail(); fatalError() }
+            let done = [file("f.bin", 10, inode: 950)]
+            _ = state(m, id, done, at: 1)
+            XCTAssertEqual(state(m, id, done, at: 2.5).state, .complete)
+            return (m, id)
+        }
+        var reads: [String] = []
+        let (mismatch, _) = completedExpectation(sha: digestA)
+        let bad = mismatch.listReports(principal: dsh, now: 3) { reads.append($0); return self.digestB }
+        XCTAssertEqual(bad.first?["state"] as? String, "failed")
+        XCTAssertEqual(bad.first?["reason"] as? String, "checksum_mismatch")
+        XCTAssertNil(bad.first?["path"], "an unverified file is not listed as the result")
+        XCTAssertEqual(reads, [root + "/f.bin"])
+
+        let (unreadable, _) = completedExpectation(sha: digestA)
+        let none = unreadable.listReports(principal: dsh, now: 3) { _ in nil }
+        XCTAssertEqual(none.first?["reason"] as? String, "checksum_unavailable")
+        XCTAssertNil(none.first?["path"])
+
+        let (verified, _) = completedExpectation(sha: digestA)
+        let good = verified.listReports(principal: dsh, now: 3) { _ in self.digestA }
+        XCTAssertEqual(good.first?["state"] as? String, "complete")
+        XCTAssertEqual(good.first?["integrity"] as? String, "sha256_verified")
+
+        reads = []
+        let (plain, _) = completedExpectation(sha: nil)
+        let listed = plain.listReports(principal: dsh, now: 3) { reads.append($0); return nil }
+        XCTAssertEqual(listed.first?["state"] as? String, "complete")
+        XCTAssertNil(listed.first?["checksum"], "a list never asks for a checksum by itself")
+        XCTAssertEqual(reads, [], "no integrity declared: no file is read to build the list")
+        XCTAssertEqual(plain.listReports(principal: other, now: 3) { _ in nil }.count, 0)
+    }
+
     func testAMatchingChecksumIsVerifiedAndAMismatchFails() {
         var good = completed()
         bridgeApplyIntegrity(&good, expectedSHA256: digestA, digest: digestA, requested: false)

@@ -283,10 +283,13 @@ check("withRequestState(peer: peer)" in wait_body and "dispatchLock" not in wait
 downloads_code = strip_comments((REPO / "apps/macos/Shared/ComputerUseDownloads.swift").read_text())
 status_body = browser_code[browser_code.index("func downloadStatusRequest("):]
 status_body = status_body[:status_body.index("\n}\n")]
-check("FileHandle(forReadingAtPath:" not in browser_code and browser_code.count("bridgeSHA256(ofFileAt:") == 1
-      and 'let requested = arguments["checksum"] as? Bool == true' in status_body
-      and "if requested || expected != nil, status.state == .complete {" in status_body
-      and status_body.index("if requested || expected != nil") < status_body.index("bridgeSHA256(ofFileAt:")
+report_body = downloads_code[downloads_code.index("public func bridgeDownloadReport("):]
+report_body = report_body[:report_body.index("\n}\n")]
+check("FileHandle(forReadingAtPath:" not in browser_code
+      and browser_code.count("bridgeSHA256(") == browser_code.count("digestOf: bridgeSHA256(ofFileAt:)") == 2
+      and "if requested || expectedSHA256 != nil, status.state == .complete {" in report_body
+      and report_body.index("status.state == .complete") < report_body.index("digestOf)")
+      and "requested: false, digestOf: digestOf)" in downloads_code
       and downloads_code.count("FileHandle(forReadingAtPath:") == 1 and "try? handle.read" not in downloads_code
       and "Data(contentsOf" not in browser_code + downloads_code
       and "contentsOfFile" not in browser_code + downloads_code,
@@ -299,9 +302,12 @@ close_body = close_body[:close_body.index("\n}\n")]
 check("revokedDownloadRefusal(id)" in status_body
       and status_body.index("revokedDownloadRefusal(id)") < status_body.index("scanDownloadRoot(root)")
       and "revokedDownloadRefusal(id)" in list_body
+      and "downloadMonitor.listReports(" in list_body and ".dictionary" not in list_body
+      and "bridgeDownloadReport(" in status_body and ".dictionary" not in status_body
       and "bridgeDownloadAuthorizationRefusal(" in browser_code
       and "downloadMonitor.forget(principal: currentPrincipal, contextID: id)" in close_body,
-      "F6: every download read is re-decided against the policy before scanning; a closed context's expectations end")
+      "F6: every download read is re-decided against the policy before scanning, status and list share one "
+      "integrity rule; a closed context's expectations end")
 check('"browser.select_tab", "browser.save_dialog":\n        return .accessibility' in POLICY_SRC.replace(
           '"ui.press", "ui.set_value", "ui.scroll", "wait", "finish",\n         ', '')
       and "browserPreconditions(kind: kind, params: params, mode: mode)" in main,

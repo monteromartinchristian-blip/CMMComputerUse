@@ -342,6 +342,17 @@ public final class BridgeDownloadMonitor {
         order.filter { expectations[$0]?.principal == principal }.map { describe(id: $0, now: now) }
     }
 
+    /// What `download.list` answers: every expectation of `principal` with the
+    /// SAME integrity rule as `download.status` (`bridgeDownloadReport`). A
+    /// declared checksum is read through `digestOf`; nothing else is read.
+    public func listReports(principal: BridgePrincipal, now: Double,
+                            digestOf: (String) -> String?) -> [[String: Any]] {
+        order.filter { expectations[$0]?.principal == principal }.map { id in
+            bridgeDownloadReport(describe(id: id, now: now), expectedSHA256: expectations[id]?.expectedSHA256,
+                                 requested: false, digestOf: digestOf)
+        }
+    }
+
     /// Forget an expectation. Idempotent; the file (if any) is untouched.
     @discardableResult
     public func forget(principal: BridgePrincipal, id: String) -> Bool {
@@ -722,6 +733,21 @@ public func bridgeSHA256(ofFileAt path: String) -> String? {
         return nil
     }
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+/// The answer for one expectation with integrity folded in — the one rule
+/// every read path (`download.status`, `download.wait`, `download.list`)
+/// applies. The file is read (`digestOf`) only for a complete download with a
+/// declared checksum or an explicit `checksum` request.
+public func bridgeDownloadReport(
+    _ status: BridgeDownloadStatus, expectedSHA256: String?, requested: Bool, digestOf: (String) -> String?
+) -> [String: Any] {
+    var result = status.dictionary
+    if requested || expectedSHA256 != nil, status.state == .complete {
+        let digest = status.path.flatMap(digestOf)
+        bridgeApplyIntegrity(&result, expectedSHA256: expectedSHA256, digest: digest, requested: requested)
+    }
+    return result
 }
 
 /// Fold a checksum into a COMPLETE status. `digest` is nil when the file could

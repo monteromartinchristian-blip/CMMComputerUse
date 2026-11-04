@@ -666,16 +666,12 @@ func downloadStatusRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
     switch downloadMonitor.status(principal: currentPrincipal, id: id, entries: entries, now: Date().timeIntervalSince1970) {
     case .failure(let refusal): return (false, nil, refusalFrame(refusal))
     case .success(let status):
-        var result = status.dictionary
+        // Only on explicit request (`checksum`, or an expected_sha256 the
+        // caller declared) are a downloaded file's bytes read.
+        var result = bridgeDownloadReport(
+            status, expectedSHA256: downloadMonitor.expectedSHA256(of: id, principal: currentPrincipal),
+            requested: arguments["checksum"] as? Bool == true, digestOf: bridgeSHA256(ofFileAt:))
         if entries == nil { result["scan"] = "unavailable" }
-        let expected = downloadMonitor.expectedSHA256(of: id, principal: currentPrincipal)
-        let requested = arguments["checksum"] as? Bool == true
-        if requested || expected != nil, status.state == .complete {
-            // Only on explicit request (`checksum`, or an expected_sha256 the
-            // caller declared): the one read of a downloaded file's bytes.
-            let digest = status.path.flatMap { bridgeSHA256(ofFileAt: $0) }
-            bridgeApplyIntegrity(&result, expectedSHA256: expected, digest: digest, requested: requested)
-        }
         return (true, result, nil)
     }
 }
@@ -695,7 +691,10 @@ func revokedDownloadRefusal(_ id: String) -> BridgePolicyRefusal? {
 func downloadListRequest() -> (Bool, Any?, [String: Any?]?) {
     let now = Date().timeIntervalSince1970
     for id in downloadMonitor.ids(principal: currentPrincipal) { _ = revokedDownloadRefusal(id) }
-    return (true, ["downloads": downloadMonitor.list(principal: currentPrincipal, now: now).map { $0.dictionary }], nil)
+    // The same integrity rule as `download.status`: a declared checksum is
+    // never listed as complete unless verified (audit N1).
+    return (true, ["downloads": downloadMonitor.listReports(
+        principal: currentPrincipal, now: now, digestOf: bridgeSHA256(ofFileAt:))], nil)
 }
 
 func downloadForgetRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
