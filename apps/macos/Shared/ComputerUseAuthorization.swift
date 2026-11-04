@@ -56,15 +56,21 @@ public struct BridgeAppGrant: Equatable, Sendable {
     public var scopes: Set<BridgeScope>
     /// Window title fragments. Empty means "any window of this application".
     public var windowPatterns: [String]
+    /// Directories a download triggered in this application may be verified
+    /// in (`"downloads": {"roots": [...]}`), normalized. EMPTY MEANS NONE: a
+    /// grant without roots cannot watch any directory (F-09).
+    public var downloadRoots: [String]
 
     public init(
         bundleID: String = "", name: String = "",
-        scopes: Set<BridgeScope> = [], windowPatterns: [String] = []
+        scopes: Set<BridgeScope> = [], windowPatterns: [String] = [],
+        downloadRoots: [String] = []
     ) {
         self.bundleID = bundleID
         self.name = name
         self.scopes = scopes
         self.windowPatterns = windowPatterns
+        self.downloadRoots = downloadRoots
     }
 
     /// Does this grant match the application?
@@ -301,8 +307,20 @@ public struct BridgeAuthorizationPolicy: Equatable, Sendable {
             guard let list = rawWindows as? [String] else { return nil }
             windows = list
         }
+        var roots: [String] = []
+        if let rawDownloads = app["downloads"] {
+            // Present means well-formed: a typo must not silently widen or
+            // narrow which directories can be watched.
+            guard let downloads = rawDownloads as? [String: Any],
+                  let list = downloads["roots"] as? [String] else { return nil }
+            for entry in list {
+                guard let root = bridgeNormalizedDownloadRoot(entry, home: NSHomeDirectory()) else { return nil }
+                if !roots.contains(root) { roots.append(root) }
+            }
+        }
         return BridgeAppGrant(
-            bundleID: bundleID, name: name, scopes: scopes, windowPatterns: windows)
+            bundleID: bundleID, name: name, scopes: scopes, windowPatterns: windows,
+            downloadRoots: roots)
     }
 
     /// The grant covering an application, if any.
