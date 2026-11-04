@@ -52,6 +52,11 @@ final class DownloadTests: XCTestCase {
                        BridgePartialName(format: .chromium, finalName: nil))
         XCTAssertEqual(bridgePartialDownload(name: "a.zip.part", isDirectory: false),
                        BridgePartialName(format: .gecko, finalName: "a.zip"))
+        XCTAssertEqual(bridgePartialDownload(name: "slow.ap041uWi.bin.part", isDirectory: false),
+                       BridgePartialName(format: .gecko, finalName: "slow.bin"), "current Firefox naming")
+        XCTAssertEqual(bridgePartialDownload(name: "report.v2.Ab3dE6gH.pdf.part", isDirectory: false)?.finalName,
+                       "report.v2.pdf")
+        XCTAssertEqual(bridgePartialDownload(name: "notes.Zx81qwer.part", isDirectory: false)?.finalName, "notes")
         XCTAssertNil(bridgePartialDownload(name: "a.zip", isDirectory: false))
         XCTAssertTrue(bridgeIgnoredDownloadEntry(".DS_Store"))
     }
@@ -118,6 +123,37 @@ final class DownloadTests: XCTestCase {
         s = state(m, id, done, at: 4.5)
         XCTAssertEqual(s.state, .complete)
         XCTAssertFalse(s.replacedExisting, "replacing its own placeholder is not an overwrite")
+    }
+
+    /// The exact trace Firefox 14x wrote in the live lane (inodes from `ls -i`):
+    /// a 0-byte placeholder and a randomized part file; the part file is
+    /// renamed over the placeholder.
+    func testLiveFirefoxTraceCompletesAsOneDownload() {
+        let m = monitor()
+        let id = expect(m, [], hint: "slow.bin", at: 0)
+        let started = [file("slow.bin", 0, inode: 131708700), file("slow.ap041uWi.bin.part", 206848, inode: 131708704)]
+        var s = state(m, id, started, at: 1)
+        XCTAssertEqual(s.state, .inProgress)
+        XCTAssertEqual(s.fileName, "slow.bin")
+        let done = [file("slow.bin", 409600, inode: 131708704, at: 2)]
+        _ = state(m, id, done, at: 2)
+        s = state(m, id, done, at: 3.5)
+        XCTAssertEqual(s.state, .complete)
+        XCTAssertEqual(s.bytes, 409600)
+        XCTAssertFalse(s.replacedExisting)
+    }
+
+    /// The trace Chrome (headless, new mode) wrote in the live lane: a hidden
+    /// temporary file first, then `Name.crdownload`, renamed in place.
+    func testLiveChromeTraceIgnoresTheHiddenTemporaryFile() {
+        let m = monitor()
+        let id = expect(m, [], hint: "slow.bin", at: 0)
+        _ = state(m, id, [file(".com.google.Chrome.WZ6yfz", 10240, inode: 131705682)], at: 0.5)
+        XCTAssertEqual(state(m, id, nil, at: 0.5).state, .notStarted, "a hidden file is not a download yet")
+        _ = state(m, id, [file("slow.bin.crdownload", 51200, inode: 131705682)], at: 1)
+        let done = [file("slow.bin", 409600, inode: 131705682, at: 2)]
+        _ = state(m, id, done, at: 2)
+        XCTAssertEqual(state(m, id, done, at: 3.5).state, .complete)
     }
 
     // MARK: 7. redirect / generated link: the name is only known at the end
@@ -279,6 +315,36 @@ final class DownloadTests: XCTestCase {
         guard case .failure(let refusal) = limited.expect(
             principal: dsh, contextID: nil, bundleID: "b", root: root, entries: [], opID: nil, nameHint: nil, now: 0)
         else { return XCTFail("limit not enforced") }
+        XCTAssertEqual(refusal.code, "DOWNLOAD_LIMIT")
+    }
+
+    func testFinishedExpectationsDoNotCountAgainstTheLimit() {
+        var next = 0
+        let m = BridgeDownloadMonitor(timings: timings, limits: BridgeDownloadLimits(maxPerPrincipal: 2, maxTotal: 4),
+                                      makeID: { next += 1; return "dl_\(next)" })
+        var entries: [BridgeDirectoryEntry] = []
+        for round in 0..<6 {
+            let name = "f\(round).bin"
+            guard case .success(let id) = m.expect(principal: dsh, contextID: nil, bundleID: "b", root: root,
+                                                   entries: entries, opID: nil, nameHint: name,
+                                                   now: Double(round * 10)) else {
+                return XCTFail("round \(round): a finished download must not block a new one")
+            }
+            entries.append(file(name, 10, inode: UInt64(1000 + round)))
+            _ = m.status(principal: dsh, id: id, entries: entries, now: Double(round * 10) + 1)
+            guard case .success(let done) = m.status(principal: dsh, id: id, entries: entries,
+                                                     now: Double(round * 10) + 3) else { return XCTFail() }
+            XCTAssertEqual(done.state, .complete)
+        }
+        XCTAssertLessThanOrEqual(m.count, 4, "finished records are evicted oldest first")
+        // Open (unfinished) expectations still hit the limit.
+        _ = m.expect(principal: dsh, contextID: nil, bundleID: "b", root: root, entries: entries, opID: nil,
+                     nameHint: nil, now: 100)
+        _ = m.expect(principal: dsh, contextID: nil, bundleID: "b", root: root, entries: entries, opID: nil,
+                     nameHint: nil, now: 100)
+        guard case .failure(let refusal) = m.expect(principal: dsh, contextID: nil, bundleID: "b", root: root,
+                                                    entries: entries, opID: nil, nameHint: nil, now: 100)
+        else { return XCTFail("open expectations must stay bounded") }
         XCTAssertEqual(refusal.code, "DOWNLOAD_LIMIT")
     }
 

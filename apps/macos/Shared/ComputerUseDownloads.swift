@@ -53,8 +53,9 @@ public enum BridgePartialFormat: String, Sendable {
     /// Chromium: `Name.ext.crdownload`, or `Unconfirmed N.crdownload` before
     /// the name is known; renamed in place (same inode) when done.
     case chromium = "crdownload"
-    /// Firefox/Gecko: `Name.ext.part` plus an empty placeholder `Name.ext`;
-    /// the part file replaces the placeholder when done.
+    /// Firefox/Gecko: `Name.<8 random>.ext.part` (older releases:
+    /// `Name.ext.part`) plus an empty placeholder `Name.ext`; the part file
+    /// replaces the placeholder (same inode) when done.
     case gecko = "part"
 }
 
@@ -80,7 +81,17 @@ public func bridgePartialDownload(name: String, isDirectory: Bool) -> BridgePart
         return BridgePartialName(format: .chromium, finalName: unconfirmed ? nil : stem)
     }
     if name.hasSuffix(".part") {
-        return BridgePartialName(format: .gecko, finalName: base(".part"))
+        guard let stem = base(".part") else { return BridgePartialName(format: .gecko, finalName: nil) }
+        // Current Firefox inserts an 8-character random token before the
+        // extension (observed live: `slow.ap041uWi.bin.part` for `slow.bin`).
+        let pattern = #"^(.+)\.[A-Za-z0-9]{8}(\.[^.]+)?$"#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let found = regex.firstMatch(in: stem, range: NSRange(stem.startIndex..., in: stem)) {
+            let head = Range(found.range(at: 1), in: stem).map { String(stem[$0]) } ?? stem
+            let ext = Range(found.range(at: 2), in: stem).map { String(stem[$0]) } ?? ""
+            return BridgePartialName(format: .gecko, finalName: head + ext)
+        }
+        return BridgePartialName(format: .gecko, finalName: stem)
     }
     return nil
 }
@@ -251,7 +262,14 @@ public final class BridgeDownloadMonitor {
         }) {
             return .success(existing)
         }
-        let mine = expectations.values.filter { $0.principal == principal }.count
+        // Only OPEN expectations count against the limit: a finished one is a
+        // record, evicted oldest-first (this principal's first) to make room.
+        let mine = expectations.values.filter { $0.principal == principal && $0.endedAt == nil }.count
+        while expectations.count >= limits.maxTotal {
+            let ended = order.compactMap { expectations[$0] }.filter { $0.endedAt != nil }
+            guard let victim = ended.first(where: { $0.principal == principal }) ?? ended.first else { break }
+            forget(principal: victim.principal, id: victim.id)
+        }
         guard mine < limits.maxPerPrincipal, expectations.count < limits.maxTotal else {
             return .failure(BridgePolicyRefusal(
                 code: "DOWNLOAD_LIMIT",

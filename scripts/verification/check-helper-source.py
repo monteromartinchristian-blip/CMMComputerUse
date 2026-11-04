@@ -269,7 +269,31 @@ probe_at = probe_body.find("guard var addr = unixAddr(path) else { return false 
 check(probe_at >= 0 and probe_at < probe_body.index("socket(AF_UNIX") < probe_body.index("connect("),
       "S: probeSocket uses the same validation and never connects to a truncated address")
 
+# F-09 browser and downloads (BrowserSupport.swift).
+browser_src = (REPO / "apps/macos/CMMComputerUse/BrowserSupport.swift").read_text()
+browser_code = strip_comments(browser_src)
+check(not re.search(r"NSAppleScript|osascript|OSAScript|CGEvent|Process\(|/usr/bin|cookie|Cookies|History\.db|"
+                    r"Login Data|keychain|SecItem|remote-debugging|webdriver|marionette", browser_code, re.I),
+      "F1: browser code uses no scripting, synthetic input, subprocess, profile/cookie/keychain or automation protocol")
+wait_body = browser_code[browser_code.index("func waitLoop("):]
+wait_body = wait_body[:wait_body.index("\n}\n")]
+check("withRequestState(peer: peer)" in wait_body and "dispatchLock" not in wait_body
+      and wait_body.index("withRequestState(peer: peer)") < wait_body.index("Thread.sleep("),
+      "F2: waits take dispatchLock per sample only (never across the sleep)")
+check(browser_code.count("FileHandle(forReadingAtPath:") == 1
+      and 'arguments["checksum"] as? Bool == true' in browser_code
+      and "Data(contentsOf" not in browser_code and "contentsOfFile" not in browser_code,
+      "F3: a downloaded file's bytes are read only for an explicit checksum request")
+check('"browser.select_tab", "browser.save_dialog":\n        return .accessibility' in POLICY_SRC.replace(
+          '"ui.press", "ui.set_value", "ui.scroll", "wait", "finish",\n         ', '')
+      and "browserPreconditions(kind: kind, params: params, mode: mode)" in main,
+      "F4: browser actions are accessibility-class and pass their preconditions inside the action pipeline")
+check('scope: .control' in browser_code and "bridgeDownloadRootAllowed(root, roots: roots)" in browser_code
+      and "downloadRoots ?? []" in browser_code,
+      "F5: browser actions need a control grant; downloads watch only the grant's declared roots")
+
 build = BUILD.read_text()
+check("BrowserSupport.swift" in build, "build-helper.sh compiles BrowserSupport.swift")
 shared = sorted(p.name for p in (REPO / "apps/macos/Shared").glob("*.swift"))
 missing = [name for name in shared if name not in build]
 check(not missing, "build-helper.sh compiles every Shared file (missing: %s)" % missing)
