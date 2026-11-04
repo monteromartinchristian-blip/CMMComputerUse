@@ -307,6 +307,22 @@ class DownloadTests(Base):
         self.call("computer_use_download_status", {"download_id": DL})
         self.assertNotIn("checksum", self.frames("download.status")[1]["arguments"])
 
+    def test_a_declared_checksum_that_could_not_be_computed_is_not_verified(self):
+        # Audit H2: the helper fails the download instead of leaving it complete.
+        self.helper.download_states = [{"state": "in_progress"},
+                                       {"state": "failed", "extra": {"reason": "checksum_unavailable"}}]
+        result = self.call("computer_use_download", {"context": CTX, "element_id": 7, "snapshot": 3,
+                                                     "expected_sha256": "ab" * 32})
+        self.assertTrue(result.get("isError"))
+        self.assertIn("NOT VERIFIED", text_of(result))
+        self.assertIn("checksum_unavailable", text_of(result))
+
+    def test_a_checksum_request_without_a_digest_says_so(self):
+        self.helper.download_states = [{"state": "complete", "extra": {"checksum": "unavailable"}}]
+        text = text_of(self.call("computer_use_download_status", {"download_id": DL, "checksum": True}))
+        self.assertIn("checksum unavailable", text)
+        self.assertNotIn("sha256=", text)
+
 
 # 8. save dialogs and conflicts
 

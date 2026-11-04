@@ -2691,10 +2691,13 @@ func contextClose(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
         return (false, nil, refusalFrame(refusal))
     case .success(let closed):
         if let streamID = closed.streamID { stopWindowStreamInternal(id: streamID, reason: "context_closed") }
+        // A closed context's download expectations end with it (idempotent).
+        let forgotten = downloadMonitor.forget(principal: currentPrincipal, contextID: id)
         if closed.closed { log("CONTEXT_CLOSED context=\(id) handles=\(closed.releasedHandles)") }
         return (true, [
             "context_id": id, "closed": closed.closed, "already_closed": closed.alreadyClosed,
             "released_handles": closed.releasedHandles, "stream_stopped": closed.streamID != nil,
+            "downloads_forgotten": forgotten,
         ], nil)
     }
 }

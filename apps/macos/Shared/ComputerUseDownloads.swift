@@ -25,6 +25,7 @@
 // expectation instead of pressing again. Nothing here opens a file: names,
 // sizes, inodes and dates only. Pure; the helper feeds it `lstat` results.
 
+import CryptoKit
 import Foundation
 
 // MARK: - Directory entries
@@ -204,6 +205,8 @@ public final class BridgeDownloadMonitor {
         let principal: BridgePrincipal
         let contextID: String?
         let bundleID: String
+        /// The application's name at declaration: a grant may name it.
+        let appName: String
         let root: String
         let opID: String?
         let nameHint: String?
@@ -271,7 +274,7 @@ public final class BridgeDownloadMonitor {
     public func expect(
         principal: BridgePrincipal, contextID: String?, bundleID: String, root: String,
         entries: [BridgeDirectoryEntry], opID: String?, nameHint: String?, now: Double,
-        expectedBytes: Int64? = nil, expectedSHA256: String? = nil
+        expectedBytes: Int64? = nil, expectedSHA256: String? = nil, appName: String = ""
     ) -> Result<String, BridgePolicyRefusal> {
         reap(now: now)
         if let opID, let existing = order.first(where: {
@@ -300,7 +303,7 @@ public final class BridgeDownloadMonitor {
         while expectations[id] != nil { id = makeID() }
         let hint = nameHint.flatMap { $0.isEmpty ? nil : $0 }
         expectations[id] = Expectation(
-            id: id, principal: principal, contextID: contextID, bundleID: bundleID, root: root,
+            id: id, principal: principal, contextID: contextID, bundleID: bundleID, appName: appName, root: root,
             opID: opID, nameHint: hint, expectedBytes: expectedBytes,
             expectedSHA256: expectedSHA256?.lowercased(), createdAt: now, afterFold: folds)
         order.append(id)
@@ -347,6 +350,29 @@ public final class BridgeDownloadMonitor {
         order.removeAll { $0 == id }
         if let artifact = expectation.artifact { artifacts.removeValue(forKey: artifact) }
         return true
+    }
+
+    /// Forget every expectation one context of `principal` declared (the
+    /// context was closed). Returns how many were forgotten.
+    @discardableResult
+    public func forget(principal: BridgePrincipal, contextID: String) -> Int {
+        let mine = order.filter { expectations[$0]?.principal == principal && expectations[$0]?.contextID == contextID }
+        for id in mine { forget(principal: principal, id: id) }
+        return mine.count
+    }
+
+    /// What an expectation watches — the application and the directory the
+    /// policy must still grant at every read. Its owner only.
+    public func subject(of id: String, principal: BridgePrincipal)
+        -> (bundleID: String, appName: String, root: String)?
+    {
+        guard let expectation = expectations[id], expectation.principal == principal else { return nil }
+        return (expectation.bundleID, expectation.appName, expectation.root)
+    }
+
+    /// The ids of `principal`'s expectations, oldest first.
+    public func ids(principal: BridgePrincipal) -> [String] {
+        order.filter { expectations[$0]?.principal == principal }
     }
 
     /// Roots that have open (non-terminal) expectations: the ones to scan.
@@ -594,10 +620,16 @@ public final class BridgeDownloadMonitor {
         } ?? false
         var state = artifact.state
         var reason = artifact.reason
-        if state == .complete, artifact.extractedTo == nil, let expected = expectation.expectedBytes,
-           artifact.bytes != expected {
-            state = .failed
-            reason = "size_mismatch;expected=\(expected);got=\(artifact.bytes)"
+        if state == .complete, let expected = expectation.expectedBytes {
+            if artifact.extractedTo != nil {
+                // The archive is gone and a folder has no comparable size:
+                // the declared size cannot be verified, so it is not.
+                state = .failed
+                reason = "size_unavailable;archive_unpacked_by_browser"
+            } else if artifact.bytes != expected {
+                state = .failed
+                reason = "size_mismatch;expected=\(expected);got=\(artifact.bytes)"
+            }
         }
         return BridgeDownloadStatus(
             downloadID: id, state: state, root: expectation.root, fileName: artifact.finalName,
@@ -647,4 +679,70 @@ public func bridgeNormalizedDownloadRoot(_ raw: String, home: String) -> String?
 /// are not implied: the policy names every directory a download may land in.
 public func bridgeDownloadRootAllowed(_ requested: String, roots: [String]) -> Bool {
     roots.contains(requested)
+}
+
+/// Is an existing expectation still covered by the policy NOW? Decided at
+/// every read, not only at `download.expect`: a revoked application, a lost
+/// `observe` scope or a root removed from the grant stops it answering
+/// (nil = still covered).
+public func bridgeDownloadAuthorizationRefusal(
+    policy: BridgeAuthorizationPolicy, client: BridgeClientGrant?, bundleID: String, appName: String = "",
+    root: String
+) -> BridgePolicyRefusal? {
+    if let refusal = policy.decision(bundleID: bundleID, name: appName, windowTitle: nil, scope: .observe,
+                                     client: client).refusal {
+        return refusal
+    }
+    guard let grant = policy.grant(bundleID: bundleID, name: appName),
+          bridgeDownloadRootAllowed(root, roots: grant.downloadRoots) else {
+        return BridgePolicyRefusal(
+            code: "DOWNLOAD_ROOT_NOT_ALLOWED",
+            message: "The policy no longer allows this download directory for this application.",
+            detail: "reason=root_revoked")
+    }
+    return nil
+}
+
+// MARK: - Integrity
+
+/// SHA-256 of a regular file, or nil when it cannot be read completely (a
+/// folder, a missing or unreadable file, a read error half-way): never the
+/// digest of a prefix.
+public func bridgeSHA256(ofFileAt path: String) -> String? {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue,
+          let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    do {
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+    } catch {
+        return nil
+    }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+/// Fold a checksum into a COMPLETE status. `digest` is nil when the file could
+/// not be hashed. A declared `expectedSHA256` is an explicit integrity
+/// requirement: a mismatch AND an unavailable digest are both `failed`, and the
+/// path is withheld — an unverified file is never handed out as the result.
+/// A plain `checksum` request without a digest says so and invents nothing.
+public func bridgeApplyIntegrity(
+    _ result: inout [String: Any], expectedSHA256: String?, digest: String?, requested: Bool
+) {
+    if let digest { result["sha256"] = digest }
+    guard let expected = expectedSHA256 else {
+        if requested && digest == nil { result["checksum"] = "unavailable" }
+        return
+    }
+    guard let digest, digest == expected.lowercased() else {
+        result["state"] = BridgeDownloadState.failed.rawValue
+        result["terminal"] = true
+        result["reason"] = digest == nil ? "checksum_unavailable" : "checksum_mismatch"
+        result.removeValue(forKey: "path")
+        return
+    }
+    result["integrity"] = "sha256_verified"
 }

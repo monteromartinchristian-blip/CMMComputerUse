@@ -16,7 +16,6 @@
 
 import AppKit
 import ApplicationServices
-import CryptoKit
 import Foundation
 
 // MARK: - State (under dispatchLock)
@@ -642,7 +641,7 @@ func downloadExpectRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
     switch downloadMonitor.expect(
         principal: currentPrincipal, contextID: context.id, bundleID: owner.bundleID, root: root,
         entries: entries, opID: opID, nameHint: hint, now: Date().timeIntervalSince1970,
-        expectedBytes: expectedBytes, expectedSHA256: expectedSHA) {
+        expectedBytes: expectedBytes, expectedSHA256: expectedSHA, appName: owner.name) {
     case .failure(let refusal): return (false, nil, refusalFrame(refusal))
     case .success(let id):
         log("download expectation \(id) context=\(context.label) bundle=\(owner.bundleID)")
@@ -656,6 +655,11 @@ func downloadStatusRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
         return (false, nil, bridgeError(code: "DOWNLOAD_UNKNOWN", message: "No such download expectation for this client.",
                                         detail: "reason=download_unknown"))
     }
+    // Decided again at every read: a grant revoked since `download.expect`
+    // ends the expectation before its directory is scanned or a byte is read.
+    if let refusal = revokedDownloadRefusal(id) {
+        return (false, nil, refusalFrame(refusal))
+    }
     let scanned = scanDownloadRoot(root)
     let entries: [BridgeDirectoryEntry]?
     if case .success(let found) = scanned { entries = found } else { entries = nil }
@@ -665,26 +669,32 @@ func downloadStatusRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
         var result = status.dictionary
         if entries == nil { result["scan"] = "unavailable" }
         let expected = downloadMonitor.expectedSHA256(of: id, principal: currentPrincipal)
-        if arguments["checksum"] as? Bool == true || expected != nil, status.state == .complete,
-           let path = status.path, let digest = sha256(ofFileAt: path) {
+        let requested = arguments["checksum"] as? Bool == true
+        if requested || expected != nil, status.state == .complete {
             // Only on explicit request (`checksum`, or an expected_sha256 the
             // caller declared): the one read of a downloaded file's bytes.
-            result["sha256"] = digest
-            if let expected, expected != digest {
-                result["state"] = BridgeDownloadState.failed.rawValue
-                result["terminal"] = true
-                result["reason"] = "checksum_mismatch"
-                result.removeValue(forKey: "path")
-            } else if expected != nil {
-                result["integrity"] = "sha256_verified"
-            }
+            let digest = status.path.flatMap { bridgeSHA256(ofFileAt: $0) }
+            bridgeApplyIntegrity(&result, expectedSHA256: expected, digest: digest, requested: requested)
         }
         return (true, result, nil)
     }
 }
 
+/// The refusal for an expectation the policy no longer covers (application,
+/// `observe` scope or root revoked), which is then forgotten; nil if covered.
+func revokedDownloadRefusal(_ id: String) -> BridgePolicyRefusal? {
+    guard let subject = downloadMonitor.subject(of: id, principal: currentPrincipal),
+          let refusal = bridgeDownloadAuthorizationRefusal(
+              policy: authorization, client: currentClient, bundleID: subject.bundleID,
+              appName: subject.appName, root: subject.root) else { return nil }
+    downloadMonitor.forget(principal: currentPrincipal, id: id)
+    log("download expectation \(id) ended: no longer authorized (\(refusal.detail))")
+    return refusal
+}
+
 func downloadListRequest() -> (Bool, Any?, [String: Any?]?) {
     let now = Date().timeIntervalSince1970
+    for id in downloadMonitor.ids(principal: currentPrincipal) { _ = revokedDownloadRefusal(id) }
     return (true, ["downloads": downloadMonitor.list(principal: currentPrincipal, now: now).map { $0.dictionary }], nil)
 }
 
@@ -694,17 +704,6 @@ func downloadForgetRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
                                         detail: "reason=download_unknown"))
     }
     return (true, ["forgotten": downloadMonitor.forget(principal: currentPrincipal, id: id), "download_id": id], nil)
-}
-
-func sha256(ofFileAt path: String) -> String? {
-    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-    defer { try? handle.close() }
-    var hasher = SHA256()
-    while true {
-        guard let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty else { break }
-        hasher.update(data: chunk)
-    }
-    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
 
 // MARK: - Waits (outside dispatchLock)

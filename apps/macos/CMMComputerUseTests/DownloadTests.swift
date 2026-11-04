@@ -174,6 +174,23 @@ final class DownloadTests: XCTestCase {
         XCTAssertEqual(s.dictionary["archive_name"] as? String, "run-archive.zip")
     }
 
+    /// A declared size cannot be checked on a folder: fail closed, never a
+    /// silent `complete` (same rule as an uncomputable checksum, audit H2).
+    func testADeclaredSizeOnAnArchiveTheBrowserUnpackedIsNotVerified() {
+        let m = monitor()
+        guard case .success(let id) = m.expect(principal: dsh, contextID: nil, bundleID: "com.apple.Safari", root: root,
+                                               entries: [], opID: nil, nameHint: "run-archive.zip", now: 0,
+                                               expectedBytes: 40000)
+        else { return XCTFail() }
+        _ = state(m, id, [bundle("run-archive.zip.download", 40000, inode: 700)], at: 1)
+        let unpacked = [BridgeDirectoryEntry(name: "run-archive", isDirectory: true, size: 0, inode: 701, modified: 2)]
+        _ = state(m, id, unpacked, at: 2)
+        let s = state(m, id, unpacked, at: 3.5)
+        XCTAssertEqual(s.state, .failed)
+        XCTAssertEqual(s.reason, "size_unavailable;archive_unpacked_by_browser")
+        XCTAssertEqual(s.extractedTo, "run-archive", "what happened is still reported")
+    }
+
     func testAnUnrelatedFolderIsNotTakenForAnExtraction() {
         let m = monitor()
         let id = expect(m, [], hint: "a.pdf", at: 0)
@@ -440,5 +457,129 @@ final class DownloadTests: XCTestCase {
         XCTAssertNil(BridgeAuthorizationPolicy.parse(Data(typo.utf8), source: "t"))
         let escape = #"{"version":1,"mode":"background","apps":[{"bundle_id":"x","downloads":{"roots":["relative/dir"]}}]}"#
         XCTAssertNil(BridgeAuthorizationPolicy.parse(Data(escape.utf8), source: "t"))
+    }
+
+    // MARK: revocation (pre-integration audit H1)
+
+    private func chromePolicy(scopes: String = #"["observe","control"]"#, roots: String) -> BridgeAuthorizationPolicy {
+        let text = #"{"version":1,"mode":"background","apps":[{"bundle_id":"com.google.Chrome","scopes":"#
+            + scopes + #","downloads":{"roots":"# + roots + "}}]}"
+        guard let policy = BridgeAuthorizationPolicy.parse(Data(text.utf8), source: "t") else { fatalError(text) }
+        return policy
+    }
+
+    /// An expectation is decided against the policy at EVERY read, not only
+    /// when it was declared: a revoked root or application stops answering.
+    func testAnExpectationIsRevalidatedAgainstThePolicyAtEveryRead() {
+        let root = "/tmp/lane-downloads"
+        XCTAssertNil(bridgeDownloadAuthorizationRefusal(
+            policy: chromePolicy(roots: #"["/tmp/lane-downloads"]"#), client: nil,
+            bundleID: "com.google.Chrome", root: root))
+        let rootRemoved = bridgeDownloadAuthorizationRefusal(
+            policy: chromePolicy(roots: #"["/tmp/other"]"#), client: nil, bundleID: "com.google.Chrome", root: root)
+        XCTAssertEqual(rootRemoved?.code, "DOWNLOAD_ROOT_NOT_ALLOWED")
+        XCTAssertTrue(rootRemoved?.detail.contains("reason=root_revoked") ?? false)
+        let noRoots = bridgeDownloadAuthorizationRefusal(
+            policy: chromePolicy(roots: "[]"), client: nil, bundleID: "com.google.Chrome", root: root)
+        XCTAssertEqual(noRoots?.code, "DOWNLOAD_ROOT_NOT_ALLOWED")
+        let noObserve = bridgeDownloadAuthorizationRefusal(
+            policy: chromePolicy(scopes: #"["control"]"#, roots: #"["/tmp/lane-downloads"]"#), client: nil,
+            bundleID: "com.google.Chrome", root: root)
+        XCTAssertEqual(noObserve?.code, "APPROVAL_REJECTED")
+        let appRevoked = bridgeDownloadAuthorizationRefusal(
+            policy: chromePolicy(roots: #"["/tmp/lane-downloads"]"#), client: nil, bundleID: "org.mozilla.firefox",
+            root: root)
+        XCTAssertEqual(appRevoked?.code, "APPROVAL_REJECTED")
+    }
+
+    func testTheMonitorNamesWhatAnExpectationWatchesOnlyToItsOwner() {
+        let m = monitor()
+        let id = expect(m, [], at: 0)
+        XCTAssertEqual(m.subject(of: id, principal: dsh)?.bundleID, "com.google.Chrome")
+        XCTAssertEqual(m.subject(of: id, principal: dsh)?.root, root)
+        XCTAssertNil(m.subject(of: id, principal: other))
+        XCTAssertEqual(m.ids(principal: dsh), [id])
+        XCTAssertEqual(m.ids(principal: other), [])
+    }
+
+    func testClosingAContextForgetsOnlyItsOwnExpectations() {
+        let m = monitor()
+        func declare(_ context: String, _ principal: BridgePrincipal) -> String {
+            guard case .success(let id) = m.expect(
+                principal: principal, contextID: context, bundleID: "com.google.Chrome", root: root,
+                entries: [], opID: nil, nameHint: nil, now: 0) else { XCTFail(); return "" }
+            return id
+        }
+        let a = declare("ctx_a", dsh)
+        let b = declare("ctx_b", dsh)
+        let foreign = declare("ctx_a", other)
+        XCTAssertEqual(m.forget(principal: dsh, contextID: "ctx_a"), 1)
+        guard case .failure(let refusal) = m.status(principal: dsh, id: a, entries: nil, now: 1) else {
+            return XCTFail("a closed context's expectation must be gone")
+        }
+        XCTAssertEqual(refusal.code, "DOWNLOAD_UNKNOWN")
+        XCTAssertEqual(state(m, b, nil, at: 1).state, .notStarted)
+        XCTAssertNotNil(m.subject(of: foreign, principal: other), "another client's context id is not ours to close")
+    }
+
+    // MARK: integrity (pre-integration audit H2)
+
+    private let digestA = String(repeating: "a", count: 64)
+    private let digestB = String(repeating: "b", count: 64)
+
+    private func completed() -> [String: Any] {
+        ["state": "complete", "terminal": true, "path": "/r/f.bin", "file_name": "f.bin"]
+    }
+
+    /// A declared checksum that cannot be computed (a folder the browser
+    /// unpacked, an unreadable file) is a failure — never a silent success.
+    func testADeclaredChecksumThatCannotBeComputedFails() {
+        var result = completed()
+        bridgeApplyIntegrity(&result, expectedSHA256: digestA, digest: nil, requested: false)
+        XCTAssertEqual(result["state"] as? String, "failed")
+        XCTAssertEqual(result["terminal"] as? Bool, true)
+        XCTAssertEqual(result["reason"] as? String, "checksum_unavailable")
+        XCTAssertNil(result["path"], "an unverified file is not handed out as the result")
+        XCTAssertNil(result["integrity"])
+        XCTAssertNil(result["sha256"])
+    }
+
+    func testAChecksumRequestWithoutADigestSaysUnavailableAndInventsNothing() {
+        var result = completed()
+        bridgeApplyIntegrity(&result, expectedSHA256: nil, digest: nil, requested: true)
+        XCTAssertEqual(result["state"] as? String, "complete", "no integrity was declared: the download stands")
+        XCTAssertEqual(result["checksum"] as? String, "unavailable")
+        XCTAssertNil(result["sha256"])
+    }
+
+    func testAMatchingChecksumIsVerifiedAndAMismatchFails() {
+        var good = completed()
+        bridgeApplyIntegrity(&good, expectedSHA256: digestA, digest: digestA, requested: false)
+        XCTAssertEqual(good["state"] as? String, "complete")
+        XCTAssertEqual(good["integrity"] as? String, "sha256_verified")
+        XCTAssertEqual(good["sha256"] as? String, digestA)
+        var bad = completed()
+        bridgeApplyIntegrity(&bad, expectedSHA256: digestA, digest: digestB, requested: false)
+        XCTAssertEqual(bad["state"] as? String, "failed")
+        XCTAssertEqual(bad["reason"] as? String, "checksum_mismatch")
+        XCTAssertNil(bad["path"])
+        var plain = completed()
+        bridgeApplyIntegrity(&plain, expectedSHA256: nil, digest: digestB, requested: true)
+        XCTAssertEqual(plain["sha256"] as? String, digestB)
+        XCTAssertNil(plain["integrity"])
+    }
+
+    /// The real reader: a folder (what a browser unpacked) has no digest, and a
+    /// file hashes completely.
+    func testTheFileReaderHashesFilesAndRefusesFolders() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("f.bin")
+        try Data("abc".utf8).write(to: file)
+        XCTAssertEqual(bridgeSHA256(ofFileAt: file.path),
+                       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        XCTAssertNil(bridgeSHA256(ofFileAt: dir.path))
+        XCTAssertNil(bridgeSHA256(ofFileAt: dir.appendingPathComponent("absent").path))
     }
 }

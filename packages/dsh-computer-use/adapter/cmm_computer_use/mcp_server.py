@@ -1552,6 +1552,8 @@ def _render_download(result: Any, declared: bool = False) -> str:
         parts.append("sha256=%s" % result["sha256"])
     if result.get("integrity"):
         parts.append("integrity=%s" % result["integrity"])
+    if result.get("checksum") == "unavailable":
+        parts.append("checksum unavailable: the file could not be read completely; nothing was verified")
     if result.get("state") == "interrupted":
         parts.append("the browser may offer Resume; press it, then wait again")
     return "; ".join(parts)

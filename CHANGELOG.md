@@ -36,6 +36,20 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
 
 ### Fixed
 
+- Pre-integration audit H1: `download.status`, `download.wait` and
+  `download.list` decide each expectation against the policy at every read.
+  A revoked application, a lost `observe` scope or a root removed from the
+  grant ends the expectation (`DOWNLOAD_ROOT_NOT_ALLOWED` with
+  `reason=root_revoked`, or the policy's refusal) before the directory is
+  scanned. Closing a context forgets its expectations
+  (`downloads_forgotten` in the answer).
+- Pre-integration audit H2: a declared `expected_sha256` that cannot be
+  computed (a folder the browser unpacked, an unreadable file) is now `failed`
+  with `reason=checksum_unavailable`, never a silent `complete`. A read error
+  half-way gives no digest instead of the digest of a prefix; a plain
+  `checksum` request without a digest answers `checksum: "unavailable"`.
+  Likewise, a declared `expected_bytes` on an archive the browser unpacked is
+  `failed` with `reason=size_unavailable;archive_unpacked_by_browser`.
 - The PiP restarted its live stream whenever the window title changed (every
   tab switch / navigation); a page change cleared the panel as if the window
   were lost.

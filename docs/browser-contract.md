@@ -31,6 +31,7 @@ The download directories are part of the application grant:
 ```
 
 - **No roots, no downloads.** A grant without `roots` watches nothing and answers `DOWNLOADS_NOT_ENABLED`.
+- **Decided at every read.** `download.status`, `download.wait` and `download.list` check the grant again each time. If the application, its `observe` scope or the root was revoked since `download.expect`, the expectation ends before the directory is scanned: `DOWNLOAD_ROOT_NOT_ALLOWED` with `reason=root_revoked`, or the policy's own refusal. Closing a context also ends its expectations.
 - **Roots are exact.** A subdirectory is not implied.
 - **Malformed roots invalidate the policy.** A relative path, `..`, or `/` makes the whole policy invalid, and the helper denies everything.
 - **Window patterns follow the page title.** A browser grant should normally not restrict windows by title. If it does, a tab switch that renames the window out of the pattern stops control, and that is the correct behaviour.
@@ -142,7 +143,13 @@ finished writing a non-empty, stable file". With them:
 
 - the wrong size is reported as `failed` with `reason=size_mismatch`;
 - the wrong hash is reported as `failed` with `reason=checksum_mismatch`. A
-  declared hash is an explicit request to read the file.
+  declared hash is an explicit request to read the file;
+- a declared hash that cannot be computed is reported as `failed` with
+  `reason=checksum_unavailable`, and no path is returned. This covers a folder
+  the browser unpacked, an unreadable file and a read error half-way.
+
+A `checksum: true` request on a file that cannot be read completely answers
+`checksum: "unavailable"` and no `sha256`: never the digest of part of a file.
 
 **Archives unpacked by the browser.** With "Open safe files after
 downloading", Safari unpacks a ZIP into a folder and deletes the archive
@@ -152,6 +159,12 @@ downloading", Safari unpacks a ZIP into a folder and deletes the archive
 - `archive_name`;
 - `extracted_to`;
 - `path`, pointing at the folder.
+
+A folder can be checked neither by size nor by hash. With `expected_bytes`
+declared, such a download is `failed` with
+`reason=size_unavailable;archive_unpacked_by_browser`. With `expected_sha256`,
+it is `failed` with `reason=checksum_unavailable`. Declaring no integrity is the
+only way to accept a ZIP that the browser may unpack.
 
 **The root must be the browser's real folder.** The helper cannot read browser
 settings. A Safari that saves to iCloud Drive › Downloads needs that folder as
