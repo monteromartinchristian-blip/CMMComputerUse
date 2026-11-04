@@ -32,9 +32,14 @@ public func bridgeRetryClass(operation: String, kind: String?) -> BridgeRetryCla
     case "bridge.ping", "permissions.status", "policy.status", "breach.status", "apps.list",
          "policy.requirements.check", "observation.describe", "observation.capture_screen",
          "observation.stream_frame", "observation.stream_status", "workspace.status",
-         "workspace.context_list", "workspace.context_status", "action.outcome":
+         "workspace.context_list", "workspace.context_status", "action.outcome",
+         "browser.state", "browser.wait", "download.status", "download.wait", "download.list":
         return .read
-    case "observation.release", "observation.stream_stop", "workspace.context_close", "policy.reload":
+    // `download.expect` touches no application: it records a baseline. With
+    // an op_id (clients always send one) a resend returns the SAME
+    // expectation; without one it declares another, equally harmless.
+    case "observation.release", "observation.stream_stop", "workspace.context_close", "policy.reload",
+         "download.forget", "download.expect":
         return .idempotent
     default:
         return .mutating

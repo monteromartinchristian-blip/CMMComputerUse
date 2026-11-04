@@ -28,6 +28,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_SRC="$REPO/apps/macos"
 SRC="$APP_SRC/CMMComputerUse/main.swift"
 SRC_STREAM="$APP_SRC/CMMComputerUse/WindowStream.swift"
+SRC_BROWSER="$APP_SRC/CMMComputerUse/BrowserSupport.swift"
 SHARED="$APP_SRC/Shared/BridgeTargeting.swift"
 SHARED_POLICY="$APP_SRC/Shared/ComputerUsePolicy.swift"
 SHARED_AUTHZ="$APP_SRC/Shared/ComputerUseAuthorization.swift"
@@ -52,7 +53,7 @@ INSTALL_DIR="${CMM_BRIDGE_INSTALL_DIR:-$HOME/Applications}"
 APP="$INSTALL_DIR/$APP_NAME"
 BUILD_DIR="${CMM_HELPER_BUILD_DIR:-$REPO/build}"
 
-for required in "$SRC" "$SRC_STREAM" "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$SHARED_SOCKET" "$SHARED_WORKSPACE" "$SHARED_STREAMS" "$SHARED_RELIABILITY" "$SHARED_BROWSER" "$SHARED_DOWNLOADS" "$PLIST"; do
+for required in "$SRC" "$SRC_STREAM" "$SRC_BROWSER" "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$SHARED_SOCKET" "$SHARED_WORKSPACE" "$SHARED_STREAMS" "$SHARED_RELIABILITY" "$SHARED_BROWSER" "$SHARED_DOWNLOADS" "$PLIST"; do
   if [ ! -f "$required" ]; then
     echo "missing source: $required" >&2; exit 1
   fi
@@ -67,7 +68,7 @@ swiftc -O -target arm64-apple-macosx15.0 \
   -framework ApplicationServices -framework AppKit -framework CoreGraphics -framework Foundation \
   -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework CoreImage -framework ImageIO \
   -framework Security \
-  "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$SHARED_SOCKET" "$SHARED_WORKSPACE" "$SHARED_STREAMS" "$SHARED_RELIABILITY" "$SHARED_BROWSER" "$SHARED_DOWNLOADS" "$SRC_STREAM" "$SRC" \
+  "$SHARED" "$SHARED_POLICY" "$SHARED_AUTHZ" "$SHARED_CLIENT" "$SHARED_REQUIREMENT" "$SHARED_LATCH" "$SHARED_SOCKET" "$SHARED_WORKSPACE" "$SHARED_STREAMS" "$SHARED_RELIABILITY" "$SHARED_BROWSER" "$SHARED_DOWNLOADS" "$SRC_STREAM" "$SRC_BROWSER" "$SRC" \
   -o "$BUILD_DIR/CMMComputerUse"
 
 echo "== assembling $APP_NAME"

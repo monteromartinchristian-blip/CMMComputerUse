@@ -124,7 +124,8 @@ public enum BridgeActionClass: String, Sendable {
 /// breach).
 public func bridgeActionClass(kind: String) -> BridgeActionClass? {
     switch kind {
-    case "ui.press", "ui.set_value", "ui.scroll", "wait", "finish":
+    case "ui.press", "ui.set_value", "ui.scroll", "wait", "finish",
+         "browser.select_tab", "browser.save_dialog":
         return .accessibility
     case "app.open", "app.activate", "window.focus":
         return .focus

@@ -92,10 +92,14 @@ class AnnotationTests(SurfaceCase):
     def test_read_only_set_matches_the_background_catalog(self):
         names = {tool["name"] for tool in self.registry().tools()}
         # 0.3.3 adds two read-only workspace tools (status; opening an
-        # observe-scoped context acts on no application).
+        # observe-scoped context acts on no application). F-09 adds four:
+        # browser state/wait read, download expect/status are helper
+        # bookkeeping on a policy-declared directory (no application touched).
         self.assertEqual(READ_ONLY_TOOLS, {"computer_use_status", "computer_use_list_apps",
                                            "computer_use_observe", "computer_use_capture_window",
-                                           "computer_use_workspace_status", "computer_use_context_open"})
+                                           "computer_use_workspace_status", "computer_use_context_open",
+                                           "computer_use_browser_state", "computer_use_browser_wait",
+                                           "computer_use_download_expect", "computer_use_download_status"})
         self.assertTrue(READ_ONLY_TOOLS.issubset(names))
 
 
@@ -321,8 +325,10 @@ class AvailabilityTests(SurfaceCase):
         catalog = handle_message(registry, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         assert catalog is not None
         # + computer_use_scroll (AX-only); 0.3.3: + workspace_status,
-        # context_open, context_close.
-        self.assertEqual(len(catalog["result"]["tools"]), 11)
+        # context_open, context_close; F-09: + browser_state, browser_wait,
+        # browser_select_tab, download, download_expect, download_status,
+        # save_dialog.
+        self.assertEqual(len(catalog["result"]["tools"]), 18)
         response = self.call("computer_use_status", registry=registry)
         self.assertTrue(is_error(response))
         self.assertIn("REFUSED COMPUTER_RUNTIME_UNAVAILABLE", text_of(response))

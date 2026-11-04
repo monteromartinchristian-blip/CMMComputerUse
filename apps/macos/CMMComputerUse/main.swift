@@ -115,6 +115,8 @@ let allowedActions: Set<String> = [
     "keyboard.type", "keyboard.shortcut",
     "pointer.click", "pointer.scroll",
     "wait", "finish",
+    // F-09: AX-only browser actions (BrowserSupport.swift).
+    "browser.select_tab", "browser.save_dialog",
 ]
 
 // USB HID keycodes (parity with MacComputerRuntime._KEYCODES).
@@ -1263,7 +1265,8 @@ func runningApp(named request: String) -> NSRunningApplication? {
 /// result that a client could mistake for a successful one.
 func describe(
     includeScreenshot: Bool, targetApp: String?, mode: BridgeInteractionMode,
-    includeDiagnostics: Bool = false, elementFilter: String = "", contextID: String? = nil
+    includeDiagnostics: Bool = false, elementFilter: String = "", contextID: String? = nil,
+    windowID: Int? = nil
 ) -> (result: [String: Any]?, refusal: BridgePolicyRefusal?) {
     // The context first: it is the caller's own, or the request is refused
     // before any application is touched. No `context_id` is the 0.3.2 caller,
@@ -1308,11 +1311,32 @@ func describe(
     // against the window that is actually going to be walked.
     var windowElement: AXUIElement?
     var captureTitle = ""
+    var windowFollow = "focused"
     let appElement = AXUIElementCreateApplication(owner.pid)
     if AXIsProcessTrusted() {
         windowElement = axElement(appElement, kAXFocusedWindowAttribute)
             ?? axElement(appElement, kAXMainWindowAttribute)
             ?? (axAttr(appElement, kAXWindowsAttribute) as? [AXUIElement])?.first
+        // F-09: a window is named by its CGWindowID, never by focus or order.
+        // An explicit window_id must exist; an explicit context keeps the
+        // window it observed last (same process) instead of following focus,
+        // so two contexts on two windows of one browser never swap.
+        let bound = context.legacy ? nil
+            : (context.identity?.pid == owner.pid ? context.identity?.windowID : nil)
+        if let wanted = windowID ?? bound {
+            let windows = (axAttr(appElement, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+            if let match = windows.first(where: { cgWindowID(of: $0, pid: owner.pid) == wanted }) {
+                windowElement = match
+                windowFollow = windowID != nil ? "requested" : "bound"
+            } else if windowID != nil {
+                return (nil, BridgePolicyRefusal(
+                    code: "COMPUTER_TARGET_UNAVAILABLE",
+                    message: "That window of the application is not open.",
+                    detail: "policy=\(mode.rawValue);target=window;reason=window_not_found"))
+            } else {
+                windowFollow = "bound_window_closed"
+            }
+        }
         if let windowElement {
             captureTitle = (axAttr(windowElement, kAXTitleAttribute) as? String) ?? ""
         }
@@ -1386,7 +1410,8 @@ func describe(
     let titled = windows.filter { ($0["title"] as? String) == captureTitle }
     let identity = BridgeContextIdentity(
         bundleID: owner.bundleID, pid: owner.pid, appName: owner.name,
-        windowID: titled.count == 1 ? titled[0]["window_id"] as? Int : nil,
+        windowID: windowElement.flatMap { cgWindowID(of: $0, pid: owner.pid) }
+            ?? (titled.count == 1 ? titled[0]["window_id"] as? Int : nil),
         windowTitle: captureTitle,
         document: documentIdentity(window: windowElement, webArea: traversal.webArea, title: captureTitle))
     guard let start = workspace.beginObservation(
@@ -1395,7 +1420,15 @@ func describe(
     }
     workspace.commit(id: context.id, generation: start.generation, handles: traversal.handles)
     let committed = workspace.record(id: context.id) ?? context
+    // The observation is the new baseline for this context's browser
+    // transitions (BrowserSupport.swift); nothing for other applications.
+    notePageObserved(contextID: context.id, app: target)
 
+    func finish(_ description: [String: Any]) -> (result: [String: Any]?, refusal: BridgePolicyRefusal?) {
+        var description = description
+        description["window_follow"] = windowFollow
+        return (description, nil)
+    }
     var screenshotB64: String? = nil
     var screenshotScope = "none"
     var screenshotError: String? = nil
@@ -1405,11 +1438,11 @@ func describe(
         // additionally refuses to guess when the window has no title.
         guard !captureTitle.isEmpty else {
             screenshotError = "window_title_unavailable"
-            return (buildDescription(
+            return finish(buildDescription(
                 frontmostName: frontmostName, frontmost: frontmost, target: target,
                 traversal: traversal, windowTitle: captureTitle, windows: windows, context: committed,
                 start: start, screenshot: nil, scope: "none",
-                error: screenshotError, enrichment: enrichment, diagnostics: diagnostics), nil)
+                error: screenshotError, enrichment: enrichment, diagnostics: diagnostics))
         }
         let outcome = captureWindowBase64(app: owner.name, title: captureTitle, snapshot: start.generation)
         screenshotB64 = outcome.image
@@ -1418,11 +1451,11 @@ func describe(
         else { screenshotError = outcome.failure }
     }
 
-    return (buildDescription(
+    return finish(buildDescription(
         frontmostName: frontmostName, frontmost: frontmost, target: target,
         traversal: traversal, windowTitle: captureTitle, windows: windows, context: committed,
         start: start, screenshot: screenshotB64, scope: screenshotScope,
-        error: screenshotError, enrichment: enrichment, diagnostics: diagnostics), nil)
+        error: screenshotError, enrichment: enrichment, diagnostics: diagnostics))
 }
 
 /// One observation frame. `frontmost_*` is always measured truth; `target_*`
@@ -1466,7 +1499,8 @@ func buildDescription(
         "identity_changes": start.identityChanges,
     ]
     if let document = context.identity?.document { result["document"] = document.dictionary }
-    if matches.count == 1 { result["target_window_id"] = matches[0]["window_id"] }
+    if let windowID = context.identity?.windowID { result["target_window_id"] = windowID }
+    else if matches.count == 1 { result["target_window_id"] = matches[0]["window_id"] }
     if !enrichment.isEmpty { result["ax_enrichment"] = enrichment }
     // Say it when the tree is useless instead of handing over three title-bar
     // buttons as if they were the application: `chrome_only` means every
@@ -2299,6 +2333,8 @@ func executeAction(kind: String, params: [String: Any]) -> [String: Any] {
     case "app.activate": return appActivate(params["app"] as? String ?? "")
     case "window.focus": return windowFocus(params["title"] as? String ?? "")
     case "ui.press": return uiPress(params)
+    case "browser.select_tab": return browserSelectTab(params)
+    case "browser.save_dialog": return browserSaveDialog(params)
     case "ui.set_value": return uiSetValue(params)
     case "ui.scroll": return uiScroll(params)
     case "keyboard.type": return keyboardType(params["text"] as? String ?? "")
@@ -2406,6 +2442,8 @@ func actionTargetBundle(kind: String, params: [String: Any]) -> String? {
     case "app.activate", "app.open":
         let request = (params["app"] as? String) ?? ""
         return runningApp(named: request)?.bundleIdentifier
+    case "browser.select_tab", "browser.save_dialog":
+        return requestBrowserTarget?.bundleID
     default:
         return nil
     }
@@ -2985,6 +3023,10 @@ func executeActionRequest(
         log("refused \(kind) stale-or-expired observation")
         return (false, nil, refusalFrame(refusal))
     }
+    if let refusal = browserPreconditions(kind: kind, params: params, mode: mode) {
+        log("refused \(kind) browser precondition: \(refusal.detail)")
+        return (false, nil, refusalFrame(refusal))
+    }
     // Measure the invariant around EVERY executed action, success or
     // failure, and sample DURING it: a before/after pair cannot see a
     // window that raises itself and drops back.
@@ -3044,7 +3086,8 @@ func executeActionRequest(
             let record = BridgeBreachRecord(
                 id: UUID().uuidString.lowercased(), targetBundle: targetBundle,
                 targetName: (params["element_id"] as? NSNumber)
-                    .flatMap { requestHandle($0.intValue)?.context.appName } ?? "",
+                    .flatMap { requestHandle($0.intValue)?.context.appName }
+                    ?? requestBrowserTarget?.appName ?? "",
                 clientID: currentClient?.clientID ?? "", kind: kind, policy: mode.rawValue,
                 at: Date().timeIntervalSince1970, verdict: report.verdict.rawValue,
                 focusBecameTarget: report.focusBecameTarget,
@@ -3187,6 +3230,18 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                     "operation_ledger": true,
                     "stream_recovery": true,
                 ] as [String: Any],
+                // F-09: browser windows/tabs/page lifecycle and verified
+                // downloads (contract cmm-computer-use/browser v1).
+                "browser": [
+                    "contract": "cmm-computer-use/browser",
+                    "contract_version": 1,
+                    "tabs": true, "page_lifecycle": true, "select_tab": true,
+                    "save_dialog": true, "window_targeting": true,
+                ] as [String: Any],
+                "downloads": [
+                    "verified": true, "expectations": true, "partial_formats": ["webkit_bundle", "crdownload", "part"],
+                    "checksum_on_request": true,
+                ] as [String: Any],
             ],
             "requirement_contract": bridgeRequirementContractVersion,
             // Random per process: a change means the helper restarted and
@@ -3253,7 +3308,8 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
             includeScreenshot: include, targetApp: target, mode: resolved.mode,
             includeDiagnostics: (arguments["include_ax_diagnostics"] as? Bool) ?? false,
             elementFilter: (arguments["element_filter"] as? String) ?? "",
-            contextID: contextID)
+            contextID: contextID,
+            windowID: (arguments["window_id"] as? NSNumber)?.intValue)
         if let refusal {
             return (false, nil, refusalFrame(refusal))
         }
@@ -3320,6 +3376,16 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
         return contextStatus(arguments)
     case "workspace.context_close":
         return contextClose(arguments)
+    case "browser.state":
+        return browserStateRequest(arguments)
+    case "download.expect":
+        return downloadExpectRequest(arguments)
+    case "download.status":
+        return downloadStatusRequest(arguments)
+    case "download.list":
+        return downloadListRequest()
+    case "download.forget":
+        return downloadForgetRequest(arguments)
     case "action.outcome":
         return actionOutcome(arguments)
     case "action.execute":
@@ -3463,24 +3529,42 @@ func handleLine(_ text: String, sendTo fd: Int32?, peer: BridgePeerCode? = nil) 
         }
         pendingOpID = opID
     }
+    // Waits poll a read-only status, one locked sample at a time (F-09).
+    if operation == "download.wait" || operation == "browser.wait" {
+        let (ok, result, error) = waitLoop(operation: operation, arguments: args, peer: peer)
+        respond(["ok": ok, "result": result, "error": error], id: rid)
+        return
+    }
+    let (ok, result, error) = withRequestState(peer: peer) {
+        dispatch(operation: operation, arguments: args)
+    }
+    if let pendingOpID { endPendingOperation(pendingOpID) }
+    respond(["ok": ok, "result": result, "error": error], id: rid)
+}
+
+/// Run `body` as ONE request: under `dispatchLock`, with the client, peer and
+/// principal of `peer` published for its authorization decisions, and every
+/// per-request global cleared afterwards.
+///
+/// Resolve the client for this request under the lock, then dispatch. Every
+/// authorization decision reads `currentClient`, so the two must not be
+/// separated: the whole operation runs inside this critical section. The peer
+/// is published beside it for the same reason: `policy.status` reports the
+/// caller of THIS request, never another connection's. The principal (who
+/// owns contexts and streams) is derived from the same two facts.
+func withRequestState<T>(peer: BridgePeerCode?, _ body: () -> T) -> T {
     dispatchLock.lock()
-    // Resolve the client for this request under the lock, then dispatch. Every
-    // authorization decision below reads `currentClient`, so the two must not be
-    // separated: the whole operation runs inside this critical section. The peer
-    // is published beside it for the same reason: `policy.status` reports the
-    // caller of THIS request, never another connection's. The principal (who
-    // owns contexts and streams) is derived from the same two facts.
+    defer { dispatchLock.unlock() }
     currentPeer = peer
     currentClient = bridgeMatchingClient(peer, policy: authorization)
     currentPrincipal = requestPrincipal(peer: peer, client: currentClient)
-    let (ok, result, error) = dispatch(operation: operation, arguments: args)
+    let value = body()
     requestContext = nil
+    requestBrowserTarget = nil
     currentPrincipal = BridgePrincipal(key: "local", strength: .local)
     currentClient = nil
     currentPeer = nil
-    dispatchLock.unlock()
-    if let pendingOpID { endPendingOperation(pendingOpID) }
-    respond(["ok": ok, "result": result, "error": error], id: rid)
+    return value
 }
 
 // MARK: - Socket serve mode (product transport)

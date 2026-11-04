@@ -95,7 +95,16 @@ OPERATION_TIMEOUTS = {
     "observation.stream_frame": 5.0,
     "observation.stream_status": 10.0,
     "observation.stream_recover": 25.0,
+    # F-09 browser and downloads. The waits are bounded by their own
+    # `timeout` argument (≤ 120 s); the transport allows that plus margin.
+    "browser.state": 15.0,
+    "download.expect": 10.0,
+    "download.status": 10.0,
+    "download.list": 10.0,
+    "download.forget": 10.0,
 }
+#: Upper bound of a helper-side wait (``browser.wait`` / ``download.wait``).
+WAIT_MAX_SECONDS = 120.0
 
 #: Operations that never change anything outside the helper's own read path:
 #: retried after a transport failure with bounded backoff. Mirrors
@@ -106,11 +115,15 @@ READ_OPERATIONS = frozenset(
         "observation.describe", "observation.capture_screen", "observation.stream_frame",
         "observation.stream_status", "workspace.status", "workspace.context_list",
         "workspace.context_status", "action.outcome",
+        "browser.state", "browser.wait", "download.status", "download.wait", "download.list",
     }
 )
-#: Helper bookkeeping that is idempotent: one retry.
+#: Helper bookkeeping that is idempotent: one retry. ``download.expect`` is
+#: bookkeeping too (it touches no application) and is always sent with an
+#: op_id, which the helper answers with the SAME expectation on a resend.
 IDEMPOTENT_OPERATIONS = frozenset(
-    {"observation.release", "observation.stream_stop", "workspace.context_close"}
+    {"observation.release", "observation.stream_stop", "workspace.context_close",
+     "download.forget", "download.expect"}
 )
 RETRY_DELAYS = {"read": (0.25, 0.75), "idempotent": (0.25,), "mutating": ()}
 
@@ -134,6 +147,9 @@ ACTION_KINDS = frozenset(
         "pointer.scroll",
         "wait",
         "finish",
+        # F-09: accessibility-only browser actions (mutating, never resent).
+        "browser.select_tab",
+        "browser.save_dialog",
     }
 )
 
@@ -167,6 +183,15 @@ ERROR_CODES = frozenset(
         "STREAM_RECOVERY_BACKOFF",
         "OPERATION_ID_CONFLICT",
         "OPERATION_IN_PROGRESS",
+        # F-09 browser and downloads.
+        "CONTEXT_UNOBSERVED",
+        "TAB_UNKNOWN",
+        "SAVE_DIALOG_NOT_FOUND",
+        "DOWNLOADS_NOT_ENABLED",
+        "DOWNLOAD_ROOT_NOT_ALLOWED",
+        "DOWNLOAD_ROOT_UNAVAILABLE",
+        "DOWNLOAD_UNKNOWN",
+        "DOWNLOAD_LIMIT",
         # Adapter-side: the answer to a mutating action was lost and nobody
         # can say whether it ran. Never resent automatically.
         "OUTCOME_UNKNOWN",
@@ -184,6 +209,12 @@ def retry_class(operation: str, kind: Optional[str] = None) -> str:
     if operation in IDEMPOTENT_OPERATIONS:
         return "idempotent"
     return "mutating"
+
+
+def _with_context(arguments: Dict[str, Any], context_id: Optional[str]) -> Dict[str, Any]:
+    if context_id:
+        arguments["context_id"] = context_id
+    return arguments
 
 
 def new_operation_id() -> str:
@@ -657,6 +688,55 @@ class BridgeClient:
 
     def stream_recover(self, stream_id: str) -> Any:
         return self.request("observation.stream_recover", {"stream_id": stream_id})
+
+    # ── F-09: browser and downloads ───────────────────────────────────
+
+    def browser_state(self, context_id: Optional[str] = None) -> Any:
+        """Windows, tabs (stable ids), page state and the transition since the
+        context last looked. Read-only."""
+
+        return self.request("browser.state", _with_context({}, context_id))
+
+    def browser_wait(self, context_id: Optional[str] = None, *, until: str = "settled",
+                     timeout: float = 15.0) -> Any:
+        """Wait (helper-side, bounded) until the page is ``settled``,
+        ``loaded`` or ``changed``. Read-only; never holds the helper."""
+
+        timeout = max(0.5, min(float(timeout), WAIT_MAX_SECONDS))
+        return self.request("browser.wait", _with_context({"until": until, "timeout": timeout}, context_id),
+                            timeout=timeout + 10.0)
+
+    def download_expect(self, context_id: Optional[str] = None, *, directory: Optional[str] = None,
+                        name_hint: Optional[str] = None, op_id: Optional[str] = None) -> Any:
+        """Declare a download BEFORE triggering it. Returns its ``download_id``.
+
+        Always carries an op_id: a resend after a lost answer returns the same
+        expectation instead of declaring a second one."""
+
+        arguments: Dict[str, Any] = {"op_id": op_id or new_operation_id()}
+        if directory:
+            arguments["directory"] = directory
+        if name_hint:
+            arguments["name_hint"] = name_hint
+        return self.request("download.expect", _with_context(arguments, context_id))
+
+    def download_status(self, download_id: str, *, checksum: bool = False) -> Any:
+        arguments: Dict[str, Any] = {"download_id": download_id}
+        if checksum:
+            # The only request that reads a downloaded file's bytes.
+            arguments["checksum"] = True
+        return self.request("download.status", arguments)
+
+    def download_wait(self, download_id: str, *, until: str = "terminal", timeout: float = 60.0) -> Any:
+        timeout = max(0.5, min(float(timeout), WAIT_MAX_SECONDS))
+        return self.request("download.wait", {"download_id": download_id, "until": until, "timeout": timeout},
+                            timeout=timeout + 10.0)
+
+    def download_list(self) -> Any:
+        return self.request("download.list")
+
+    def download_forget(self, download_id: str) -> Any:
+        return self.request("download.forget", {"download_id": download_id})
 
     def action_outcome(self, op_id: str) -> Any:
         return self.request("action.outcome", {"op_id": op_id})

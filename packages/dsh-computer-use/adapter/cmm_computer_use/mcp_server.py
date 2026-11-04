@@ -37,6 +37,7 @@ import json
 import sys
 from typing import Any, Dict, List, Optional, TextIO
 
+from .browser import FAILURE_MEANINGS, classify_failure, download_by_pressing, needs_reobservation
 from .client import (
     ACTION_KINDS,
     POLICIES,
@@ -73,6 +74,12 @@ READ_ONLY_TOOLS = frozenset(
         # no application and the helper re-checks the grant on every use).
         "computer_use_workspace_status",
         "computer_use_context_open",
+        # F-09: read the browser, wait for it, and declare/read downloads
+        # (bookkeeping in the helper; no application is touched).
+        "computer_use_browser_state",
+        "computer_use_browser_wait",
+        "computer_use_download_expect",
+        "computer_use_download_status",
     }
 )
 
@@ -117,7 +124,17 @@ AUTO_INVOCATION_POLICY = (
     "every element action, and close it when done; element ids and snapshots "
     "belong to the context that produced them. Without `context` the tools "
     "behave exactly as in 0.3.2 (one default context). A mutating action is "
-    "never resent automatically: on OUTCOME_UNKNOWN observe again instead."
+    "never resent automatically: on OUTCOME_UNKNOWN observe again instead. "
+    "Web browsers are applications too: use these tools without being asked "
+    "whenever a task needs a web page, a tab or a file from a site. Read tabs "
+    "with computer_use_browser_state, switch with computer_use_browser_select_tab, "
+    "wait for a page with computer_use_browser_wait. A tab switch or a "
+    "navigation is NOT a disconnection: observe again and continue. To download "
+    "a file use computer_use_download (or computer_use_download_expect before "
+    "any other trigger, then computer_use_download_status); never say a file "
+    "was downloaded unless the helper verified it (state=complete, with its "
+    "path). Save dialogs are handled with computer_use_save_dialog; overwriting "
+    "an existing file needs explicit overwrite=true."
 )
 NO_BYPASS_LINE = (
     "Do not work around this with Bash, osascript/JXA/AppleScript, System Events, "
@@ -341,6 +358,111 @@ class ToolRegistry:
                 ),
             },
             {
+                "name": "computer_use_browser_state",
+                "description": (
+                    "Read a browser's windows and tabs (stable tab ids that survive "
+                    "reordering and title changes), the page each window shows "
+                    "(redacted URL: no query or fragment), its loading state, open "
+                    "dialogs, and what changed since this context last looked: "
+                    "tab_switched, navigated, reloaded, tab_closed, window_closed or "
+                    "app_closed. A tab switch or navigation keeps the connection. "
+                    "Observe the browser in the context first. Read-only."
+                ),
+                "inputSchema": _schema({"context": CONTEXT_PROPERTY}),
+            },
+            {
+                "name": "computer_use_browser_wait",
+                "description": (
+                    "Wait until the page in the context's browser window is settled "
+                    "(default), loaded, or changed (navigation, tab switch, reload). "
+                    "Reports redirects passed through. Bounded (≤ 120 s). Read-only."
+                ),
+                "inputSchema": _schema({
+                    "context": CONTEXT_PROPERTY,
+                    "until": {"type": "string", "enum": ["settled", "loaded", "changed"], "default": "settled"},
+                    "timeout": {"type": "number", "minimum": 0.5, "maximum": 120, "default": 15},
+                }),
+            },
+            {
+                "name": "computer_use_browser_select_tab",
+                "description": (
+                    "Select one tab (tab_id from computer_use_browser_state) with the "
+                    "browser's own accessibility action — no keystroke, no click, no "
+                    "activation. Verified on the tab strip. Element ids of the previous "
+                    "tab stop being valid; a fresh observation is returned."
+                ),
+                "inputSchema": _schema({
+                    "context": CONTEXT_PROPERTY,
+                    "tab_id": {"type": "string", "pattern": "^tab_[0-9a-f]{32}$"},
+                }, required=["tab_id"]),
+            },
+            {
+                "name": "computer_use_download",
+                "description": (
+                    "Download a file by pressing ONE observed link or button, then "
+                    "VERIFY it: the helper watches a directory the policy allows and "
+                    "reports complete only when the finished file exists, is non-empty "
+                    "and stable. Returns the file name, path and size, or what blocked "
+                    "it (save dialog, PDF viewer, interruption). A press whose answer "
+                    "was lost is never repeated."
+                ),
+                "inputSchema": _schema({
+                    "context": CONTEXT_PROPERTY,
+                    "element_id": {"type": "integer", "minimum": 1},
+                    "snapshot": {"type": "integer", "minimum": 1},
+                    "name_hint": {"type": "string", "maxLength": 255,
+                                  "description": "Expected file name, if known (helps with simultaneous downloads)."},
+                    "directory": {"type": "string", "maxLength": 1024,
+                                  "description": "A download directory the policy allows (default: its first)."},
+                    "timeout": {"type": "number", "minimum": 1, "maximum": 120, "default": 120},
+                }, required=["element_id", "snapshot"]),
+            },
+            {
+                "name": "computer_use_download_expect",
+                "description": (
+                    "Declare a download BEFORE triggering it some other way (a save "
+                    "dialog, a viewer's button). Returns a download_id for "
+                    "computer_use_download_status. Touches no application."
+                ),
+                "inputSchema": _schema({
+                    "context": CONTEXT_PROPERTY,
+                    "name_hint": {"type": "string", "maxLength": 255},
+                    "directory": {"type": "string", "maxLength": 1024},
+                }),
+            },
+            {
+                "name": "computer_use_download_status",
+                "description": (
+                    "Status of a declared download: not_started, in_progress, "
+                    "interrupted (resumable), failed or complete (verified, with path "
+                    "and size). wait=true waits (≤ 120 s) for the end. checksum=true "
+                    "also returns the file's SHA-256 (reads the file; only when asked)."
+                ),
+                "inputSchema": _schema({
+                    "download_id": {"type": "string", "pattern": "^dl_[0-9a-f]{32}$"},
+                    "wait": {"type": "boolean", "default": False},
+                    "timeout": {"type": "number", "minimum": 0.5, "maximum": 120, "default": 60},
+                    "checksum": {"type": "boolean", "default": False},
+                }, required=["download_id"]),
+            },
+            {
+                "name": "computer_use_save_dialog",
+                "description": (
+                    "Handle a browser's save/destination sheet with accessibility "
+                    "actions: set the file name, confirm, or cancel. If a file with "
+                    "that name exists the helper stops and reports name_conflict; "
+                    "overwrite=true is required to replace it. The destination "
+                    "folder is the one the dialog shows."
+                ),
+                "inputSchema": _schema({
+                    "context": CONTEXT_PROPERTY,
+                    "filename": {"type": "string", "maxLength": 255},
+                    "confirm": {"type": "boolean", "default": True},
+                    "overwrite": {"type": "boolean", "default": False},
+                    "cancel": {"type": "boolean", "default": False},
+                }),
+            },
+            {
                 "name": "computer_use_context_close",
                 "description": (
                     "Close a context: its element handles are dropped and its live "
@@ -484,6 +606,41 @@ class ToolRegistry:
                 if not context:
                     raise ValueError("context is required")
                 return _text(_render_context_closed(self.client.context_close(context)))
+            if name == "computer_use_browser_state":
+                return _text(_render_browser_state(self.client.browser_state(_context(arguments))))
+            if name == "computer_use_browser_wait":
+                result = self.client.browser_wait(
+                    _context(arguments), until=str(arguments.get("until") or "settled"),
+                    timeout=float(arguments.get("timeout", 15)))
+                return _text(_render_browser_wait(result))
+            if name == "computer_use_browser_select_tab":
+                return self._select_tab(arguments)
+            if name == "computer_use_download":
+                return self._download(arguments)
+            if name == "computer_use_download_expect":
+                result = self.client.download_expect(
+                    _context(arguments), directory=_opt_text(arguments, "directory"),
+                    name_hint=_opt_text(arguments, "name_hint"))
+                return _text(_render_download(result, declared=True))
+            if name == "computer_use_download_status":
+                download_id = str(arguments.get("download_id") or "")
+                if arguments.get("wait"):
+                    result = self.client.download_wait(download_id, timeout=float(arguments.get("timeout", 60)))
+                    if arguments.get("checksum") and result.get("state") == "complete":
+                        result = self.client.download_status(download_id, checksum=True)
+                else:
+                    result = self.client.download_status(download_id, checksum=bool(arguments.get("checksum")))
+                return _text(_render_download(result))
+            if name == "computer_use_save_dialog":
+                params: Dict[str, Any] = {
+                    "confirm": bool(arguments.get("confirm", True)),
+                    "overwrite": bool(arguments.get("overwrite", False)),
+                    "cancel": bool(arguments.get("cancel", False)),
+                }
+                filename = _opt_text(arguments, "filename")
+                if filename:
+                    params["filename"] = filename
+                return self._action("browser.save_dialog", params, _context(arguments))
             if name == "computer_use_press":
                 return self._element_action(
                     "ui.press",
@@ -626,7 +783,53 @@ class ToolRegistry:
 
     def _element_action(self, kind: str, params: Dict[str, Any],
                         context: Optional[str] = None) -> Dict[str, Any]:
-        return self._action(kind, params, context)
+        """An element action; when it is refused because the page or tab
+        changed (or its answer was lost), a FRESH observation is appended —
+        reads only, the action itself is never repeated."""
+
+        try:
+            return self._action(kind, params, context)
+        except BridgeError as error:
+            failure = classify_failure(error)
+            refused = _render_refusal(error)
+            if not needs_reobservation(failure):
+                return refused
+            try:
+                fresh = self.client.observe(**({"context_id": context} if context else {}))
+            except BridgeError:
+                return refused
+            refused["content"][0]["text"] += (
+                "\nRECOVERED (%s): %s. The action was NOT repeated. Fresh observation:\n%s"
+                % (failure, FAILURE_MEANINGS[failure], _render_observation(fresh)))
+            return refused
+
+    def _select_tab(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        context = _context(arguments)
+        tab_id = str(arguments.get("tab_id") or "")
+        result = self.client.act("browser.select_tab", **({"context_id": context} if context else {}),
+                                 tab_id=tab_id)
+        text, is_error = _render_action("browser.select_tab", result)
+        if not is_error:
+            try:
+                self.client.browser_wait(context, until="settled", timeout=10)
+                fresh = self.client.observe(**({"context_id": context} if context else {}))
+                text += "\nThe tab is selected; the connection is intact. Fresh observation:\n" \
+                    + _render_observation(fresh)
+            except BridgeError as error:
+                text += "\n(observe again: %s)" % error.code
+        return _text(text, is_error=is_error)
+
+    def _download(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        outcome = download_by_pressing(
+            self.client, element_id=_int(arguments, "element_id"), snapshot=_int(arguments, "snapshot"),
+            context_id=_context(arguments), name_hint=_opt_text(arguments, "name_hint"),
+            directory=_opt_text(arguments, "directory"),
+            finish_timeout=float(arguments.get("timeout", 120)))
+        lines = ["press: %s" % (outcome["press"].get("outcome"),)]
+        if outcome.get("download"):
+            lines.append(_render_download(outcome["download"]))
+        lines.append(("VERIFIED " if outcome["verified"] else "NOT VERIFIED: ") + outcome["next"])
+        return _text("\n".join(lines), is_error=not outcome["verified"])
 
     def _action(self, kind: str, params: Dict[str, Any],
                 context: Optional[str] = None) -> Dict[str, Any]:
@@ -651,6 +854,15 @@ def _context(arguments: Dict[str, Any]) -> Optional[str]:
     if not isinstance(value, str) or not value.startswith("ctx_") or len(value) != 36 \
             or not all(c in "0123456789abcdef" for c in value[4:]):
         raise ValueError("context must be a context id from computer_use_context_open")
+    return value
+
+
+def _opt_text(arguments: Dict[str, Any], key: str) -> Optional[str]:
+    value = arguments.get(key)
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError("%s must be text" % key)
     return value
 
 
@@ -1081,6 +1293,10 @@ def _render_action(kind: str, result: Any) -> "tuple":
     lines.extend(_render_execution(result.get("execution")))
     lines.extend(_render_scroll(result.get("scroll")))
     lines.extend(_render_set_value(result.get("set_value")))
+    if kind == "browser.save_dialog":
+        lines.append("dialog=%s filename_set=%s confirmed=%s replaced=%s closed=%s" % (
+            result.get("dialog"), result.get("filename_set"), result.get("confirmed"),
+            result.get("replaced"), result.get("closed")))
     interference = result.get("interference")
     lines.extend(_render_interference(interference))
     if isinstance(interference, dict) and interference.get("breach"):
@@ -1260,6 +1476,75 @@ def _render_interference(interference: Any) -> List[str]:
     return lines
 
 
+def _render_browser_state(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "browser: no state"
+    browser = result.get("browser") or {}
+    lines = ["browser: %s [%s] family=%s profile=%s context=%s" % (
+        browser.get("app", "?"), browser.get("bundle", "?"), browser.get("family", "?"),
+        browser.get("profile", "?"), result.get("context_label", "?"))]
+    transition = result.get("transition")
+    if isinstance(transition, dict):
+        lines.append("since last look: %s — %s" % (transition.get("kind"), transition.get("meaning")))
+    for window in result.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        if not window.get("authorized"):
+            lines.append("- window %s: not authorized by the policy" % window.get("window_key"))
+            continue
+        page = window.get("page") or {}
+        flags = [f for f, on in (("focused", window.get("focused")), ("followed", window.get("followed_by_context")),
+                                  ("dialog_open", window.get("dialog_open")), ("pdf", page.get("pdf"))) if on]
+        lines.append("- window %s id=%s %s load=%s url=%s %s" % (
+            window.get("window_key"), window.get("window_id"), json.dumps(window.get("title", ""))[:120],
+            page.get("load"), page.get("url"), " ".join(flags)))
+        for tab in window.get("tabs") or []:
+            lines.append("    %s tab %s %s" % ("*" if tab.get("selected") else " ", tab.get("tab_id"),
+                                              json.dumps(tab.get("title", ""))[:100]))
+        if not window.get("tabs_exposed"):
+            lines.append("    (no tab strip exposed: one tab)")
+        for key in ("opened_tabs", "closed_tabs"):
+            if window.get(key):
+                lines.append("    %s: %s" % (key, ", ".join(window[key])))
+    for key in ("opened_windows", "closed_windows"):
+        if result.get(key):
+            lines.append("%s: %s" % (key, ", ".join(result[key])))
+    return "\n".join(lines)
+
+
+def _render_browser_wait(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "wait: no result"
+    transition = result.get("transition") or {}
+    return "page: %s (%s); load=%s settled=%s redirects=%s url=%s waited=%sms%s" % (
+        transition.get("kind"), transition.get("meaning"), result.get("load"), result.get("settled"),
+        result.get("intermediate_documents"), result.get("url"), result.get("waited_ms"),
+        " TIMED OUT" if result.get("timed_out") else "")
+
+
+def _render_download(result: Any, declared: bool = False) -> str:
+    if not isinstance(result, dict):
+        return "download: no status"
+    head = "download %s: %s" % (result.get("download_id"), result.get("state"))
+    if declared:
+        head += " (declared; trigger the download now, then read its status)"
+    parts = [head]
+    if result.get("state") == "complete":
+        parts.append("file: %s (%s bytes)" % (result.get("path"), result.get("bytes")))
+    elif result.get("file_name"):
+        parts.append("file: %s (%s bytes so far)" % (result.get("file_name"), result.get("bytes")))
+    for flag in ("renamed", "replaced_existing", "resumable", "resumed", "timed_out"):
+        if result.get(flag):
+            parts.append(flag)
+    if result.get("reason"):
+        parts.append("reason=%s" % result["reason"])
+    if result.get("sha256"):
+        parts.append("sha256=%s" % result["sha256"])
+    if result.get("state") == "interrupted":
+        parts.append("the browser may offer Resume; press it, then wait again")
+    return "; ".join(parts)
+
+
 def _render_refusal(error: BridgeError) -> Dict[str, Any]:
     """A typed refusal, plus the ledger the helper attached to the failure.
 
@@ -1277,6 +1562,9 @@ def _render_refusal(error: BridgeError) -> Dict[str, Any]:
         )
     ]
     lines.extend(_render_execution(getattr(error, "execution", None)))
+    failure = classify_failure(error)
+    if failure not in ("other", "refused"):
+        lines.append("meaning: %s — %s" % (failure, FAILURE_MEANINGS[failure]))
     if error.code == "OUTCOME_UNKNOWN":
         lines.append(
             "STOP: outcome unknown (%s). Do not resend this action; observe the context again "
