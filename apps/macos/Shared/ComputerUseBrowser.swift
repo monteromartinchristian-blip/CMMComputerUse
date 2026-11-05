@@ -633,3 +633,50 @@ public func bridgeResolveWindow(
     pause()
     return (resolve(), first, 2)
 }
+
+// MARK: - A context's bound window (audit X-10)
+
+public enum BridgeBoundWindowOutcome: Equatable, Sendable {
+    /// The bound window was found (or nothing was bound): observe it.
+    case bound
+    /// The bound window is gone and the application has exactly one window:
+    /// two contexts cannot swap, so that window is used and the change is said.
+    case replacedBySingleWindow
+    /// The bound window is gone and the application has several windows (or
+    /// none): choosing one would make this context observe another context's
+    /// window. Refused.
+    case refuse
+}
+
+/// What an observation does when the window its context was bound to cannot be
+/// found. Never "whatever has focus": that let two contexts on two windows of
+/// one browser swap, silently.
+public func bridgeBoundWindowOutcome(boundRequested: Bool, found: Bool, openWindows: Int) -> BridgeBoundWindowOutcome {
+    guard boundRequested, !found else { return .bound }
+    return openWindows == 1 ? .replacedBySingleWindow : .refuse
+}
+
+// MARK: - Which process of a bundle (audit M-13)
+
+public struct BridgeProcessCandidate: Equatable, Sendable {
+    public let pid: Int32
+    public let bundleID: String
+
+    public init(pid: Int32, bundleID: String) {
+        self.pid = pid
+        self.bundleID = bundleID
+    }
+}
+
+/// Several processes can share one bundle id (the person's Chrome and a test
+/// Chrome). A name lookup returns the first of them; a context bound to
+/// another one must keep THAT process. Returns the process to observe, or
+/// `nil` when the bound process is gone or belongs to another application: the
+/// caller refuses, and the context never moves to somebody else's process.
+public func bridgePreferBoundProcess(
+    resolved: BridgeProcessCandidate, bound: BridgeProcessCandidate?, alive: [BridgeProcessCandidate]
+) -> BridgeProcessCandidate? {
+    guard let bound, bound.pid != resolved.pid else { return resolved }
+    guard bound.bundleID == resolved.bundleID, alive.contains(bound) else { return nil }
+    return bound
+}

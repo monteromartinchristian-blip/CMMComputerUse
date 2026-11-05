@@ -228,6 +228,26 @@ All of these are available in `background` mode. The server instructions tell th
 - to treat a tab switch or navigation as normal;
 - never to claim a file was downloaded without `state=complete` and its path.
 
+## 6b. Time budget and helper negotiation
+
+- **Budget.** DSH cuts a tool call at 70 s. Every tool plans inside 55 s. One
+  `browser.wait` / `download.wait` is capped at 45 s (the tool schemas say so);
+  a longer wait is asked again, and the answer says how far it got
+  (`timed_out`). A wait is never resent after a lost answer.
+- **`computer_use_download` as a whole** plans from the time that has really
+  passed. A download still running at the end of the budget is reported as in
+  progress (not complete, not verified) with its id.
+- **After the press, nothing hides it.** If a later step fails, the answer says
+  the press already ran (outcome), keeps the expectation and says not to press
+  again.
+- **Helper capabilities.** The adapter reads `bridge.ping`. A tool whose
+  capability the helper lacks answers `HELPER_TOO_OLD` (it names what still
+  works and what to tell the person), and an explicit `context` is never sent to
+  a helper that would ignore it.
+- **A window grant follows the title.** If the active tab's title leaves the
+  grant, the window stops being observable and any stream on it stops
+  (`stream_authorization_revoked`); the context cannot switch back by itself.
+
 ## 7. Errors (additions)
 
 | Code | Meaning |

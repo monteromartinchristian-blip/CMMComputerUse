@@ -1,6 +1,6 @@
 {
   "name": "@cmm/dsh-computer-use",
-  "version": "0.1.0",
+  "version": "0.3.3",
   "description": "Background computer use for DeepSeek Harness: observe and operate authorized macOS applications while the user keeps focus and the cursor.",
   "license": "MIT",
   "author": "CMM",

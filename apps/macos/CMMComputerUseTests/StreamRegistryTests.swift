@@ -263,4 +263,54 @@ final class StreamRegistryTests: XCTestCase {
         XCTAssertFalse(bridgeValidStreamKey(String(repeating: "x", count: 81)))
         XCTAssertFalse(bridgeValidStreamKey("a/b"))
     }
+
+    // MARK: a stream is judged again on the window's CURRENT title (audit X-05)
+
+    private func windowGrantPolicy() -> BridgeAuthorizationPolicy {
+        let text = #"{"version":1,"mode":"background","apps":[{"bundle_id":"com.apple.Safari","scopes":["observe"],"windows":["CMM"]}]}"#
+        return BridgeAuthorizationPolicy.parse(Data(text.utf8), source: "t")!
+    }
+
+    private let docs = BridgeStreamIdentity(bundleID: "com.apple.Safari", pid: 7, windowID: 90,
+                                            windowTitle: "CMM – Docs", appName: "Safari")
+
+    /// The stream was granted while the window was titled "CMM – Docs". After a
+    /// tab switch the window is titled like the person's bank: its frames must
+    /// stop, however the grant was satisfied at the start.
+    func testAStreamWhoseWindowChangedToAnUncoveredTitleIsRevoked() {
+        let verdict = bridgeStreamRecheck(policy: windowGrantPolicy(), client: nil, identity: docs, currentTitle: "Banco – Cuentas")
+        XCTAssertNotNil(verdict.refusal)
+        XCTAssertEqual(verdict.refusal?.code, "APPROVAL_REJECTED")
+        XCTAssertTrue(verdict.refusal?.detail.contains("window_not_granted") ?? false)
+    }
+
+    func testACoveredNewTitleKeepsTheStreamAndMakesItsIdentityHonest() {
+        let verdict = bridgeStreamRecheck(policy: windowGrantPolicy(), client: nil, identity: docs, currentTitle: "CMM – Otra pestaña")
+        XCTAssertNil(verdict.refusal)
+        XCTAssertEqual(verdict.identity.windowTitle, "CMM – Otra pestaña", "view_identity no longer reports a stale title")
+        XCTAssertEqual(verdict.identity.windowID, 90)
+        XCTAssertEqual(verdict.identity.bundleID, "com.apple.Safari")
+    }
+
+    func testAnUnreadableTitleDoesNotInventAVerdict() {
+        let verdict = bridgeStreamRecheck(policy: windowGrantPolicy(), client: nil, identity: docs, currentTitle: nil)
+        XCTAssertNil(verdict.refusal, "the window is gone or unreadable: the stream's own health reports that")
+        XCTAssertEqual(verdict.identity, docs)
+    }
+
+    func testAnEmptyTitleUnderAWindowGrantIsNotCovered() {
+        XCTAssertNotNil(bridgeStreamRecheck(policy: windowGrantPolicy(), client: nil, identity: docs, currentTitle: "").refusal)
+    }
+
+    func testAGrantWithoutWindowPatternsCoversAnyTitle() {
+        let text = #"{"version":1,"mode":"background","apps":[{"bundle_id":"com.apple.Safari","scopes":["observe"]}]}"#
+        let open = BridgeAuthorizationPolicy.parse(Data(text.utf8), source: "t")!
+        XCTAssertNil(bridgeStreamRecheck(policy: open, client: nil, identity: docs, currentTitle: "Banco – Cuentas").refusal)
+    }
+
+    func testTheRecheckIsRateLimitedPerStream() {
+        XCTAssertTrue(bridgeStreamRecheckDue(lastCheckedAt: nil, now: 100))
+        XCTAssertFalse(bridgeStreamRecheckDue(lastCheckedAt: 100, now: 100.2))
+        XCTAssertTrue(bridgeStreamRecheckDue(lastCheckedAt: 100, now: 100.6))
+    }
 }

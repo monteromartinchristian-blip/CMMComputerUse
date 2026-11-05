@@ -63,6 +63,74 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
   inode that was verified), reads exactly its size, and refuses files over
   2 GiB. A link (including one to `/dev/zero`), a FIFO or a device is refused
   without blocking. Digests are reused while the exact file is unchanged.
+### Fixed — integral pre-integration audit (c877447), 2026-11-05
+
+- **X-04 (regression of 0.3.3).** A snapshot number now names exactly ONE
+  context: generations come from a single workspace-wide counter. With
+  per-context numbering, an action citing the wrong context (or none) could
+  resolve "snapshot 1, element 7" of another application. `release` and
+  `USER_TAKEOVER` report the generation the context really holds.
+- **X-03.** The interference sampler no longer lowers the accessibility
+  messaging timeout of the whole process to 100 ms (it truncated trees and
+  titles and made a press that ran look failed). There is ONE explicit timeout,
+  2 s, set at start; the sampler's bound lives in a `BridgeBoundedReader`.
+- **X-05.** A stream is judged again on the window's CURRENT title (at most
+  twice a second) before any frame is served and on `policy.reload`. A window
+  whose title leaves the grant stops streaming (`stream_authorization_revoked`);
+  `view_identity.window` is kept current.
+- **X-06.** `observation.capture_screen` and `observation.stream_start` select
+  a window only among the windows the caller may observe: no `window_ambiguous`
+  list with other applications' titles, an unauthorized window answers like a
+  missing one, and a caller with no identity under a client-required policy
+  never reaches selection. Policy and caller are captured by value before the
+  asynchronous task.
+- **X-10.** A context whose bound window is gone is refused when the
+  application has several windows (it used to follow the focused window, so two
+  contexts could swap); with a single window it is used and named
+  (`window_follow: bound_window_replaced`).
+- **X-07 / C-09.** Tool calls plan inside a 55 s budget (DSH cuts at 70 s):
+  `browser.wait` / `download.wait` are capped at 45 s (the schema says so),
+  never resent after a lost answer, and `computer_use_download` plans its whole
+  flow from the time that has really passed.
+- **X-08.** After the press ran, no later failure hides it: the answer says the
+  press happened, keeps the expectation and forbids pressing again.
+- **X-09.** `bridge.ping` reports `helper_version`, `helper_build` and
+  `capabilities.scroll_reveal`. The adapter reads the helper's capabilities and
+  refuses with `HELPER_TOO_OLD` (what still works, what to tell the person)
+  what the helper cannot do; an explicit `context` is never sent to a helper
+  that would ignore it. `computer_use_status` shows adapter and helper versions
+  and features. The adapter and package version is `0.3.3`.
+- **X-11.** The automatic re-observation after a page change and the one after
+  `select_tab` observe the application that was being worked on; without a
+  known one nothing is observed (the model is told to observe naming the app).
+- **X-01 (streamer, web vector).** No wildcard CORS: only `dsh-app:` origins
+  are granted; `Host` must be loopback with the streamer's port (DNS rebinding)
+  and any other `Origin` is refused before the helper is reached. A closed
+  panel never leaves its slot taken (the default panel plus A used to leave B at
+  429 for ever), a replaced viewer leaving no longer stops the replacement's
+  stream, `/frame.png` captures are coalesced per window, and a port that cannot
+  be bound is a one-line `ERROR` instead of an unhandled exception. **Not
+  closed:** the token in the URL is fixed (an `<img>` cannot send headers and
+  the Host has no verified channel to the renderer), so a local process can
+  still request frames of authorized windows.
+- **M-01.** Several clients with open expectations in one folder: a file nobody
+  named is nobody's (only a `name_hint` attributes it).
+- **M-02.** A completed download whose file is replaced by another file is
+  `failed` (`file_replaced`), never completed again.
+- **M-03.** Reading a download (`status`, `wait`, `list`) keeps the context that
+  declared it alive.
+- **M-05.** A grant that declares a `bundle_id` is satisfied, for a running
+  application, by that bundle id only (an impostor with the same visible name no
+  longer finds the grant). A policy that relied on the name with a wrong
+  `bundle_id` stops matching.
+- **M-13.** An explicit context keeps the process it was bound to when several
+  share a bundle id; a bound process that is gone is refused.
+- **M-14.** `computer_use_observe` accepts `window_id`.
+- **M-18.** A malformed argument or an unexpected exception inside a tool is an
+  error answer (`-32602` / `-32603`), never the end of the server.
+
+### Added — D5
+
 - Acceptance finding D5: `ui.scroll` scrolls Firefox in the background. Its
   document area offers neither a page action nor an accessible scroll bar, so
   it used to be refused (`scroll_area_without_scrollbar`). A new last-resort

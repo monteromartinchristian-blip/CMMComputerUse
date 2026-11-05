@@ -49,7 +49,7 @@ adds a dependency, it ships a lockfile and pinned ranges in the same release.
 ```bash
 # tarball integrity
 npm pack --dry-run
-shasum -a 256 cmm-dsh-computer-use-0.1.0.tgz
+shasum -a 256 cmm-dsh-computer-use-0.3.3.tgz
 
 # the published files are the ones in the manifest
 node packages/dsh-computer-use/scripts/verify-manifest.mjs

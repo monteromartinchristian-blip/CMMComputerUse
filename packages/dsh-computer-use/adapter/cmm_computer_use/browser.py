@@ -17,9 +17,10 @@ integration. The MCP adapter and the reference harness both use it.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, Optional
 
-from .client import BridgeClient, BridgeError, BridgeOutcomeUnknown, BridgeUnavailable
+from .client import HOST_BUDGET_SECONDS, BridgeClient, BridgeError, BridgeOutcomeUnknown, BridgeUnavailable
 
 __all__ = [
     "FAILURE_MEANINGS",
@@ -108,6 +109,7 @@ def download_by_pressing(
     finish_timeout: float = 120.0,
     expected_bytes: Optional[int] = None,
     expected_sha256: Optional[str] = None,
+    budget: float = HOST_BUDGET_SECONDS,
 ) -> Dict[str, Any]:
     """Press a download control once and verify the finished file.
 
@@ -115,8 +117,16 @@ def download_by_pressing(
     ``verified`` is True only when the helper reports ``complete`` (file
     present, non-empty, stable, partial gone). ``next`` says what to do when
     it is not: look for a save dialog, a viewer, or report.
+
+    The whole flow plans inside ``budget`` seconds (the host cuts a tool call
+    at 70 s): a download that is still running when the budget ends is reported
+    as in progress, never as verified, and is asked again with its id. Once the
+    press ran, NO later failure hides that fact: the result always says the
+    press happened and must not be repeated (audit X-07 / X-08).
     """
 
+    started_at = time.monotonic()
+    remaining = lambda: max(0.0, budget - (time.monotonic() - started_at))  # noqa: E731
     expectation = client.download_expect(context_id, directory=directory, name_hint=name_hint,
                                          expected_bytes=expected_bytes, expected_sha256=expected_sha256)
     download_id = expectation["download_id"]
@@ -136,7 +146,21 @@ def download_by_pressing(
             client.download_forget(download_id)
             return {"press": press, "download": None, "verified": False,
                     "next": "the press was refused before anything happened: %s" % refused.code}
-    started = client.download_wait(download_id, until="started", timeout=start_timeout)
+    try:
+        return _after_the_press(client, download_id, press, context_id, start_timeout, finish_timeout, remaining)
+    except (BridgeError, BridgeUnavailable) as failure:
+        # The press ran (or may have): the answer must say so, keep the
+        # expectation (it is how to verify later) and forbid pressing again.
+        return {"press": press, "download": None, "verified": False,
+                "next": "the press already ran (outcome %s): do not press again. The download could "
+                        "not be read (%s). Ask computer_use_download_status with download_id=%s"
+                        % (press.get("outcome"), getattr(failure, "code", type(failure).__name__), download_id),
+                "download_id": download_id}
+
+
+def _after_the_press(client, download_id, press, context_id, start_timeout, finish_timeout, remaining):
+    started = client.download_wait(download_id, until="started",
+                                   timeout=max(0.5, min(start_timeout, remaining() - 5.0)))
     if started.get("state") == "not_started":
         state = None
         try:
@@ -159,7 +183,8 @@ def download_by_pressing(
                     "(do not press again blindly)" % (started.get("directory"), press["outcome"]))
         return {"press": press, "download": started, "verified": False, "next": hint,
                 "browser": state}
-    final = client.download_wait(download_id, until="terminal", timeout=finish_timeout)
+    wait = max(0.5, min(finish_timeout, remaining() - 2.0))
+    final = client.download_wait(download_id, until="terminal", timeout=wait)
     verified = final.get("state") == "complete"
     if verified:
         hint = "verified: %s (%s bytes)" % (final.get("path"), final.get("bytes"))
@@ -169,7 +194,8 @@ def download_by_pressing(
     elif final.get("state") == "failed":
         hint = "the download failed (%s)" % final.get("reason")
     else:
-        hint = "still in progress after %ss; wait on download %s again" % (finish_timeout, download_id)
+        hint = ("still in progress (not complete, not verified) after %ss; wait on download %s again"
+                % (int(wait), download_id))
     return {"press": press, "download": final, "verified": verified, "next": hint}
 
 

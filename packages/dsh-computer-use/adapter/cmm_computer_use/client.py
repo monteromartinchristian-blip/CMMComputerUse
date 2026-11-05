@@ -38,8 +38,9 @@ import socket
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, FrozenSet, Optional
 
 __all__ = [
     "BRIDGE_BUNDLE_ID",
@@ -103,8 +104,17 @@ OPERATION_TIMEOUTS = {
     "download.list": 10.0,
     "download.forget": 10.0,
 }
-#: Upper bound of a helper-side wait (``browser.wait`` / ``download.wait``).
-WAIT_MAX_SECONDS = 120.0
+#: DSH cuts a tool call at 70 s (``toolCallTimeoutMs``). A tool must answer
+#: BEFORE that, or the model sees a timeout, retries, and repeats an action
+#: that already ran (audit X-07). Every tool plans inside this budget.
+HOST_BUDGET_SECONDS = 55.0
+#: Upper bound of ONE helper-side wait (``browser.wait`` / ``download.wait``):
+#: plus the 10 s socket margin it stays under the host's cut. A longer wait is
+#: simply asked again; the answer says how far it got (``timed_out``).
+WAIT_MAX_SECONDS = 45.0
+#: Waits are never resent after a transport failure: a resend would restart a
+#: full wait and multiply the time (audit C-09). The caller reads the state.
+UNRETRIED_OPERATIONS = frozenset({"browser.wait", "download.wait"})
 
 #: Operations that never change anything outside the helper's own read path:
 #: retried after a transport failure with bounded backoff. Mirrors
@@ -285,6 +295,31 @@ class BridgeError(Exception):
         return payload
 
 
+def _short(value: Any) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    return text if text and len(text) <= 40 and text.isprintable() else "unknown"
+
+
+@dataclass(frozen=True)
+class HelperInfo:
+    """What the helper says about itself in ``bridge.ping`` (audit X-09)."""
+
+    version: str
+    build: str
+    features: FrozenSet[str]
+    instance_id: Optional[str]
+
+    def has(self, feature: str) -> bool:
+        return feature in self.features
+
+
+#: The ``capabilities`` a feature is read from. A 0.3.2 helper has none of
+#: these keys: its absence IS the evidence that the helper is too old.
+HELPER_FEATURES = ("workspace", "browser", "downloads", "scroll_reveal")
+#: How long a capability check is trusted before the helper is asked again.
+HELPER_INFO_MAX_AGE = 30.0
+
+
 class BridgeUnavailable(BridgeError):
     """The helper could not be reached, or did not identify itself as ours."""
 
@@ -353,6 +388,9 @@ class BridgeClient:
         self.instance_id: Optional[str] = None
         #: Injected for tests; the retry backoff sleeps through it.
         self._sleep = time.sleep
+        #: Injected for tests; the capability cache ages through it.
+        self._monotonic = time.monotonic
+        self._helper_info: Optional[tuple] = None
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
@@ -444,7 +482,7 @@ class BridgeClient:
         """
 
         kind = (arguments or {}).get("kind") if operation == "action.execute" else None
-        delays = RETRY_DELAYS[retry_class(operation, kind)]
+        delays = () if operation in UNRETRIED_OPERATIONS else RETRY_DELAYS[retry_class(operation, kind)]
         attempt = 0
         while True:
             try:
@@ -579,6 +617,31 @@ class BridgeClient:
             )
         return result
 
+    def helper_info(self, max_age: float = HELPER_INFO_MAX_AGE) -> HelperInfo:
+        """The helper's version, build and capabilities, from ``bridge.ping``.
+
+        Cached for ``max_age`` seconds and dropped as soon as the helper's
+        instance changes (a restart, possibly into another version). Raises
+        what :meth:`ping` raises: an unreachable helper is not "too old".
+        """
+
+        now = self._monotonic()
+        cached = getattr(self, "_helper_info", None)
+        if cached is not None:
+            at, info = cached
+            same_instance = not (info.instance_id and self.instance_id and info.instance_id != self.instance_id)
+            if same_instance and now - at < max_age:
+                return info
+        ping = self.ping()
+        capabilities = ping.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        info = HelperInfo(
+            version=_short(ping.get("helper_version")), build=_short(ping.get("helper_build")),
+            features=frozenset(name for name in HELPER_FEATURES if capabilities.get(name)),
+            instance_id=ping.get("instance_id") if isinstance(ping.get("instance_id"), str) else None)
+        self._helper_info = (now, info)
+        return info
+
     def status(self) -> Dict[str, Any]:
         """Permissions as the helper measured them (never inferred here)."""
 
@@ -589,7 +652,7 @@ class BridgeClient:
 
     def observe(self, app: Optional[str] = None, include_screenshot: bool = False,
                 include_ax_diagnostics: bool = False, element_filter: Optional[str] = None,
-                context_id: Optional[str] = None) -> Any:
+                context_id: Optional[str] = None, window_id: Optional[int] = None) -> Any:
         """Observe one application (or the frontmost one) without activating it.
 
         Reading another application's accessibility tree does not bring it
@@ -621,6 +684,10 @@ class BridgeClient:
             # 0.3.3: observe INTO one context. Its generation and handles move;
             # no other context's do. Absent, the 0.3.2 default context is used.
             arguments["context_id"] = context_id
+        if window_id is not None:
+            # One window of the application, by the id the helper itself
+            # reported (a title follows the active tab; the id does not).
+            arguments["window_id"] = int(window_id)
         return self.request("observation.describe", arguments)
 
     def capture_window(self, app: str, window_title: str, context_id: Optional[str] = None) -> Any:

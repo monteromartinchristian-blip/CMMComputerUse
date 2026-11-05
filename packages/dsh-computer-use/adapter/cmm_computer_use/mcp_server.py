@@ -58,7 +58,25 @@ __all__ = [
 ]
 
 SERVER_NAME = "cmm-computer-use"
-SERVER_VERSION = "0.1.0"
+#: One version for the package and this server (a test pins that they agree).
+SERVER_VERSION = "0.3.3"
+
+#: The helper capability each 0.3.3 tool needs. A helper without it (a 0.3.2
+#: helper, in a rollback or before the helper is updated) would answer
+#: CAPABILITY_UNSUPPORTED to the new operations and IGNORE an explicit
+#: `context_id`, acting on whatever application is in front.
+TOOL_FEATURES = {
+    "computer_use_context_open": "workspace",
+    "computer_use_context_close": "workspace",
+    "computer_use_workspace_status": "workspace",
+    "computer_use_browser_state": "browser",
+    "computer_use_browser_wait": "browser",
+    "computer_use_browser_select_tab": "browser",
+    "computer_use_save_dialog": "browser",
+    "computer_use_download": "downloads",
+    "computer_use_download_expect": "downloads",
+    "computer_use_download_status": "downloads",
+}
 
 #: Tools that only read. Everything else changes the helper's state or acts on
 #: another application, so the distinction is published in the MCP tool
@@ -173,6 +191,30 @@ class ToolRegistry:
             raise ValueError("mode must be one of %s" % ", ".join(POLICIES))
         self.client = client
         self.mode = mode
+        #: The application each context (key "" = the 0.3.2 default) was last
+        #: observing. An automatic re-observation names it: the helper's
+        #: `observe` without an app describes whatever is IN FRONT, which in
+        #: background mode is the person's own work (audit X-11).
+        self._targets: Dict[str, str] = {}
+
+    def _remember_target(self, context: Optional[str], observation: Any) -> None:
+        if isinstance(observation, dict):
+            bundle = observation.get("target_bundle") or observation.get("target_app")
+            if isinstance(bundle, str) and bundle:
+                self._targets[context or ""] = bundle
+
+    def _reobserve(self, context: Optional[str]) -> Optional[Any]:
+        """A fresh observation of the application this context was observing, or
+        ``None`` when none is known (then nothing is observed: the model is told
+        to observe again naming the application)."""
+
+        if context:
+            # An explicit context observes the application it is bound to.
+            return self.client.observe(context_id=context)
+        app = self._targets.get("")
+        if not app:
+            return None
+        return self.client.observe(app=app)
 
     # ── catalog ───────────────────────────────────────────────────────
 
@@ -228,6 +270,16 @@ class ToolRegistry:
                             "default": False,
                         },
                         "context": CONTEXT_PROPERTY,
+                        "window_id": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Observe THIS window of the application (the window_id an earlier "
+                                "observation or computer_use_browser_state reported). Use it when an "
+                                "application has several windows: without it a context keeps the "
+                                "window it observed last."
+                            ),
+                        },
                         "ax_diagnostics": {
                             "type": "boolean",
                             "description": (
@@ -387,7 +439,7 @@ class ToolRegistry:
                 "inputSchema": _schema({
                     "context": CONTEXT_PROPERTY,
                     "until": {"type": "string", "enum": ["settled", "loaded", "changed"], "default": "settled"},
-                    "timeout": {"type": "number", "minimum": 0.5, "maximum": 120, "default": 15},
+                    "timeout": {"type": "number", "minimum": 0.5, "maximum": 45, "default": 15},
                 }),
             },
             {
@@ -425,7 +477,7 @@ class ToolRegistry:
                                        "description": "Exact size, if known: a truncated file is then reported failed."},
                     "expected_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$",
                                         "description": "Published SHA-256, if known (the helper then reads the file to compare)."},
-                    "timeout": {"type": "number", "minimum": 1, "maximum": 120, "default": 120},
+                    "timeout": {"type": "number", "minimum": 1, "maximum": 45, "default": 45},
                 }, required=["element_id", "snapshot"]),
             },
             {
@@ -456,7 +508,7 @@ class ToolRegistry:
                 "inputSchema": _schema({
                     "download_id": {"type": "string", "pattern": "^dl_[0-9a-f]{32}$"},
                     "wait": {"type": "boolean", "default": False},
-                    "timeout": {"type": "number", "minimum": 0.5, "maximum": 120, "default": 60},
+                    "timeout": {"type": "number", "minimum": 0.5, "maximum": 45, "default": 30},
                     "checksum": {"type": "boolean", "default": False},
                 }, required=["download_id"]),
             },
@@ -599,6 +651,9 @@ class ToolRegistry:
             raise _ToolNotFound(name)
         arguments = arguments or {}
         try:
+            refusal = self._helper_gate(name, arguments)
+            if refusal is not None:
+                return refusal
             if name == "computer_use_status":
                 return _text(_render_status(self.client))
             if name == "computer_use_list_apps":
@@ -641,7 +696,7 @@ class ToolRegistry:
             if name == "computer_use_download_status":
                 download_id = str(arguments.get("download_id") or "")
                 if arguments.get("wait"):
-                    result = self.client.download_wait(download_id, timeout=float(arguments.get("timeout", 60)))
+                    result = self.client.download_wait(download_id, timeout=float(arguments.get("timeout", 30)))
                     if arguments.get("checksum") and result.get("state") == "complete":
                         result = self.client.download_status(download_id, checksum=True)
                 else:
@@ -722,7 +777,14 @@ class ToolRegistry:
         context = _context(arguments)
         if context:
             extra["context_id"] = context
+        if "window_id" in arguments and arguments["window_id"] is not None:
+            window_id = arguments["window_id"]
+            # A real positive integer only (a bool is an int in Python).
+            if isinstance(window_id, bool) or not isinstance(window_id, int) or not 1 <= window_id <= 2 ** 31 - 1:
+                raise ValueError("window_id must be a positive integer window id reported by the helper")
+            extra["window_id"] = window_id
         observation = self.client.observe(app=app, include_screenshot=include, **extra)
+        self._remember_target(context, observation)
         blocks: List[Dict[str, Any]] = [_text(_render_observation(
             observation, str(arguments.get("filter") or ""),
             facts=self._session_facts(observation)))["content"][0]]
@@ -811,13 +873,46 @@ class ToolRegistry:
             if not needs_reobservation(failure):
                 return refused
             try:
-                fresh = self.client.observe(**({"context_id": context} if context else {}))
+                fresh = self._reobserve(context)
             except BridgeError:
                 return refused
+            if fresh is None:
+                refused["content"][0]["text"] += (
+                    "\n%s. The action was NOT repeated. No application is known for this session yet, so "
+                    "nothing was observed: observe again with computer_use_observe and name the application "
+                    "(`app`)." % FAILURE_MEANINGS[failure])
+                return refused
+            self._remember_target(context, fresh)
             refused["content"][0]["text"] += (
                 "\nRECOVERED (%s): %s. The action was NOT repeated. Fresh observation:\n%s"
                 % (failure, FAILURE_MEANINGS[failure], _render_observation(fresh)))
             return refused
+
+    def _helper_gate(self, name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Refuse, with an actionable answer, what this helper cannot do.
+
+        The helper's own capabilities decide (``bridge.ping``), never the
+        adapter's assumptions. Unreachable is not "too old": that error is
+        raised as it always was. An explicit `context` is a 0.3.3 feature of
+        every tool that takes one, because an older helper ignores it silently.
+        """
+
+        feature = TOOL_FEATURES.get(name)
+        if feature is None and _context(arguments):
+            feature = "workspace"
+        if feature is None:
+            return None
+        info = self.client.helper_info()
+        if info.has(feature):
+            return None
+        ignored = ("" if name in TOOL_FEATURES else
+                   " This helper ignores `context` and would act on another application: it was not sent.")
+        return _text(
+            "REFUSED HELPER_TOO_OLD: %s needs the helper capability '%s', which this helper does not have "
+            "(helper %s, build %s).%s Do not retry this tool. Work with the tools that need no `context` "
+            "(computer_use_observe, computer_use_press, computer_use_set_value, computer_use_scroll, "
+            "computer_use_release) and tell the person the helper must be updated to 0.3.3 or later."
+            % (name, feature, info.version, info.build, ignored), is_error=True)
 
     def _select_tab(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         context = _context(arguments)
@@ -828,9 +923,14 @@ class ToolRegistry:
         if not is_error:
             try:
                 self.client.browser_wait(context, until="settled", timeout=10)
-                fresh = self.client.observe(**({"context_id": context} if context else {}))
-                text += "\nThe tab is selected; the connection is intact. Fresh observation:\n" \
-                    + _render_observation(fresh)
+                fresh = self._reobserve(context)
+                if fresh is None:
+                    text += ("\nThe tab is selected; the connection is intact. No application is known for "
+                             "this session yet: observe with computer_use_observe naming the application (`app`).")
+                else:
+                    self._remember_target(context, fresh)
+                    text += "\nThe tab is selected; the connection is intact. Fresh observation:\n" \
+                        + _render_observation(fresh)
             except BridgeError as error:
                 text += "\n(observe again: %s)" % error.code
         return _text(text, is_error=is_error)
@@ -840,9 +940,11 @@ class ToolRegistry:
             self.client, element_id=_int(arguments, "element_id"), snapshot=_int(arguments, "snapshot"),
             context_id=_context(arguments), name_hint=_opt_text(arguments, "name_hint"),
             directory=_opt_text(arguments, "directory"),
-            finish_timeout=float(arguments.get("timeout", 120)),
+            finish_timeout=float(arguments.get("timeout", 45)),
             expected_bytes=arguments.get("expected_bytes"), expected_sha256=_opt_text(arguments, "expected_sha256"))
         lines = ["press: %s" % (outcome["press"].get("outcome"),)]
+        if outcome.get("download_id") and not outcome.get("download"):
+            lines.append("download %s: unknown (could not be read)" % outcome["download_id"])
         if outcome.get("download"):
             lines.append(_render_download(outcome["download"]))
         lines.append(("VERIFIED " if outcome["verified"] else "NOT VERIFIED: ") + outcome["next"])
@@ -914,12 +1016,28 @@ def _read_with_retry(call):
         return call()
 
 
+def _helper_version_text(ping: Dict[str, Any]) -> str:
+    version = ping.get("helper_version")
+    build = ping.get("helper_build")
+    if not isinstance(version, str) or not version or version == "unknown":
+        return "unknown"
+    return "%s (build %s)" % (version, build if isinstance(build, str) and build else "unknown")
+
+
+def _helper_features(ping: Dict[str, Any]) -> list:
+    capabilities = ping.get("capabilities") if isinstance(ping.get("capabilities"), dict) else {}
+    return [name for name in ("workspace", "browser", "downloads", "scroll_reveal") if capabilities.get(name)]
+
+
 def _render_status(client: BridgeClient) -> str:
     ping = _read_with_retry(client.ping)
     permissions = _read_with_retry(client.status)
     lines = [
         "helper: %s protocol=%s pid=%s" % (ping.get("bridge"), ping.get("protocol"), ping.get("pid")),
         "bundle: %s" % ping.get("bundle_id"),
+        "adapter_version: %s" % SERVER_VERSION,
+        "helper_version: %s" % _helper_version_text(ping),
+        "helper_features: %s" % (",".join(_helper_features(ping)) or "none (a 0.3.2 helper has none of the 0.3.3 ones)"),
         "deployment_policy: %s (this adapter asks for %s)" % (ping.get("policy"), client.policy),
         "accessibility: %s" % permissions.get("accessibility"),
         "screen_recording: %s" % permissions.get("screen_recording"),
@@ -1682,8 +1800,13 @@ def handle_message(registry: ToolRegistry, message: Any) -> Optional[Dict[str, A
             return _result(request_id, registry.call(name, arguments))
         except _ToolNotFound:
             return _error(request_id, -32602, "Unknown tool: %s" % name)
-        except ValueError as error:
-            return _error(request_id, -32602, str(error))
+        except (ValueError, TypeError) as error:
+            # A wrong type or value in an argument (null, a list where a number
+            # belongs): the caller's mistake, never a dead server (audit M-18).
+            return _error(request_id, -32602, "Invalid arguments: %s" % str(error)[:200])
+        except Exception as error:  # noqa: BLE001 - one request must never end the server
+            return _error(request_id, -32603, "Internal error (%s); the server is still running"
+                          % type(error).__name__)
     return _error(request_id, -32601, "Method not found: %s" % method)
 
 

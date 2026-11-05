@@ -7,8 +7,9 @@
 //
 //   * a context is one application (and the window/document observed in it),
 //     owned by one PRINCIPAL — the verified identity of the caller;
-//   * each context has its own generation, its own observation clock, its own
-//     released generations and its own element handles;
+//   * each context has its own current generation (numbered from ONE
+//     workspace-wide counter, so a snapshot number names one context), its own
+//     observation clock, its own released generations and its own handles;
 //   * a handle resolves only inside the context that produced it, and only for
 //     the principal that owns that context;
 //   * a context id is opaque and random, and it is NEVER an authorization:
@@ -280,6 +281,16 @@ public final class BridgeWorkspace<Handle> {
     public let limits: BridgeWorkspaceLimits
     private let makeID: () -> String
     private var contexts: [String: BridgeContextRecord<Handle>] = [:]
+    /// One generation counter for the whole workspace (audit X-04): a
+    /// snapshot number names exactly ONE context, so an action that cites the
+    /// wrong context (or none) can never resolve "snapshot 1, element 7" of
+    /// another application. Per-context numbering made that possible.
+    private var lastGeneration = 0
+
+    private func nextGeneration() -> Int {
+        lastGeneration += 1
+        return lastGeneration
+    }
     private var legacyIDs: [BridgePrincipal: String] = [:]
     private var closed: [BridgePrincipal: [String]] = [:]
 
@@ -344,6 +355,17 @@ public final class BridgeWorkspace<Handle> {
         contexts[record.id] = record
         legacyIDs[principal] = record.id
         return record
+    }
+
+    /// Mark a context as in use (audit M-03): a read of something that belongs
+    /// to it — a download it declared — keeps it from expiring under that
+    /// work. Only its owner can; unknown or foreign ids change nothing.
+    @discardableResult
+    public func touch(principal: BridgePrincipal, id: String, now: Double) -> Bool {
+        guard var record = contexts[id], record.principal == principal else { return false }
+        record.lastUsedAt = now
+        contexts[id] = record
+        return true
     }
 
     /// Resolve a context for `principal`. `id == nil` is the legacy default.
@@ -435,7 +457,7 @@ public final class BridgeWorkspace<Handle> {
         guard var record = contexts[id] else { return nil }
         let changes = record.identity.map { identity.changes(from: $0) } ?? []
         record.handles.removeAll()
-        record.generation += 1
+        record.generation = nextGeneration()
         record.capturedAt = now
         record.lastUsedAt = now
         record.identity = identity
@@ -461,11 +483,17 @@ public final class BridgeWorkspace<Handle> {
             generation: record.generation, releasedSnapshots: record.released, now: now)
         record.handles.removeAll()
         record.released = retirement.releasedSnapshots
-        record.generation = retirement.generation
+        // The new current generation comes from the workspace-wide counter
+        // (audit X-04); what is REPORTED must be that number, not the one the
+        // shared rule computed for a single table.
+        let current = nextGeneration()
+        record.generation = current
         record.capturedAt = retirement.capturedAt
         record.invalidation = reason
         contexts[id] = record
-        return retirement
+        return BridgeObservationRetirement(
+            retired: retirement.retired, generation: current, capturedAt: retirement.capturedAt,
+            releasedSnapshots: retirement.releasedSnapshots)
     }
 
     public func bindStream(id: String, streamID: String?) {

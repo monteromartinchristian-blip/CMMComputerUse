@@ -654,6 +654,13 @@ func downloadExpectRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: 
 }
 
 func downloadStatusRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    // Audit M-03: a read of a download keeps the context that declared it in
+    // use, BEFORE idle contexts are reaped; otherwise a long download followed
+    // only by waits lost its expectation after 30 minutes.
+    if let id = arguments["download_id"] as? String, bridgeValidOpaqueID(id, prefix: "dl"),
+       let contextID = downloadMonitor.contextID(of: id) {
+        workspace.touch(principal: currentPrincipal, id: contextID, now: Date().timeIntervalSince1970)
+    }
     reapIdleContexts()
     guard let id = arguments["download_id"] as? String, bridgeValidOpaqueID(id, prefix: "dl"),
           let root = downloadMonitor.root(of: id, principal: currentPrincipal) else {
@@ -694,6 +701,11 @@ func revokedDownloadRefusal(_ id: String) -> BridgePolicyRefusal? {
 }
 
 func downloadListRequest() -> (Bool, Any?, [String: Any?]?) {
+    for id in downloadMonitor.ids(principal: currentPrincipal) {
+        if let contextID = downloadMonitor.contextID(of: id) {
+            workspace.touch(principal: currentPrincipal, id: contextID, now: Date().timeIntervalSince1970)
+        }
+    }
     reapIdleContexts()
     let now = Date().timeIntervalSince1970
     for id in downloadMonitor.ids(principal: currentPrincipal) { _ = revokedDownloadRefusal(id) }

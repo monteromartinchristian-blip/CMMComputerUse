@@ -207,12 +207,15 @@ check('invalidateObservation(contextID: context.id, reason: "release")' in relea
       and "bridgeRetireObservation(" in ws_invalidate
       and "record.handles.removeAll()" in ws_invalidate
       and "record.released = retirement.releasedSnapshots" in ws_invalidate
-      and "record.generation = retirement.generation" in ws_invalidate
+      and "let current = nextGeneration()" in ws_invalidate
+      and "record.generation = current" in ws_invalidate
+      and "generation: current" in ws_invalidate
+      and "record.generation = nextGeneration()" in ws_begin
       and "record.capturedAt = retirement.capturedAt" in ws_invalidate
       and "released.insert(generation)" in retire_body and "generation: generation + 1" in retire_body
       and "capturedAt: now" in retire_body,
       "R: release retires the context's generation through the one shared invalidation "
-      "(its handles emptied, N+1, time=now)")
+      "(its handles emptied, the next WORKSPACE-WIDE generation (audit X-04), time=now)")
 main_code = "\n".join(l.split("//", 1)[0] for l in main.splitlines())
 check(not re.search(r"\bcapturedAt\s*=", main_code)
       and set(re.findall(r"record\.capturedAt = [^\n]+", WORKSPACE_SRC))
@@ -327,7 +330,9 @@ check("revokedDownloadRefusal(id)" in status_body
       and "bridgeDownloadReport(" in status_body and ".dictionary" not in status_body
       and "bridgeDownloadAuthorizationRefusal(" in browser_code
       and "downloadMonitor.forget(principal: currentPrincipal, contextID: id)" in close_body
-      and "{\n    reapIdleContexts()\n" in status_body and "{\n    reapIdleContexts()\n" in list_body
+      and "reapIdleContexts()" in status_body and "reapIdleContexts()" in list_body
+      and status_body.index("reapIdleContexts()") < status_body.index("revokedDownloadRefusal(id)")
+      and status_body.index("reapIdleContexts()") < status_body.index("scanDownloadRoot(root)")
       and "downloadMonitor.forget(principal: record.principal, contextID: record.id)" in reap_body
       and downloads_code.count("        reap(now: now)\n") >= 4,
       "F6: every download read is re-decided against the policy before scanning, status and list share one "
@@ -350,6 +355,60 @@ check("bridgeResolveWindow(resolveWindow, pause:" in describe_body
       and "windowResolution.map { \";\" + $0.diagnostics }" in describe_body
       and resolve_body.count("resolve()") == 2 and resolve_body.count("pause()") == 1,
       "F7: an observation resolves its window with ONE bounded retry before deciding, and a refusal says what it decided on")
+
+timeouts = re.findall(r"AXUIElementSetMessagingTimeout\(([^\n]*)\)", strip_comments(main + browser_src))
+check(timeouts == ["AXUIElementCreateSystemWide(), Float(bridgeAXMessagingTimeoutSeconds)"]
+      and "private let axFocusedReader = BridgeBoundedReader<String>" in main
+      and "axFocusedReader.read(timeout: 0.1)" in main,
+      "F9: exactly ONE accessibility timeout, set once at start from a constant; the focus sampler is bounded "
+      "by a reader, never by lowering the process-wide timeout")
+
+stream_src = (REPO / "apps/macos/CMMComputerUse/WindowStream.swift").read_text()
+cap_body = main[main.index("func captureScreenRequest("):]
+cap_body = cap_body[:cap_body.index("\n}\n")]
+str_body = main[main.index("func streamStartRequest("):]
+str_body = str_body[:str_body.index("\n}\n")]
+check("bridgeSelectWindow(" not in strip_comments(main) + strip_comments(stream_src)
+      and "bridgeResolveWindowById(" not in strip_comments(main) + strip_comments(stream_src)
+      and strip_comments(main).count("bridgeSelectAuthorizedWindow(") == 1
+      and strip_comments(stream_src).count("bridgeSelectAuthorizedWindow(") == 1
+      and strip_comments(stream_src).count("bridgeResolveAuthorizedWindowById(") == 1
+      and 'clientRequiredRefusal(operation: "observation.capture_screen")' in cap_body
+      and 'clientRequiredRefusal(operation: "observation.stream_start")' in str_body
+      and "let policy = authorization" in main and "let policy = authorization" in stream_src,
+      "F10: windows are selected only among those the caller may observe (policy and caller captured by value "
+      "before the task); a caller with no identity under a client-required policy never reaches selection")
+
+frame_body = stream_src[stream_src.index("func windowStreamFrame("):]
+frame_body = frame_body[:frame_body.index("\n}\n")]
+reval_body = stream_src[stream_src.index("func revalidateWindowStreams("):]
+reval_body = reval_body[:reval_body.index("\n}\n")]
+check("guard recheckStreamAuthorization(entry, now: now) else" in frame_body
+      and frame_body.index("recheckStreamAuthorization(") < frame_body.index("latestFrame()")
+      and "bridgeStreamRecheck(" in reval_body and "currentWindowTitle(windowID:" in reval_body
+      and "entry.identity.windowTitle, scope" not in reval_body
+      and "CGWindowListCopyWindowInfo([.optionIncludingWindow]" in stream_src,
+      "F11: a stream is judged again on the window's CURRENT title before any frame is served and on "
+      "policy.reload (never only the title it started with)")
+
+check("bridgeBoundWindowOutcome(boundRequested: true, found: false, openWindows: standard.count)" in describe_body
+      and "reason=bound_window_closed;windows=" in describe_body
+      and '"bound_window_replaced"' in describe_body
+      and describe_body.index("bridgeBoundWindowOutcome(") < describe_body.index("authorization.decision("),
+      "F12: a lost bound window is refused (several windows) or used and named (one window), decided before "
+      "the window is authorized; never silently re-bound to the focused window")
+
+check("workspace.touch(principal: currentPrincipal, id: contextID" in status_body
+      and status_body.index("workspace.touch(") < status_body.index("reapIdleContexts()")
+      and "workspace.touch(principal: currentPrincipal, id: contextID" in list_body
+      and list_body.index("workspace.touch(") < list_body.index("reapIdleContexts()"),
+      "F13: reading a download (status, wait, list) keeps the context that declared it alive, before idle "
+      "contexts are reaped")
+
+check("bridgePreferBoundProcess(" in describe_body and "reason=bound_process_gone" in describe_body
+      and describe_body.index("bridgePreferBoundProcess(") < describe_body.index("authorization.decision("),
+      "F14: an explicit context keeps the process it was bound to when several processes share a bundle id; a "
+      "bound process that is gone is refused, never replaced by another instance")
 
 build = BUILD.read_text()
 check("BrowserSupport.swift" in build, "build-helper.sh compiles BrowserSupport.swift")

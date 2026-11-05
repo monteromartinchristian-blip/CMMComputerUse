@@ -52,6 +52,8 @@ class BrowserHelper:
         self.pdf = False
         self.outcome = None
         self.expect_drop_first = False
+        #: operations whose answer is lost (connection closed) every time they are asked
+        self.drop_ops = set()
 
     def state(self, request):
         return ok(request, {
@@ -86,6 +88,8 @@ class BrowserHelper:
     def __call__(self, request):
         op = request.get("operation")
         args = request.get("arguments") or {}
+        if op in self.drop_ops:
+            return None
         if op == "browser.state":
             return self.state(request)
         if op == "browser.wait":
@@ -226,7 +230,7 @@ class NavigationTests(Base):
         text = text_of(self.call("computer_use_browser_wait", {"context": CTX, "until": "loaded", "timeout": 500}))
         frame = self.frames("browser.wait")[0]["arguments"]
         self.assertEqual(frame["until"], "loaded")
-        self.assertEqual(frame["timeout"], 120.0, "capped at the helper's bound")
+        self.assertEqual(frame["timeout"], 45.0, "capped at the adapter's bound, under the host's 70 s cut")
         self.assertIn("settled=True", text)
 
 
@@ -325,6 +329,161 @@ class DownloadTests(Base):
 
 
 # 8. save dialogs and conflicts
+
+class HostBudgetTests(Base):
+    """Audit X-07 / X-08 / C-09. DSH cuts a tool call at 70 s: a tool must answer
+    before that, a long wait is never resent, and a download whose press already
+    ran never looks like one that did not."""
+
+    def test_waits_are_capped_below_the_host_timeout_and_the_schema_says_so(self):
+        from cmm_computer_use.client import HOST_BUDGET_SECONDS, WAIT_MAX_SECONDS
+        self.assertLess(WAIT_MAX_SECONDS + 10.0, 70.0, "wait + socket margin stays under DSH's 70 s cut")
+        self.assertLessEqual(HOST_BUDGET_SECONDS, 60.0)
+        tools = {t["name"]: t for t in self.registry.tools()}
+        for name, field in (("computer_use_browser_wait", "timeout"), ("computer_use_download_status", "timeout"),
+                            ("computer_use_download", "timeout")):
+            props = tools[name]["inputSchema"]["properties"]
+            self.assertLessEqual(props[field]["maximum"], WAIT_MAX_SECONDS, name)
+        self.call("computer_use_browser_wait", {"context": CTX, "timeout": 120})
+        sent = self.frames("browser.wait")[0]["arguments"]["timeout"]
+        self.assertLessEqual(sent, WAIT_MAX_SECONDS, "an oversized request is clamped, not forwarded")
+        self.call("computer_use_download_status", {"download_id": DL, "wait": True, "timeout": 120})
+        self.assertLessEqual(self.frames("download.wait")[-1]["arguments"]["timeout"], WAIT_MAX_SECONDS)
+
+    def test_a_download_as_a_whole_fits_the_budget_even_if_every_wait_uses_all_its_time(self):
+        """Worst case: each wait runs to its full timeout. The flow plans from
+        the time that has really passed, so the total still fits."""
+        from unittest import mock
+        from cmm_computer_use.client import HOST_BUDGET_SECONDS
+        clock = {"t": 0.0, "waits": []}
+        original = self.client.download_wait
+
+        def waiting(download_id, **kwargs):
+            clock["waits"].append(kwargs.get("timeout"))
+            clock["t"] += kwargs.get("timeout", 0.0)
+            return original(download_id, **kwargs)
+
+        self.client.download_wait = waiting
+        with mock.patch("cmm_computer_use.browser.time.monotonic", lambda: clock["t"]):
+            self.call("computer_use_download", {"context": CTX, "element_id": 7, "snapshot": 3, "timeout": 45})
+        self.assertGreaterEqual(len(clock["waits"]), 2, clock["waits"])
+        self.assertLessEqual(clock["t"], HOST_BUDGET_SECONDS, "every wait at its full length: %s" % clock["waits"])
+
+    def test_a_long_wait_is_never_resent_after_a_lost_answer(self):
+        self.helper.drop_ops = {"browser.wait"}
+        result = self.call("computer_use_browser_wait", {"context": CTX, "timeout": 30})
+        self.assertTrue(result.get("isError"))
+        self.assertEqual(len(self.frames("browser.wait")), 1, "no retry multiplies a wait")
+        self.helper.drop_ops = {"download.wait"}
+        self.call("computer_use_download_status", {"download_id": DL, "wait": True, "timeout": 30})
+        self.assertEqual(len(self.frames("download.wait")), 1)
+
+    def test_a_failure_after_the_press_says_the_press_ran_and_never_repeats_it(self):
+        self.helper.drop_ops = {"download.wait"}
+        result = self.call("computer_use_download", {"context": CTX, "element_id": 7, "snapshot": 3})
+        text = text_of(result)
+        self.assertTrue(result.get("isError"))
+        self.assertIn("press: succeeded", text, "the press already ran: the model must be told")
+        self.assertIn("do not press again", text.lower())
+        self.assertIn(DL, text, "the expectation is the way to verify later")
+        self.assertEqual(len(self.frames("action.execute")), 1, "never pressed twice")
+        self.assertEqual(len(self.frames("download.forget")), 0, "the expectation is kept: it is how to verify")
+
+    def test_a_status_read_failing_before_any_state_is_still_not_a_verification(self):
+        self.helper.drop_ops = {"browser.state", "download.wait"}
+        self.helper.download_states = [{"state": "not_started"}]
+        text = text_of(self.call("computer_use_download", {"context": CTX, "element_id": 7, "snapshot": 3}))
+        self.assertIn("NOT VERIFIED", text)
+        self.assertNotIn("VERIFIED verified", text)
+
+
+class AdapterRobustnessTests(Base):
+    """Audit X-11 and M-18 (C-03, C-06)."""
+
+    def test_a_recovery_observation_without_context_names_the_app_it_was_observing(self):
+        """No context: the helper's `observe` without an app describes whatever
+        is IN FRONT (the person's own work). The automatic recovery after a page
+        change must observe the application that was being worked on."""
+        self.helper.press = "document_changed"
+        first = self.call("computer_use_observe", {"app": "Finder"})
+        self.assertFalse(first.get("isError"))
+        text = text_of(self.call("computer_use_press", {"element_id": 7, "snapshot": 3}))
+        self.assertIn("RECOVERED (document_changed)", text)
+        describes = self.frames("observation.describe")
+        self.assertEqual(len(describes), 2)
+        self.assertEqual(describes[-1]["arguments"].get("app"), "com.apple.finder",
+                         "the recovery observed the same application, not the frontmost one")
+
+    def test_without_a_known_target_the_recovery_does_not_observe_whatever_is_in_front(self):
+        self.helper.press = "document_changed"
+        text = text_of(self.call("computer_use_press", {"element_id": 7, "snapshot": 3}))
+        self.assertEqual(self.frames("observation.describe"), [], "no app known: nothing was observed")
+        self.assertIn("observe", text.lower())
+        self.assertIn("app", text.lower())
+        self.assertEqual(len(self.frames("action.execute")), 1)
+
+    def test_select_tab_without_context_does_not_observe_the_frontmost_application(self):
+        self.call("computer_use_observe", {"app": "Finder"})
+        self.call("computer_use_browser_select_tab", {"tab_id": TAB1})
+        describes = self.frames("observation.describe")
+        self.assertEqual(describes[-1]["arguments"].get("app"), "com.apple.finder")
+
+    def test_a_malformed_argument_is_an_error_answer_never_a_dead_server(self):
+        for name, arguments in (
+                ("computer_use_browser_wait", {"context": CTX, "timeout": None}),
+                ("computer_use_browser_wait", {"context": CTX, "timeout": [1]}),
+                ("computer_use_download_status", {"download_id": DL, "wait": True, "timeout": {"a": 1}}),
+                ("computer_use_download", {"element_id": 7, "snapshot": 3, "expected_bytes": [1]}),
+                ("computer_use_download_expect", {"expected_bytes": {"x": 1}}),
+                ("computer_use_download", {"element_id": 7, "snapshot": 3, "timeout": "soon"})):
+            from cmm_computer_use.mcp_server import handle_message
+            reply = handle_message(self.registry, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                                   "params": {"name": name, "arguments": arguments}})
+            self.assertIsNotNone(reply, name)
+            self.assertTrue("error" in reply or reply.get("result", {}).get("isError"),
+                            "%s %s must be refused, not crash: %s" % (name, arguments, reply))
+
+    def test_an_unexpected_exception_inside_a_tool_is_reported_and_the_server_lives(self):
+        from cmm_computer_use.mcp_server import handle_message
+        def explode(*_a, **_k):
+            raise KeyError("download_id")
+        self.registry.client.download_expect = explode
+        reply = handle_message(self.registry, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                               "params": {"name": "computer_use_download_expect", "arguments": {}}})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32603)
+        again = handle_message(self.registry, {"jsonrpc": "2.0", "id": 10, "method": "tools/list"})
+        self.assertIn("result", again, "the server answers the next request")
+
+
+class WindowChoiceTests(Base):
+    """Audit M-14 / B-05 (acceptance finding D3): two documents of one app could
+    not be told apart through MCP, although the helper observes a window by its id."""
+
+    def test_observe_can_name_the_window_by_its_id(self):
+        self.call("computer_use_observe", {"app": "Finder", "context": CTX, "window_id": 10651})
+        sent = self.frames("observation.describe")[-1]["arguments"]
+        self.assertEqual(sent["window_id"], 10651)
+        self.assertEqual(sent["context_id"], CTX)
+
+    def test_without_a_window_id_nothing_extra_is_sent(self):
+        self.call("computer_use_observe", {"app": "Finder"})
+        self.assertNotIn("window_id", self.frames("observation.describe")[-1]["arguments"])
+
+    def test_a_window_id_is_validated_not_forwarded_blindly(self):
+        from cmm_computer_use.mcp_server import handle_message
+        for bad in (0, -3, "10", 1.5, True, [1], 2 ** 40):
+            reply = handle_message(self.registry, {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "computer_use_observe", "arguments": {"app": "Finder", "window_id": bad}}})
+            self.assertTrue("error" in reply or reply["result"].get("isError"), repr(bad))
+        self.assertEqual(self.frames("observation.describe"), [])
+
+    def test_the_schema_offers_it(self):
+        tool = next(t for t in self.registry.tools() if t["name"] == "computer_use_observe")
+        prop = tool["inputSchema"]["properties"]["window_id"]
+        self.assertEqual(prop["type"], "integer")
+        self.assertGreaterEqual(prop["minimum"], 1)
+
 
 class SaveDialogTests(Base):
     def test_the_save_dialog_is_an_ax_action_with_explicit_overwrite(self):

@@ -19,6 +19,10 @@ nonisolated(unsafe) var helperLogHandle: FileHandle?
 // TCC: even a non-prompting permission observation is not proof of equivalence
 // to the installed helper. No policy file is opened, no path/env value emitted.
 let launchArguments = parseLaunchArguments()
+// ONE explicit accessibility messaging timeout for the whole process (audit
+// X-03). Nothing else may lower it: a lower value anywhere would truncate the
+// trees and titles every other read depends on (source guard F9).
+AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), Float(bridgeAXMessagingTimeoutSeconds))
 if launchArguments.preflightOnly {
     let override = ProcessInfo.processInfo.environment["CMM_COMPUTER_USE_POLICY_FILE"]
     let report: [String: Any] = [
@@ -225,12 +229,11 @@ func cursorLocation() -> CGPoint {
     return NSEvent.mouseLocation
 }
 
-/// The application that holds keyboard focus according to the accessibility
-/// server, read synchronously (no AppKit cache). Empty when unreadable.
-func axFocusedApplicationBundle() -> String {
+/// Reads one focused-application bundle id from the accessibility server
+/// (synchronously, no AppKit cache); may block on a hung application. Empty
+/// when unreadable.
+private func axFocusedApplicationBundleUnbounded() -> String {
     let systemWide = AXUIElementCreateSystemWide()
-    // Bounded: a hung focused application must not stall the sampler.
-    AXUIElementSetMessagingTimeout(systemWide, 0.1)
     var value: AnyObject?
     guard AXUIElementCopyAttributeValue(
         systemWide, kAXFocusedApplicationAttribute as CFString, &value) == .success,
@@ -239,6 +242,16 @@ func axFocusedApplicationBundle() -> String {
     var pid: pid_t = 0
     guard AXUIElementGetPid(raw as! AXUIElement, &pid) == .success, pid > 0 else { return "" }
     return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+}
+
+private let axFocusedReader = BridgeBoundedReader<String>(label: "cmm.ax.focused-app", fallback: "")
+
+/// The application that holds keyboard focus according to the accessibility
+/// server. Bounded by a reader, NOT by lowering the process-wide AX timeout:
+/// that was set to 100 ms here and truncated every other accessibility read of
+/// the helper (audit X-03). A hung focused application yields the last value.
+func axFocusedApplicationBundle() -> String {
+    axFocusedReader.read(timeout: 0.1) { axFocusedApplicationBundleUnbounded() }
 }
 
 /// Owner of the front-most normal (layer 0), visible, non-trivial window, per
@@ -1295,6 +1308,27 @@ func describe(
                 detail: "policy=\(mode.rawValue);target=app"))
         }
         target = resolved
+        // Audit M-13: several processes can share one bundle id (the person's
+        // Chrome and a test Chrome). A name lookup returns the first; an
+        // explicit context bound to another process keeps THAT process, and a
+        // bound process that is gone is never replaced by another instance.
+        if !context.legacy, let identity = context.identity,
+           identity.pid != resolved.processIdentifier,
+           identity.bundleID == (resolved.bundleIdentifier ?? "") {
+            let alive = NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }
+                .map { BridgeProcessCandidate(pid: $0.processIdentifier, bundleID: $0.bundleIdentifier ?? "") }
+            guard let kept = bridgePreferBoundProcess(
+                resolved: BridgeProcessCandidate(pid: resolved.processIdentifier, bundleID: resolved.bundleIdentifier ?? ""),
+                bound: BridgeProcessCandidate(pid: identity.pid, bundleID: identity.bundleID), alive: alive),
+                  let process = NSRunningApplication(processIdentifier: kept.pid), !process.isTerminated else {
+                return (nil, BridgePolicyRefusal(
+                    code: "COMPUTER_TARGET_UNAVAILABLE",
+                    message: "The process this context was observing is no longer running. Close this context "
+                        + "and open a new one (computer_use_context_close, then computer_use_context_open).",
+                    detail: "policy=\(mode.rawValue);target=app;reason=bound_process_gone"))
+            }
+            target = process
+        }
     }
     guard let target else {
         return (nil, BridgePolicyRefusal(
@@ -1357,6 +1391,29 @@ func describe(
         }
         windowFollow = resolved.resolution.follow
         captureTitle = resolved.resolution.title
+        // Audit X-10: the window this context was bound to is gone. Never
+        // "whatever has focus": two contexts on two windows of one browser
+        // would swap. One window left: nothing to swap, use it and say so;
+        // several: refuse and say how to start over.
+        if resolved.resolution.follow == "bound_window_closed" {
+            let standard = ((axAttr(appElement, kAXWindowsAttribute) as? [AXUIElement]) ?? [])
+                .filter { (axAttr($0, kAXRoleAttribute) as? String) == "AXWindow" }
+            switch bridgeBoundWindowOutcome(boundRequested: true, found: false, openWindows: standard.count) {
+            case .refuse:
+                return (nil, BridgePolicyRefusal(
+                    code: "COMPUTER_TARGET_UNAVAILABLE",
+                    message: "The window this context was observing is no longer open and the application has "
+                        + "other windows. Close this context and open a new one for the window you want "
+                        + "(computer_use_context_close, then computer_use_context_open).",
+                    detail: "policy=\(mode.rawValue);target=window;reason=bound_window_closed;windows=\(standard.count)"))
+            case .replacedBySingleWindow:
+                windowElement = standard[0]
+                captureTitle = (axAttr(standard[0], kAXTitleAttribute) as? String) ?? ""
+                windowFollow = "bound_window_replaced"
+            case .bound:
+                break
+            }
+        }
     }
 
     // DENY BY DEFAULT: an application the deployment did not authorize is
@@ -1590,6 +1647,16 @@ func captureWindowBase64(
     // The generation of the CALLER'S context, so a capture is tied to the
     // observation line it belongs to (0.3.2: a process-wide counter).
     let captureSnapshot = snapshot
+    // The policy and the caller are read HERE, under the request's lock, and
+    // travel into the task by value: the task used to read the globals after
+    // another request could own them (audit A-11), and it decided only AFTER
+    // selecting (audit X-06).
+    let policy = authorization
+    let caller = currentClient
+    let mayObserve: @Sendable (BridgeWindowCandidate) -> Bool = {
+        policy.decision(bundleID: $0.bundleID, name: $0.app, windowTitle: $0.title,
+                        scope: .observe, client: caller).isAllowed
+    }
     Task {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(
@@ -1609,12 +1676,13 @@ func captureWindowBase64(
                     height: Int(window.frame.height))
                 pairs.append((candidate, window))
             }
-            switch bridgeSelectWindow(
-                request: title, app: app, candidates: pairs.map { $0.0 })
+            switch bridgeSelectAuthorizedWindow(
+                request: title, app: app, candidates: pairs.map { $0.0 }, isAuthorized: mayObserve)
             {
             case .notFound:
                 box.failure = "window_not_found"
             case .ambiguous(let matches):
+                // Only windows this caller may observe are ever listed.
                 box.failure = "window_ambiguous:" + matches.joined(separator: " | ")
             case .selected(let chosen):
                 guard let pair = pairs.first(where: { $0.0 == chosen }) else {
@@ -1624,9 +1692,9 @@ func captureWindowBase64(
                 // The selected window's OWNER must be authorized for
                 // observation, with this title: a client cannot reach an
                 // unauthorized window by naming it.
-                if let refusal = authorization.decision(
+                if let refusal = policy.decision(
                     bundleID: pair.0.bundleID, name: pair.0.app,
-                    windowTitle: pair.0.title, scope: .observe, client: currentClient
+                    windowTitle: pair.0.title, scope: .observe, client: caller
                 ).refusal {
                     box.refusal = refusal
                     break
@@ -3034,6 +3102,11 @@ func actionOutcome(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) 
 // MARK: - Observation operations with contexts
 
 func captureScreenRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
+    // Under a client-required policy a caller with no identity learns only
+    // that (audit X-06): it never reaches window selection.
+    if let refusal = clientRequiredRefusal(operation: "observation.capture_screen") {
+        return (false, nil, refusalFrame(refusal))
+    }
     let app = (arguments["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let title = (arguments["window_title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let hasWindowTarget = !(title ?? "").isEmpty
@@ -3082,6 +3155,9 @@ func captureScreenRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: A
 
 func streamStartRequest(_ arguments: [String: Any]) -> (Bool, Any?, [String: Any?]?) {
     reapIdleContexts()
+    if let refusal = clientRequiredRefusal(operation: "observation.stream_start") {
+        return (false, nil, refusalFrame(refusal))
+    }
     var app = (arguments["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let title = ((arguments["window_title"] as? String) ?? "")
         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3370,6 +3446,10 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
             "protocol": bridgeVersion,
             "pid": ProcessInfo.processInfo.processIdentifier,
             "bundle_id": Bundle.main.bundleIdentifier ?? "",
+            // Which build this is (audit X-09): an adapter pairs it with the
+            // capabilities below to detect a helper that is too old for it.
+            "helper_version": bridgeHelperIdentity(info: Bundle.main.infoDictionary).version,
+            "helper_build": bridgeHelperIdentity(info: Bundle.main.infoDictionary).build,
             "policy": deploymentMode.rawValue,
             "authorization": [
                 "loaded": authorization.loaded,
@@ -3443,6 +3523,9 @@ func dispatch(operation: String, arguments: [String: Any]) -> (Bool, Any?, [Stri
                     "tabs": true, "page_lifecycle": true, "select_tab": true,
                     "save_dialog": true, "window_targeting": true,
                 ] as [String: Any],
+                // D5: ui.scroll can reveal content beyond the visible edge
+                // (AXScrollToVisible) where a page has no page action or scroll bar.
+                "scroll_reveal": true,
                 "downloads": [
                     "verified": true, "expectations": true, "partial_formats": ["webkit_bundle", "crdownload", "part"],
                     "checksum_on_request": true,

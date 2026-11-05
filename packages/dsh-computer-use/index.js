@@ -26,12 +26,37 @@ function resolveSocket(configured) {
   return chosen.startsWith('~/') ? join(homedir(), chosen.slice(2)) : chosen;
 }
 
-// Fixed loopback endpoint. The helper's own policy still decides which single
-// window may be captured; the token keeps other local processes out. A fixed
-// port is deliberate: the renderer's URL is configuration, so it must not
+// Fixed loopback endpoint. The helper's own policy still decides which window
+// may be captured. The token is NOT a secret: it is fixed and public, because
+// the renderer builds an <img src> URL (which cannot carry a header) and there
+// is no verified Host-to-renderer channel to hand it a per-start value. What
+// actually protects the endpoint is `requestGuard` (loopback `Host`, only a
+// `dsh-app:` `Origin`, no wildcard CORS), which closes the web-page vector. A
+// process of the same user can still ask for frames of the windows the policy
+// authorizes (audit X-01, open until the renderer can receive a secret). A
+// fixed port is deliberate: the renderer's URL is configuration, so it must not
 // change between restarts of the same session projection.
 const LIVE_PORT = 47183;
 const LIVE_TOKEN = 'cmm-cu-live';
+/**
+ * Who may talk to the streamer from a browser context (audit X-01).
+ * `Host` must be the loopback name with the streamer's own port, which stops
+ * DNS rebinding; a request with an `Origin` must come from the `dsh-app:`
+ * scheme (the renderer is `dsh-app://app`) and only that origin is granted
+ * CORS. A request without `Origin` (an <img>, a local tool) is not a CORS
+ * request and gets no CORS header at all.
+ */
+export function requestGuard(request, port) {
+  const host = String(request.headers.host || '');
+  if (!(host === '127.0.0.1:' + port || host === 'localhost:' + port)) return {ok: false, headers: {}};
+  const origin = request.headers.origin;
+  if (origin === undefined) return {ok: true, headers: {}};
+  let parsed;
+  try { parsed = new URL(origin); } catch { return {ok: false, headers: {}}; }
+  if (parsed.protocol !== 'dsh-app:') return {ok: false, headers: {}};
+  return {ok: true, headers: {'Access-Control-Allow-Origin': origin, Vary: 'Origin'}};
+}
+
 /** Concurrent mirrors (panel A and panel B), matching the helper's two streams. */
 const MAX_SLOTS = 2;
 
@@ -82,7 +107,7 @@ function captureOnce(socket, app, window) {
 
 function runStreamer(socket, port = LIVE_PORT) {
   const token = LIVE_TOKEN;
-  let pending = null;
+  const pending = new Map();
   // 0.3.3: up to MAX_SLOTS independent mirrors (panel A and panel B), each
   // with its own helper stream, counters, phase, viewers and recovery. A slot
   // is named by the panel (`slot=A`); no slot is the 0.3.2 single mirror.
@@ -96,7 +121,7 @@ function runStreamer(socket, port = LIVE_PORT) {
     if (!slot) {
       slot = {stats: {frames: 0, lastFrameAt: 0, viewers: 0, mode: 'idle', error: null, windowId: null,
         phase: 'idle', streamId: null, frameIndex: null, recoveries: 0},
-        live: null, transition: Promise.resolve()};
+        live: null, transition: Promise.resolve(), connections: 0};
       slots.set(name, slot);
     }
     return slot;
@@ -119,6 +144,10 @@ function runStreamer(socket, port = LIVE_PORT) {
     return multi;
   };
   const activeSlots = () => [...slots.values()].filter(slot => slot.live).length;
+  // A slot counts against the two-mirror limit only while a viewer is
+  // connected to it (audit B-12): entries of closed panels never block the
+  // next one.
+  const openSlots = () => [...slots.values()].filter(slot => slot.connections > 0).length;
 
   const acquire = (name, slot, target) => serialized(slot, async () => {
     // A window id IS the window: a title change (tab switch, navigation) on
@@ -158,8 +187,11 @@ function runStreamer(socket, port = LIVE_PORT) {
     return slot.live;
   });
 
-  const release = (slot) => serialized(slot, async () => {
-    if (!slot.live) return;
+  // By identity (audit B-13): a viewer whose target was replaced by another
+  // viewer of the same slot no longer owns `slot.live`, so its release must
+  // not take a viewer away from the replacement.
+  const release = (slot, owned) => serialized(slot, async () => {
+    if (!slot.live || slot.live !== owned) return;
     slot.live.viewers -= 1;
     slot.stats.viewers = Math.max(0, slot.live.viewers);
     if (slot.live.viewers > 0) return;
@@ -262,7 +294,7 @@ function runStreamer(socket, port = LIVE_PORT) {
         await new Promise(resolve => setTimeout(resolve, 45));
       }
     } finally {
-      await release(slot);
+      await release(slot, live);
     }
   };
 
@@ -293,17 +325,26 @@ function runStreamer(socket, port = LIVE_PORT) {
 
   const server = createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1');
-    const headers = {'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*'};
+    // Audit X-01. Only the DSH renderer may read this endpoint from a browser
+    // context: `Host` must be the loopback name (DNS rebinding), and a request
+    // that carries an `Origin` must come from the app's own `dsh-app:` scheme.
+    // CORS is granted to that origin only; no wildcard.
+    const verdict = requestGuard(request, server.address() && server.address().port);
+    const headers = {'Cache-Control': 'no-store', ...verdict.headers};
+    if (!verdict.ok) { response.writeHead(403, headers).end(); return; }
+    if (request.method === 'OPTIONS') { response.writeHead(204, {...headers, 'Access-Control-Allow-Methods': 'GET'}).end(); return; }
     if (url.pathname === '/stream.mjpg') {
       if (url.searchParams.get('token') !== token) { response.writeHead(403, headers).end(); return; }
       const name = slotName(url);
       // Two mirrors at once, never a third: the helper refuses a third stream
       // and this endpoint refuses a third slot before asking it.
-      if (name && !slots.has(name) && slots.size >= MAX_SLOTS) {
+      const known = slots.get(name);
+      if (!(known && known.connections > 0) && openSlots() >= MAX_SLOTS) {
         response.writeHead(429, headers).end('STREAM_LIMIT');
         return;
       }
       const slot = slotOf(name);
+      slot.connections += 1;
       // Continuous multipart stream for the viewer: the element never reloads.
       // Frames come from the helper's SCStream cache, so the rate is the
       // window's real capture rate instead of one capture round trip per frame.
@@ -316,6 +357,14 @@ function runStreamer(socket, port = LIVE_PORT) {
         pid: Number(url.searchParams.get('pid')) || null,
       };
       let shut = false;
+      let counted = true;
+      const leave = () => {
+        if (!counted) return;
+        counted = false;
+        slot.connections -= 1;
+        // A closed panel leaves no entry behind once its stream is released.
+        if (slot.connections === 0 && !slot.live && slots.get(name) === slot) slots.delete(name);
+      };
       request.on('close', () => { shut = true; });
       const closed = () => shut || response.writableEnded;
       // Supervised: the live stream is the path, the capture loop is the
@@ -338,6 +387,8 @@ function runStreamer(socket, port = LIVE_PORT) {
         await pollFrames(slot, response, closed, target.app, target.window, Math.min(30000, 6000 * failures));
       }
       response.end();
+      await slot.transition.catch(() => {});
+      leave();
       return;
     }
     if (url.pathname === '/stream/status') {
@@ -360,16 +411,26 @@ function runStreamer(socket, port = LIVE_PORT) {
     try {
       // Coalesce: a slow capture must not turn parallel polls into 429s, which
       // the renderer would see as a broken stream and stop showing the mirror.
-      if (!pending) {
-        pending = captureOnce(socket, url.searchParams.get('app') || '',
-          url.searchParams.get('window') || '').finally(() => { pending = null; });
+      // Keyed by the target (audit): a capture in flight for one window is
+      // never the answer to a request for another.
+      const appName = url.searchParams.get('app') || '';
+      const windowName = url.searchParams.get('window') || '';
+      const key = appName + '\u0000' + windowName;
+      if (!pending.has(key)) {
+        pending.set(key, captureOnce(socket, appName, windowName).finally(() => { pending.delete(key); }));
       }
-      const {bytes, contentType} = await pending;
+      const {bytes, contentType} = await pending.get(key);
       response.writeHead(200, {...headers, 'Content-Type': contentType, 'Content-Length': bytes.length});
       response.end(bytes);
     } catch (error) {
       response.writeHead(503, headers).end(String((error && error.message) || error));
     }
+  });
+  server.on('error', error => {
+    // Audit B-21: a port that cannot be bound is a clear, one-line failure the
+    // Host can read, not an unhandled exception.
+    process.stdout.write('ERROR ' + ((error && error.code) || 'listen_failed') + '\n');
+    if (process.argv.includes('--stream')) process.exit(1);
   });
   server.listen(port, '127.0.0.1', () => process.stdout.write('READY ' + server.address().port + '\n'));
   const stopAll = () => Promise.all([...slots.values()].filter(slot => slot.live).map(slot =>

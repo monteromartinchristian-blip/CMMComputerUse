@@ -83,7 +83,7 @@ Use grammar (`COMPUTER_RUNTIME_UNAVAILABLE`, `COMPUTER_PERMISSION_DENIED`,
 
 | Operation | Arguments | Result |
 |---|---|---|
-| `bridge.ping` | `{}` | `{bridge, protocol, pid, bundle_id, policy, authorization, capabilities}` — identity proof |
+| `bridge.ping` | `{}` | `{bridge, protocol, pid, bundle_id, helper_version, helper_build, policy, authorization, capabilities}` — identity proof; `helper_version`/`helper_build` say which build this is and `capabilities` (`workspace`, `browser`, `downloads`, `scroll_reveal`, …) what it can do: an adapter negotiates with them and refuses what an older helper lacks |
 | `permissions.status` | `{}` | `{accessibility, screen_recording, detail}` measured on the helper |
 | `permissions.request_accessibility` | `{}` | canonical AX prompt, then status |
 | `permissions.request_screen_recording` | `{}` | canonical SC request, then status |

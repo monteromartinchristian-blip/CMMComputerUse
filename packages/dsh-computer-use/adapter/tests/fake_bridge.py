@@ -152,6 +152,13 @@ def default_responder(request: Dict[str, Any]) -> Dict[str, Any]:
                 "bundle_id": "com.cmm.chat.computer-use",
                 "policy": "unrestricted",
                 "authorization": {"loaded": True, "apps": 1, "default": "deny"},
+                # A current helper: it says what it can do (audit X-09). Tests
+                # of an older helper script their own ping.
+                "helper_version": "0.3.3",
+                "helper_build": "6",
+                "capabilities": {"workspace": {"contract": "cmm-computer-use/workspace"},
+                                 "browser": {"contract": "cmm-computer-use/browser"},
+                                 "downloads": {"verified": True}, "scroll_reveal": True},
             },
         )
     if operation == "permissions.status":

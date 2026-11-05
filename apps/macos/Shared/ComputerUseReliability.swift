@@ -142,3 +142,70 @@ public final class BridgeOperationLedger<Payload> {
 /// Random per helper process. A change between two answers means the helper
 /// restarted: contexts, streams and the ledger are gone.
 public func bridgeRandomInstanceID() -> String { bridgeRandomID(prefix: "ins") }
+
+// MARK: - Helper identity (audit X-09)
+
+/// The version and build `bridge.ping` reports for THIS helper, read from the
+/// bundle's Info.plist. A host uses them (and the `capabilities` beside them)
+/// to detect a helper that is older than the adapter it is paired with. Never
+/// echoes anything that is not a short printable string.
+public func bridgeHelperIdentity(info: [String: Any]?) -> (version: String, build: String) {
+    func clean(_ value: Any?) -> String {
+        guard let text = (value as? String)?.trimmingCharacters(in: .whitespaces),
+              !text.isEmpty, text.count <= 40,
+              !text.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) else { return "unknown" }
+        return text
+    }
+    return (clean(info?["CFBundleShortVersionString"]), clean(info?["CFBundleVersion"]))
+}
+
+// MARK: - Bounded reads (audit X-03)
+
+/// The accessibility messaging timeout of the whole helper process, in
+/// seconds, set ONCE at start. It used to be set to 100 ms by the interference
+/// sampler (`AXUIElementSetMessagingTimeout` on the system-wide element is
+/// process-wide), which truncated trees, emptied titles and made a press that
+/// had run look failed. 2 s bounds a hung application well under the 6 s
+/// system default without cutting a slow but healthy one.
+public let bridgeAXMessagingTimeoutSeconds: Double = 2.0
+
+/// Runs a read that may hang on another process and bounds how long the caller
+/// waits, WITHOUT lowering any process-wide timeout. A read that does not
+/// finish in time yields the last value that did (or `fallback`); while it is
+/// still running no second one is started, so a hung application costs one
+/// parked thread, not a pile of them.
+public final class BridgeBoundedReader<Value: Sendable>: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let lock = NSLock()
+    private var inFlight = false
+    private var last: Value
+
+    public init(label: String, fallback: Value) {
+        queue = DispatchQueue(label: label)
+        last = fallback
+    }
+
+    public func read(timeout: TimeInterval, _ work: @escaping @Sendable () -> Value) -> Value {
+        lock.lock()
+        if inFlight {
+            let value = last
+            lock.unlock()
+            return value
+        }
+        inFlight = true
+        lock.unlock()
+        let done = DispatchSemaphore(value: 0)
+        queue.async { [self] in
+            let value = work()
+            lock.lock()
+            last = value
+            inFlight = false
+            lock.unlock()
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + timeout)
+        lock.lock()
+        defer { lock.unlock() }
+        return last
+    }
+}

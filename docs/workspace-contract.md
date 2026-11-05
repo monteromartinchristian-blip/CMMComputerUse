@@ -42,7 +42,9 @@ A context is ONE application (and the window/document observed in it):
 
 - `context_id`: `ctx_` + 32 hex (128 random bits, `SecRandomCopyBytes`).
 - `label`: `A`, `B` (explicit) or `default` (the 0.3.2 context).
-- its own generation (`snapshot`), observation clock (30 s in
+- its own current generation (`snapshot`) — numbered from ONE workspace-wide
+  counter, so a snapshot number names exactly one context and an action that
+  cites another context's number (or none) is refused — observation clock (30 s in
   `background`/`focus`), released generations and element handles;
 - identity: bundle, pid, app name, window id (when unique), window title,
   document identity (below);

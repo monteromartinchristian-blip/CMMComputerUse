@@ -558,6 +558,16 @@ public final class BridgeDownloadMonitor {
 
     private func updateFinal(id: Int, entry: BridgeDirectoryEntry, now: Double) {
         guard var artifact = artifacts[id] else { return }
+        // Audit M-02: once the file was seen COMPLETE, another file in its
+        // name is not the same download. It is never adopted again (that made a
+        // stranger's file "complete" and "verified" one second later).
+        if artifact.state == .failed, artifact.reason == "file_replaced" { return }
+        if artifact.state == .complete, let known = artifact.finalInode, known != entry.inode {
+            artifact.state = .failed
+            artifact.reason = "file_replaced"
+            artifacts[id] = artifact
+            return
+        }
         if artifact.finalSize != entry.size || artifact.finalModified != entry.modified
             || artifact.finalInode != entry.inode {
             artifact.finalSize = entry.size
@@ -602,18 +612,23 @@ public final class BridgeDownloadMonitor {
         for artifact in free {
             let open = order.compactMap { expectations[$0] }
                 .filter { $0.root == root && $0.artifact == nil && $0.afterFold < artifact.firstFold }
+            // Audit M-01: with open expectations of SEVERAL clients on this
+            // folder, a file nobody named is nobody's (age is no evidence of
+            // whose it is): only a name hint can attribute it. One client's
+            // expectations keep the old rules.
+            let ambiguousAcrossClients = Set(open.map { $0.principal }).count > 1
             let hinted = open.first { hint in
                 guard let name = hint.nameHint else { return false }
                 return artifact.finalName.map { bridgeNameMatchesHint($0, hint: name) } ?? false
             }
             // Without a final name yet, an artifact waits for one only when
             // several expectations are open and all of them are hinted.
-            let unhinted = open.first { $0.nameHint == nil }
+            let unhinted = ambiguousAcrossClients ? nil : open.first { $0.nameHint == nil }
             // A NAMED artifact that matches no hint is never handed to a
             // hinted expectation while another one is open: that is how two
             // simultaneous downloads were swapped in the live lane. With one
             // open expectation it is that expectation's (a renamed download).
-            let pick = hinted ?? unhinted ?? (open.count == 1 ? open.first : nil)
+            let pick = hinted ?? unhinted ?? (open.count == 1 && !ambiguousAcrossClients ? open.first : nil)
             guard let pick else { continue }
             expectations[pick.id]?.artifact = artifact.id
         }

@@ -301,4 +301,60 @@ final class BrowserTests: XCTestCase {
         XCTAssertFalse(resolution("focused", "x").uncertain)
         XCTAssertTrue(resolution("requested_missing", "").uncertain)
     }
+
+    // MARK: a lost bound window is never replaced by whatever has focus (audit X-10)
+
+    /// Two contexts on two windows of one browser must never swap. When a
+    /// context's own window cannot be found, falling back to the focused window
+    /// silently made the context observe the OTHER context's window.
+    func testALostBoundWindowIsRefusedWhenTheApplicationHasSeveralWindows() {
+        XCTAssertEqual(bridgeBoundWindowOutcome(boundRequested: true, found: false, openWindows: 2), .refuse)
+        XCTAssertEqual(bridgeBoundWindowOutcome(boundRequested: true, found: false, openWindows: 5), .refuse)
+    }
+
+    func testWithASingleWindowThereIsNothingToSwapSoItIsUsedAndSaid() {
+        XCTAssertEqual(bridgeBoundWindowOutcome(boundRequested: true, found: false, openWindows: 1), .replacedBySingleWindow)
+    }
+
+    func testAFoundBoundWindowOrNoBindingChangesNothing() {
+        XCTAssertEqual(bridgeBoundWindowOutcome(boundRequested: true, found: true, openWindows: 3), .bound)
+        XCTAssertEqual(bridgeBoundWindowOutcome(boundRequested: false, found: false, openWindows: 3), .bound,
+                       "no binding (the 0.3.2 default context follows focus): not this rule's business")
+    }
+
+    func testNoWindowAtAllIsARefusal() {
+        XCTAssertEqual(bridgeBoundWindowOutcome(boundRequested: true, found: false, openWindows: 0), .refuse)
+    }
+
+    // MARK: several processes with one bundle id (audit M-13 / E-07)
+
+    private func proc(_ pid: Int32, _ bundle: String = "com.google.Chrome") -> BridgeProcessCandidate {
+        BridgeProcessCandidate(pid: pid, bundleID: bundle)
+    }
+
+    /// Chrome (the person's) and a test Chrome share a bundle id. A context
+    /// bound to the second one must keep observing THAT process, not the first
+    /// one the name lookup happens to return.
+    func testAContextBoundToAProcessKeepsThatProcess() {
+        let chosen = bridgePreferBoundProcess(
+            resolved: proc(100), bound: proc(200), alive: [proc(100), proc(200)])
+        XCTAssertEqual(chosen?.pid, 200)
+    }
+
+    func testTheResolvedProcessIsKeptWhenItIsTheBoundOneOrNothingIsBound() {
+        XCTAssertEqual(bridgePreferBoundProcess(resolved: proc(100), bound: proc(100), alive: [proc(100)])?.pid, 100)
+        XCTAssertEqual(bridgePreferBoundProcess(resolved: proc(100), bound: nil, alive: [proc(100), proc(200)])?.pid, 100)
+    }
+
+    /// A bound process that is gone is NOT replaced by another instance of the
+    /// bundle: that would silently move the context to somebody else's browser.
+    func testABoundProcessThatIsGoneIsNeverReplacedByAnotherInstance() {
+        XCTAssertNil(bridgePreferBoundProcess(resolved: proc(100), bound: proc(200), alive: [proc(100)]))
+    }
+
+    func testAProcessOfAnotherBundleIsNeverPreferred() {
+        XCTAssertNil(bridgePreferBoundProcess(resolved: proc(100), bound: proc(200, "com.apple.Safari"),
+                                              alive: [proc(100), proc(200, "com.apple.Safari")]),
+                     "the bound process belongs to a different application than the one asked for")
+    }
 }

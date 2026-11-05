@@ -6,6 +6,13 @@ The full project changelog, including the macOS helper, lives in the repository.
 
 ## Unreleased
 
+- Version 0.3.3 (package and adapter agree). `HELPER_TOO_OLD` refusals when the
+  helper lacks a capability; `computer_use_status` shows adapter and helper
+  versions and features. Tool budget of 55 s under DSH's 70 s cut; waits capped
+  at 45 s and never resent. `computer_use_observe` takes `window_id`. The PiP
+  streamer grants CORS only to `dsh-app:` origins and checks `Host`. See the
+  repository changelog for the helper-side fixes of the 2026-11-05 audit.
+
 - F-09 browser and downloads: `computer_use_browser_state`, `_browser_wait`,
   `_browser_select_tab`, `_download`, `_download_expect`, `_download_status`,
   `_save_dialog`. The PiP mirror keeps its stream across tab switches and

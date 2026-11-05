@@ -97,7 +97,7 @@ final class WorkspaceContextTests: XCTestCase {
         let genA = observe(ws, a.id, safari, [1: "safari-button"])
         let genB = observe(ws, b.id, notes, [1: "notes-button"])
         XCTAssertEqual(genA, 1)
-        XCTAssertEqual(genB, 1, "generations are per context, not process-wide")
+        XCTAssertNotEqual(genB, genA, "a snapshot number names ONE context (audit X-04)")
         // Observing B again moves only B.
         observe(ws, b.id, notes, [1: "notes-button-2"])
         guard case .success(let resolvedA) = ws.resolveHandle(
@@ -419,6 +419,65 @@ final class WorkspaceContextTests: XCTestCase {
             principal: dsh, id: nil, snapshot: nil, elementID: 3, mode: .background, now: 101)
         else { return XCTFail() }
         XCTAssertTrue(strict.detail.contains("requirement=snapshot"), strict.detail)
+    }
+
+    /// Audit X-04 (regression of 0.3.3): with per-context numbering, context A
+    /// and context B both had "snapshot 1, element 1"; an action that named
+    /// the wrong context (or none) ran on the OTHER application. A snapshot
+    /// number now identifies one context, so the mix-up is refused.
+    func testASnapshotFromOneContextIsRefusedInAnother() {
+        let ws = workspace()
+        let a = create(ws, dsh)
+        let b = create(ws, dsh)
+        let genA = observe(ws, a.id, safari, [1: "safari-button"])
+        let genB = observe(ws, b.id, notes, [1: "notes-button"])
+        guard case .failure(let wrong) = ws.resolveHandle(
+            principal: dsh, id: b.id, snapshot: genA, elementID: 1, mode: .background, now: 101)
+        else { return XCTFail("A's snapshot must not resolve in B") }
+        XCTAssertTrue(wrong.detail.contains("stale_snapshot") || wrong.detail.contains("superseded"), wrong.detail)
+        let legacy = ws.legacyContext(principal: dsh, now: 100)
+        let genL = observe(ws, legacy.id, notes, [1: "legacy-button"])
+        XCTAssertNotEqual(genL, genA)
+        guard case .failure = ws.resolveHandle(
+            principal: dsh, id: nil, snapshot: genA, elementID: 1, mode: .background, now: 101)
+        else { return XCTFail("A's snapshot must not resolve in the default context") }
+        guard case .success(let right) = ws.resolveHandle(
+            principal: dsh, id: b.id, snapshot: genB, elementID: 1, mode: .background, now: 101)
+        else { return XCTFail() }
+        XCTAssertEqual(right.handle, "notes-button")
+    }
+
+    /// What `release` / USER_TAKEOVER REPORT as the new current snapshot is the
+    /// number the context really holds (the model cites it next).
+    func testRetirementReportsTheGenerationTheContextReallyHolds() {
+        let ws = workspace()
+        let a = create(ws, dsh)
+        let b = create(ws, dsh)
+        let genA = observe(ws, a.id, safari, [1: "a"])
+        _ = observe(ws, b.id, notes, [1: "b"])
+        _ = observe(ws, b.id, notes, [1: "b2"])
+        let retired = ws.invalidate(id: a.id, reason: "release", now: 101)!
+        XCTAssertEqual(retired.retired, genA)
+        guard case .failure(let refusal) = ws.resolveHandle(
+            principal: dsh, id: a.id, snapshot: genA, elementID: 1, mode: .background, now: 102)
+        else { return XCTFail() }
+        XCTAssertTrue(refusal.detail.contains("current=\(retired.generation)"), refusal.detail)
+        XCTAssertGreaterThan(retired.generation, genA + 1, "other contexts moved the shared counter")
+    }
+
+    /// Audit M-03 / E-01: waiting on a long download kept nothing alive, so the
+    /// context expired under it and the expectation vanished (DOWNLOAD_UNKNOWN,
+    /// and the risk of pressing Download again). A read of the download touches
+    /// the context that owns it.
+    func testTouchingAContextKeepsItAliveAndOnlyForItsOwner() {
+        let ws = workspace()
+        let a = create(ws, dsh)
+        XCTAssertTrue(ws.touch(principal: dsh, id: a.id, now: 1700))
+        XCTAssertTrue(ws.reap(now: 3400).isEmpty, "idle since 1700, not since 0")
+        XCTAssertFalse(ws.touch(principal: BridgePrincipal(key: "client:other", strength: .verifiedClient), id: a.id, now: 3500),
+                       "another client cannot keep it alive")
+        XCTAssertFalse(ws.touch(principal: dsh, id: "ctx_" + String(repeating: "f", count: 32), now: 3500))
+        XCTAssertEqual(ws.reap(now: 5300).count, 1, "and without further use it still expires")
     }
 
     func testLegacyReleaseKeepsTheReleasedReason() {

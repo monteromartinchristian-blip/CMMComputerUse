@@ -79,6 +79,16 @@ public struct BridgeAppGrant: Equatable, Sendable {
     /// unknown" rule the rest of the bridge uses. Never a prefix or fuzzy match:
     /// a policy that matched by prefix would authorize the wrong app.
     public func matches(bundleID candidateBundle: String, name candidateName: String) -> Bool {
+        // A RUNNING application is identified by its real bundle id and its
+        // display name, which are different strings; a raw request ("Safari")
+        // is passed as both. For a running application a grant that declares a
+        // bundle id is satisfied by that bundle id ONLY (audit M-05 / A-04): an
+        // impostor with another bundle id and the same visible name used to
+        // find the grant by name.
+        let runningApplication = !candidateBundle.isEmpty && candidateBundle != candidateName
+        if runningApplication, !bundleID.isEmpty {
+            return bundleID.caseInsensitiveCompare(candidateBundle) == .orderedSame
+        }
         if !bundleID.isEmpty,
            bundleID.caseInsensitiveCompare(candidateBundle) == .orderedSame {
             return true

@@ -199,6 +199,51 @@ private let streamRegistryLock = NSLock()
 nonisolated(unsafe) private var streamRegistry = BridgeStreamRegistry<WindowStreamResource>()
 /// Earliest time each stream may attempt its next recovery (backoff).
 nonisolated(unsafe) private var recoveryNotBefore: [String: Double] = [:]
+/// When each stream's window title was last judged again (audit X-05).
+nonisolated(unsafe) private var titleCheckedAt: [String: Double] = [:]
+private let titleCheckLock = NSLock()
+
+/// The window's CURRENT title, by its window id: a cheap window-server query
+/// (no accessibility call, no capture). `nil` when the window is gone.
+func currentWindowTitle(windowID: Int) -> String? {
+    guard let infos = CGWindowListCopyWindowInfo([.optionIncludingWindow], CGWindowID(windowID))
+            as? [[String: Any]],
+          let info = infos.first(where: { ($0[kCGWindowNumber as String] as? Int) == windowID })
+    else { return nil }
+    return (info[kCGWindowName as String] as? String) ?? ""
+}
+
+/// The grant for the principal's client, read the way the frame path already
+/// reads it: from the policy under its own lock, never from the request lock.
+private func policyAndClient(for principal: BridgePrincipal) -> (BridgeAuthorizationPolicy, BridgeClientGrant?) {
+    authorizationLock.lock()
+    let policy = authorization
+    authorizationLock.unlock()
+    return (policy, policy.clients.first { "client:" + $0.clientID == principal.key })
+}
+
+/// Judge the window's current title again (rate limited per stream). A stream
+/// whose window no longer carries a covered title is stopped; the identity is
+/// kept current otherwise. Returns false when the stream was revoked.
+func recheckStreamAuthorization(_ entry: BridgeStreamEntry<WindowStreamResource>, now: Double) -> Bool {
+    titleCheckLock.lock()
+    let due = bridgeStreamRecheckDue(lastCheckedAt: titleCheckedAt[entry.id], now: now)
+    if due { titleCheckedAt[entry.id] = now }
+    titleCheckLock.unlock()
+    guard due else { return true }
+    let (policy, client) = policyAndClient(for: entry.principal)
+    let verdict = bridgeStreamRecheck(
+        policy: policy, client: client, identity: entry.identity,
+        currentTitle: currentWindowTitle(windowID: entry.identity.windowID))
+    if verdict.refusal != nil {
+        stopWindowStreamInternal(id: entry.id, reason: "authorization_revoked")
+        return false
+    }
+    if verdict.identity != entry.identity {
+        withRegistry { $0.updateIdentity(id: entry.id, identity: verdict.identity) }
+    }
+    return true
+}
 
 private func withRegistry<T>(_ body: (BridgeStreamRegistry<WindowStreamResource>) -> T) -> T {
     streamRegistryLock.lock()
@@ -258,6 +303,13 @@ private func selectAndOpen(
 ) -> WindowStreamStartBox {
     let box = WindowStreamStartBox()
     let sema = DispatchSemaphore(value: 0)
+    // By value, under the request's lock (audit A-11), and the selection runs
+    // only among the windows this caller may observe (audit X-06).
+    let policy = authorization
+    let mayObserve: @Sendable (BridgeWindowCandidate) -> Bool = {
+        policy.decision(bundleID: $0.bundleID, name: $0.app, windowTitle: $0.title,
+                        scope: .observe, client: client).isAllowed
+    }
     Task {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(
@@ -279,11 +331,11 @@ private func selectAndOpen(
             }
             let selection: BridgeWindowSelection
             if let windowID {
-                selection = bridgeResolveWindowById(
-                    windowID: windowID, app: app, candidates: pairs.map { $0.0 })
+                selection = bridgeResolveAuthorizedWindowById(
+                    windowID: windowID, app: app, candidates: pairs.map { $0.0 }, isAuthorized: mayObserve)
             } else {
-                selection = bridgeSelectWindow(
-                    request: title, app: app, candidates: pairs.map { $0.0 })
+                selection = bridgeSelectAuthorizedWindow(
+                    request: title, app: app, candidates: pairs.map { $0.0 }, isAuthorized: mayObserve)
             }
             switch selection {
             case .notFound:
@@ -299,7 +351,7 @@ private func selectAndOpen(
                 // observation grant must cover the window's OWNER and title,
                 // for THIS client (0.3.2 omitted the client here, so a
                 // client-required policy refused every stream).
-                if let refusal = authorization.decision(
+                if let refusal = policy.decision(
                     bundleID: pair.0.bundleID, name: pair.0.app,
                     windowTitle: pair.0.title, scope: .observe, client: client
                 ).refusal {
@@ -491,6 +543,9 @@ func stopWindowStreamInternal(id: String, reason: String) {
     let entry = withRegistry { $0.remove(id: id, now: Date().timeIntervalSince1970) }
     stopCapture(entry?.resource)
     recoveryNotBefore.removeValue(forKey: id)
+    titleCheckLock.lock()
+    titleCheckedAt.removeValue(forKey: id)
+    titleCheckLock.unlock()
     if entry != nil { log("WINDOW_STREAM_STOPPED id=\(id) reason=\(reason)") }
 }
 
@@ -507,6 +562,9 @@ func windowStreamFrame(principal: BridgePrincipal, id: String?) -> (frame: Windo
         return registry.legacyStream(principal: principal)
     }
     guard let entry = found else { return (nil, id == nil ? "stream_not_active" : "stream_unknown") }
+    // A stream is a capture that keeps happening: the window's current title is
+    // judged again, so a tab switch to a window nobody granted ends the frames.
+    guard recheckStreamAuthorization(entry, now: now) else { return (nil, "stream_authorization_revoked") }
     let health = withRegistry { $0.health(entry, now: now) }
     guard let snapshot = entry.resource?.sink.latestFrame() else {
         return (nil, health.phase == .warming ? "stream_warming" : "stream_\(health.phase.rawValue)")
@@ -606,10 +664,12 @@ func recoverWindowStream(id: String) -> Result<[String: Any], BridgePolicyRefusa
 func revalidateWindowStreams(clientFor: (BridgePrincipal) -> BridgeClientGrant?) {
     let entries = withRegistry { $0.all }
     for entry in entries {
-        let decision = authorization.decision(
-            bundleID: entry.identity.bundleID, name: entry.identity.appName,
-            windowTitle: entry.identity.windowTitle, scope: .observe, client: clientFor(entry.principal))
-        if decision.refusal != nil {
+        // The window's CURRENT title when it can be read (audit X-05), else the
+        // last one known: never the title the stream started with by default.
+        let verdict = bridgeStreamRecheck(
+            policy: authorization, client: clientFor(entry.principal), identity: entry.identity,
+            currentTitle: currentWindowTitle(windowID: entry.identity.windowID) ?? entry.identity.windowTitle)
+        if verdict.refusal != nil {
             stopWindowStreamInternal(id: entry.id, reason: "authorization_revoked")
         }
     }

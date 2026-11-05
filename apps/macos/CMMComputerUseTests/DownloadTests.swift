@@ -772,4 +772,80 @@ final class DownloadTests: XCTestCase {
         wait(for: [done], timeout: 2)
         XCTAssertNil(result.pointee)
     }
+
+    // MARK: a finished file replaced by another file (audit M-02 / E-02)
+
+    /// A1 re-checked the file at every read, but a REGULAR file with another
+    /// inode put in the same name was adopted again by the scan and became
+    /// `complete` one second later, "verified" with the stranger's size.
+    func testAFinishedDownloadWhoseFileIsReplacedByAnotherFileIsNotCompleteAgain() {
+        let m = monitor()
+        let id = expect(m, [], hint: "f.bin", at: 0)
+        let first = [file("f.bin", 10, inode: 950, at: 1)]
+        _ = state(m, id, first, at: 1)
+        XCTAssertEqual(state(m, id, first, at: 2.5).state, .complete)
+        let stranger = [file("f.bin", 77, inode: 999, at: 3)]
+        let after = state(m, id, stranger, at: 3)
+        XCTAssertEqual(after.state, .failed)
+        XCTAssertEqual(after.reason, "file_replaced")
+        XCTAssertEqual(state(m, id, stranger, at: 10).state, .failed, "terminal: it is never re-adopted")
+        XCTAssertEqual(state(m, id, stranger, at: 10).reason, "file_replaced")
+        XCTAssertNil(state(m, id, stranger, at: 10).dictionary["path"], "no path for a file that is not the download")
+    }
+
+    func testTheSameFileTouchedAgainIsStillComplete() {
+        let m = monitor()
+        let id = expect(m, [], hint: "f.bin", at: 0)
+        let same = [file("f.bin", 10, inode: 950, at: 1)]
+        _ = state(m, id, same, at: 1)
+        XCTAssertEqual(state(m, id, same, at: 2.5).state, .complete)
+        XCTAssertEqual(state(m, id, same, at: 30).state, .complete)
+    }
+
+    // MARK: two clients on one folder never take each other's file (audit M-01 / A-03)
+
+    private func expectation(_ m: BridgeDownloadMonitor, _ principal: BridgePrincipal, hint: String?, at now: Double) -> String {
+        guard case .success(let id) = m.expect(principal: principal, contextID: "ctx", bundleID: "com.apple.Safari",
+                                               root: root, entries: [], opID: nil, nameHint: hint, now: now)
+        else { XCTFail(); return "" }
+        return id
+    }
+
+    /// Both clients wait for a download in the same folder, neither names the
+    /// file. A file appears: it is nobody's by default. The oldest expectation
+    /// used to get it (name, path, size and, on request, the hash of a file
+    /// that belongs to the other client or to the person).
+    func testAnArtifactIsNotGivenToOneOfSeveralClientsByAge() {
+        let m = BridgeDownloadMonitor(timings: timings)
+        let a = expectation(m, dsh, hint: nil, at: 0)
+        let b = expectation(m, other, hint: nil, at: 0.1)
+        let appeared = [file("contrato.pdf", 5000, inode: 800, at: 1)]
+        guard case .success(let sa) = m.status(principal: dsh, id: a, entries: appeared, now: 1),
+              case .success(let sb) = m.status(principal: other, id: b, entries: nil, now: 1) else { return XCTFail() }
+        XCTAssertEqual(sa.state, .notStarted)
+        XCTAssertEqual(sb.state, .notStarted)
+        XCTAssertNil(sa.fileName)
+        XCTAssertNil(sb.fileName)
+    }
+
+    func testEachClientStillGetsItsOwnNamedDownload() {
+        let m = BridgeDownloadMonitor(timings: timings)
+        let a = expectation(m, dsh, hint: "a.csv", at: 0)
+        let b = expectation(m, other, hint: "b.csv", at: 0.1)
+        let appeared = [file("b.csv", 100, inode: 801, at: 1), file("a.csv", 100, inode: 802, at: 1)]
+        _ = m.status(principal: dsh, id: a, entries: appeared, now: 1)
+        guard case .success(let sa) = m.status(principal: dsh, id: a, entries: appeared, now: 2.5),
+              case .success(let sb) = m.status(principal: other, id: b, entries: appeared, now: 2.5) else { return XCTFail() }
+        XCTAssertEqual(sa.fileName, "a.csv")
+        XCTAssertEqual(sb.fileName, "b.csv")
+    }
+
+    func testOneClientWithSeveralOpenExpectationsKeepsTheOldRules() {
+        let m = BridgeDownloadMonitor(timings: timings)
+        let first = expectation(m, dsh, hint: nil, at: 0)
+        _ = expectation(m, dsh, hint: nil, at: 0.1)
+        guard case .success(let s) = m.status(principal: dsh, id: first, entries: [file("x.bin", 9, inode: 803, at: 1)], now: 1)
+        else { return XCTFail() }
+        XCTAssertEqual(s.fileName, "x.bin", "a single client's oldest open expectation still takes it")
+    }
 }

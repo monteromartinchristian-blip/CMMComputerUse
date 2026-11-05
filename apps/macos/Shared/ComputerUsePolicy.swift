@@ -1435,6 +1435,29 @@ public func bridgeSelectWindow(
     return .ambiguous(matches: Array(labels.prefix(6)))
 }
 
+/// Audit X-06. Select a window only among the windows the caller may observe.
+///
+/// `isAuthorized` is the OBSERVE decision for that window's owner and title,
+/// for that caller. The unauthorized windows never take part: they cannot be
+/// selected, they never appear in an ambiguity list, and a window that is not
+/// authorized answers exactly like one that does not exist. Selecting first
+/// and authorizing afterwards let any process enumerate every window title on
+/// the screen through the helper's Screen Recording permission.
+public func bridgeSelectAuthorizedWindow(
+    request: String, app: String?, candidates: [BridgeWindowCandidate],
+    isAuthorized: (BridgeWindowCandidate) -> Bool
+) -> BridgeWindowSelection {
+    bridgeSelectWindow(request: request, app: app, candidates: candidates.filter(isAuthorized))
+}
+
+/// `bridgeResolveWindowById` over the authorized windows only (audit X-06).
+public func bridgeResolveAuthorizedWindowById(
+    windowID: Int, app: String?, candidates: [BridgeWindowCandidate],
+    isAuthorized: (BridgeWindowCandidate) -> Bool
+) -> BridgeWindowSelection {
+    bridgeResolveWindowById(windowID: windowID, app: app, candidates: candidates.filter(isAuthorized))
+}
+
 /// Select one window by the identity the bridge itself published
 /// (`view_identity.window_id`).
 ///

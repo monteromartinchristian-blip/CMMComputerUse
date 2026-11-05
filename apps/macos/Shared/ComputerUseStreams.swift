@@ -369,3 +369,35 @@ public final class BridgeStreamRegistry<Resource> {
         streams[id] = entry
     }
 }
+
+// MARK: - Re-judging a stream on the window's current title (audit X-05)
+
+/// A stream is a capture that keeps happening, and a window grant is decided
+/// on the window's TITLE, which follows the active tab and the open document.
+/// A stream authorized while the window was titled "CMM – Docs" kept sending
+/// frames after a tab switch to a window nobody had granted. The decision is
+/// taken again on the CURRENT title.
+///
+/// Returns the refusal when the grant no longer covers the window, and the
+/// identity carrying the current title (so `view_identity` is never stale).
+/// `currentTitle == nil` (the window is gone or unreadable) invents no verdict:
+/// the stream's own health reports a missing window.
+public func bridgeStreamRecheck(
+    policy: BridgeAuthorizationPolicy, client: BridgeClientGrant?, identity: BridgeStreamIdentity,
+    currentTitle: String?
+) -> (refusal: BridgePolicyRefusal?, identity: BridgeStreamIdentity) {
+    guard let currentTitle else { return (nil, identity) }
+    let current = BridgeStreamIdentity(
+        bundleID: identity.bundleID, pid: identity.pid, windowID: identity.windowID,
+        windowTitle: currentTitle, appName: identity.appName)
+    let refusal = policy.decision(
+        bundleID: identity.bundleID, name: identity.appName, windowTitle: currentTitle,
+        scope: .observe, client: client).refusal
+    return (refusal, current)
+}
+
+/// The title is read at most twice a second per stream: frames come at 15 fps.
+public func bridgeStreamRecheckDue(lastCheckedAt: Double?, now: Double, interval: Double = 0.5) -> Bool {
+    guard let lastCheckedAt else { return true }
+    return now - lastCheckedAt >= interval
+}

@@ -11,7 +11,7 @@ CMM Computer Use.app  ── serves ──▶  ~/.cmm/computer-bridge/bridge.soc
 
 ## 1. The helper
 
-### From source (the supported path for 0.1.0)
+### From source (the supported path)
 
 ```bash
 git clone https://github.com/monteromartinchristian-blip/CMMComputerUse.git
@@ -83,7 +83,7 @@ dsh plugin --profile <profile> add @cmm/dsh-computer-use
 
 ```bash
 npm pack @cmm/dsh-computer-use           # or: npm pack ./packages/dsh-computer-use
-dsh plugin --profile <profile> add "$PWD/cmm-dsh-computer-use-0.1.0.tgz"
+dsh plugin --profile <profile> add "$PWD/cmm-dsh-computer-use-0.3.3.tgz"
 ```
 
 ### From a checkout

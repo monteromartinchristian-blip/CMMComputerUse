@@ -97,4 +97,66 @@ final class ReliabilityTests: XCTestCase {
                                             params: ["element_id": 1, "text": "secret value"])
         XCTAssertFalse(typed.contains("secret"))
     }
+
+    // MARK: helper identity in bridge.ping (audit X-09)
+
+    func testThePingNamesTheVersionAndBuildOfThisHelper() {
+        let id = bridgeHelperIdentity(info: ["CFBundleShortVersionString": "0.3.3", "CFBundleVersion": "6"])
+        XCTAssertEqual(id.version, "0.3.3")
+        XCTAssertEqual(id.build, "6")
+    }
+
+    func testAnUnreadableOrHostileVersionIsUnknownNotEchoed() {
+        XCTAssertEqual(bridgeHelperIdentity(info: nil).version, "unknown")
+        XCTAssertEqual(bridgeHelperIdentity(info: [:]).build, "unknown")
+        XCTAssertEqual(bridgeHelperIdentity(info: ["CFBundleShortVersionString": String(repeating: "9", count: 80)]).version, "unknown")
+        XCTAssertEqual(bridgeHelperIdentity(info: ["CFBundleShortVersionString": "0.3\n3"]).version, "unknown")
+        XCTAssertEqual(bridgeHelperIdentity(info: ["CFBundleVersion": 7]).build, "unknown", "not a string")
+        XCTAssertEqual(bridgeHelperIdentity(info: ["CFBundleVersion": "  6 "]).build, "6")
+    }
+
+    // MARK: bounded reads without a process-wide timeout (audit X-03)
+
+    func testAFastReadReturnsItsFreshValue() {
+        let reader = BridgeBoundedReader<String>(label: "t.fast", fallback: "none")
+        XCTAssertEqual(reader.read(timeout: 1) { "fresh" }, "fresh")
+    }
+
+    /// The sampler used to bound a hung app by lowering the timeout of the WHOLE
+    /// process to 100 ms, which truncated every other accessibility read. The
+    /// bound now lives in the reader: a slow read yields the last value and
+    /// never makes anything else wait.
+    func testASlowReadYieldsTheLastValueAtOnceAndIsNotStackedWhileItIsStillRunning() {
+        let reader = BridgeBoundedReader<String>(label: "t.slow", fallback: "none")
+        XCTAssertEqual(reader.read(timeout: 1) { "first" }, "first")
+        let started = Date()
+        final class Counter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = 0
+            func bump() { lock.lock(); value += 1; lock.unlock() }
+            var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+        }
+        let calls = Counter()
+        let slow: @Sendable () -> String = {
+            calls.bump()
+            Thread.sleep(forTimeInterval: 0.6)
+            return "late"
+        }
+        XCTAssertEqual(reader.read(timeout: 0.05, slow), "first", "did not wait for the slow read")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.4)
+        XCTAssertEqual(reader.read(timeout: 0.05, slow), "first", "still in flight: no second read is started")
+        XCTAssertEqual(calls.count, 1, "one slow read at a time")
+        Thread.sleep(forTimeInterval: 0.8)
+        XCTAssertEqual(reader.read(timeout: 1) { "after" }, "after", "free again once the slow read ended")
+    }
+
+    func testTheFallbackIsTheAnswerBeforeAnyReadEverFinished() {
+        let reader = BridgeBoundedReader<String>(label: "t.fallback", fallback: "none")
+        XCTAssertEqual(reader.read(timeout: 0.02) { Thread.sleep(forTimeInterval: 0.3); return "x" }, "none")
+    }
+
+    func testTheProcessWideTimeoutIsASaneConstant() {
+        XCTAssertGreaterThanOrEqual(bridgeAXMessagingTimeoutSeconds, 1.0, "100 ms truncated real trees")
+        XCTAssertLessThanOrEqual(bridgeAXMessagingTimeoutSeconds, 6.0, "never longer than the system default")
+    }
 }

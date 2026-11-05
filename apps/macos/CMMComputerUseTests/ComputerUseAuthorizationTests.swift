@@ -334,4 +334,41 @@ final class ComputerUseAuthorizationTests: XCTestCase {
             bridgeAuthorizedCaptureDecision(
                 mode: .background, hasWindowTarget: true, authorizationLoaded: true), .allowed)
     }
+
+    // MARK: a grant that names a bundle id is not satisfied by a display name (audit M-05 / A-04)
+
+    private func safariPolicy() -> BridgeAuthorizationPolicy {
+        let text = #"{"version":1,"mode":"background","apps":[{"bundle_id":"com.apple.Safari","name":"Safari","scopes":["observe","control"]}]}"#
+        return BridgeAuthorizationPolicy.parse(Data(text.utf8), source: "t")!
+    }
+
+    /// A running application is identified by its REAL bundle id and its display
+    /// name (different strings). An impostor with another bundle id and the name
+    /// "Safari" found the grant by name and could be observed and controlled.
+    func testARunningApplicationWithAnotherBundleIdIsNotTheGrantedOne() {
+        let policy = safariPolicy()
+        XCTAssertNil(policy.grant(bundleID: "com.evil.fake", name: "Safari"))
+        XCTAssertNotNil(policy.decision(bundleID: "com.evil.fake", name: "Safari", windowTitle: nil, scope: .control).refusal)
+        XCTAssertNotNil(policy.grant(bundleID: "com.apple.Safari", name: "Safari"))
+        XCTAssertNotNil(policy.grant(bundleID: "com.apple.Safari", name: "Safari (renamed)"),
+                        "the bundle id decides; a localized name change does not lose the grant")
+        XCTAssertNil(policy.decision(bundleID: "com.apple.Safari", name: "Safari", windowTitle: nil, scope: .control).refusal)
+    }
+
+    /// A raw request ("Safari", as `window.focus` or `apps.list` receive it) is
+    /// the same text as bundle and as name: the display-name lookup still works.
+    func testANameRequestStillFindsTheGrant() {
+        let policy = safariPolicy()
+        XCTAssertNotNil(policy.grant(bundleID: "Safari", name: "Safari"))
+        XCTAssertNotNil(policy.grant(bundleID: "com.apple.Safari", name: "com.apple.Safari"))
+        XCTAssertNotNil(policy.grant(bundleID: "", name: "Safari"), "no bundle known: by name, as before")
+        XCTAssertNil(policy.grant(bundleID: "Notes", name: "Notes"))
+    }
+
+    func testAGrantWithoutABundleIdMatchesByNameAsBefore() {
+        let text = #"{"version":1,"mode":"background","apps":[{"name":"Terminal","scopes":["observe"]}]}"#
+        let policy = BridgeAuthorizationPolicy.parse(Data(text.utf8), source: "t")!
+        XCTAssertNotNil(policy.grant(bundleID: "com.apple.Terminal", name: "Terminal"))
+        XCTAssertNil(policy.grant(bundleID: "com.apple.Terminal", name: "Other"))
+    }
 }
