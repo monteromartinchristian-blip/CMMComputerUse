@@ -2108,6 +2108,89 @@ func scrollProbeDictionary(_ probe: BridgeScrollProbe) -> [String: Any] {
     return d
 }
 
+func revealRect(_ element: AXUIElement) -> BridgeRevealRect? {
+    guard let frame = axFrame(element), frame.width > 0, frame.height > 0 else { return nil }
+    return BridgeRevealRect(minX: Double(frame.minX), minY: Double(frame.minY),
+                            maxX: Double(frame.maxX), maxY: Double(frame.maxY))
+}
+
+/// Descendants of `root` that advertise AXScrollToVisible, with their frames:
+/// the content `root` can bring into view (D5). The content of a NESTED
+/// scroller (a box whose children overflow it, `bridgeOverflows`) belongs to
+/// that box, not to `root`: the box itself may be a target, its content never
+/// (revealing it would scroll the box instead of `root`). Bounded walk;
+/// scroll bars and zero-size nodes skipped.
+func revealCandidates(of root: AXUIElement, limit: Int = 2000) -> [(element: AXUIElement, frame: BridgeRevealRect)] {
+    var queue = (axAttr(root, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+    var found: [(element: AXUIElement, frame: BridgeRevealRect)] = []
+    var visited = 0
+    while !queue.isEmpty, visited < limit {
+        let node = queue.removeFirst()
+        visited += 1
+        let role = (axAttr(node, kAXRoleAttribute) as? String) ?? ""
+        if role == "AXScrollBar" { continue }
+        let frame = revealRect(node)
+        let children = (axAttr(node, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+        let nested = role != "AXWebArea" && frame.map { own in
+            bridgeOverflows(container: own, children: children.compactMap { revealRect($0) })
+        } ?? false
+        if !nested { queue += children }
+        guard let frame else { continue }
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(node, &names) == .success,
+              let actions = names as? [String], actions.contains("AXScrollToVisible") else { continue }
+        found.append((node, frame))
+    }
+    return found
+}
+
+/// The container that scrolls `element` when the element has no scroll
+/// primitive of its own: the nearest ancestor whose children overflow it (an
+/// inner box), or the document (the AXScrollArea holding the AXWebArea).
+func nearestScrollContainer(of element: AXUIElement) -> AXUIElement? {
+    var node = axElement(element, kAXParentAttribute)
+    for _ in 0..<40 {
+        guard let current = node else { return nil }
+        let role = (axAttr(current, kAXRoleAttribute) as? String) ?? ""
+        switch role {
+        case "AXWindow", "AXApplication":
+            return nil
+        case "AXScrollArea":
+            return current
+        case "AXWebArea":
+            if let parent = axElement(current, kAXParentAttribute),
+               (axAttr(parent, kAXRoleAttribute) as? String) == "AXScrollArea" { return parent }
+            return current
+        default:
+            if let own = revealRect(current) {
+                let children = (axAttr(current, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+                if bridgeOverflows(container: own, children: children.compactMap { revealRect($0) }) { return current }
+            }
+        }
+        node = axElement(current, kAXParentAttribute)
+    }
+    return nil
+}
+
+/// The visible part of a scrollable element: its frame, clipped to the
+/// document area that holds it and to its window.
+func revealViewport(of element: AXUIElement) -> BridgeRevealRect? {
+    guard var frame = axFrame(element) else { return nil }
+    var node = axElement(element, kAXParentAttribute)
+    for _ in 0..<40 {
+        guard let current = node else { break }
+        let role = (axAttr(current, kAXRoleAttribute) as? String) ?? ""
+        if role == "AXScrollArea" || role == "AXWindow", let bounds = axFrame(current) {
+            frame = frame.intersection(bounds)
+        }
+        if role == "AXWindow" { break }
+        node = axElement(current, kAXParentAttribute)
+    }
+    guard !frame.isNull, frame.height > 0, frame.width > 0 else { return nil }
+    return BridgeRevealRect(minX: Double(frame.minX), minY: Double(frame.minY),
+                            maxX: Double(frame.maxX), maxY: Double(frame.maxY))
+}
+
 /// Scroll one observed element with accessibility primitives only, and
 /// VERIFY it.
 ///
@@ -2120,10 +2203,19 @@ func scrollProbeDictionary(_ probe: BridgeScrollProbe) -> [String: Any] {
 ///      direction = done, the AX error kept as `ax_error`;
 ///   2. otherwise, if the element has a settable scroll bar, its AXValue,
 ///      measured again;
-///   3. no AX route at all -> `unsupported` (CAPABILITY_UNSUPPORTED);
-///      routes tried but no verifiable effect -> failure with the reason.
+///   3. otherwise (Firefox's document: no page action, no accessible scroll
+///      bar — acceptance finding D5), `AXScrollToVisible` on the descendant
+///      beyond the visible edge, chosen by `bridgeRevealNext` (nearest first,
+///      then by where this browser landed it, never more than one viewport
+///      per step so no content is skipped); the browser scrolls the document
+///      or inner container that holds it, and every step is measured on that
+///      descendant's own position;
+///   4. no AX route at all -> `unsupported` (CAPABILITY_UNSUPPORTED);
+///      routes tried but no verifiable effect -> failure with the reason;
+///      nothing beyond the edge -> `reason=no_content_beyond`.
 ///
-/// Never a scroll-wheel event, never a cursor move, never CGEvent.
+/// Never a scroll-wheel event, never a cursor move, never CGEvent, never
+/// focus or activation.
 func uiScroll(_ params: [String: Any]) -> [String: Any] {
     guard let (_, el) = resolveElement(params: params) else {
         return ["ok": false, "message": "The referenced UI element is no longer on screen."]
@@ -2142,9 +2234,29 @@ func uiScroll(_ params: [String: Any]) -> [String: Any] {
     let bar = axElement(el, direction.isVertical
         ? kAXVerticalScrollBarAttribute : kAXHorizontalScrollBarAttribute)
     let barSettable = scrollBarSettable(bar)
-    let plan = bridgeScrollPlan(
+    var plan = bridgeScrollPlan(
         direction: direction, actions: actions, role: role,
         hasScrollBar: bar != nil, scrollBarSettable: barSettable)
+    // The reveal route is looked for only when nothing else exists, so the
+    // elements that already scrolled keep their route and their cost.
+    var reveal: [(element: AXUIElement, frame: BridgeRevealRect)] = []
+    var scrollRoot = el
+    var container: String?
+    if case .unsupported = plan {
+        reveal = revealCandidates(of: el)
+        // An element with nothing of its own to scroll (a line, a button
+        // inside a box) scrolls the container that holds it.
+        if reveal.isEmpty, let holder = nearestScrollContainer(of: el) {
+            scrollRoot = holder
+            reveal = revealCandidates(of: holder)
+            container = ((axAttr(holder, kAXRoleAttribute) as? String) ?? "AXUnknown")
+                + " \"" + String(((axAttr(holder, kAXTitleAttribute) as? String)
+                    ?? (axAttr(holder, kAXDescriptionAttribute) as? String) ?? "").prefix(60)) + "\""
+        }
+        plan = bridgeScrollPlan(
+            direction: direction, actions: actions, role: role,
+            hasScrollBar: bar != nil, scrollBarSettable: barSettable, canReveal: !reveal.isEmpty)
+    }
     if case .unsupported(let reason) = plan {
         return ["ok": false, "unsupported": true,
                 "message": "This element offers no accessibility scroll primitive; background mode will not post a scroll-wheel event.",
@@ -2192,6 +2304,70 @@ func uiScroll(_ params: [String: Any]) -> [String: Any] {
         current = after
     }
 
+    if case .revealDescendant = plan {
+        guard let viewport = revealViewport(of: scrollRoot) else {
+            return ["ok": false, "unsupported": true,
+                    "message": "The element has no visible area to scroll.",
+                    "detail": "reason=no_viewport;role=\(role)"]
+        }
+        let vertical = direction.isVertical
+        let extent = vertical ? viewport.maxY - viewport.minY : viewport.maxX - viewport.minX
+        let goal = Double(pages) * 0.9 * extent
+        // Hard cap: never more than `pages` viewports, so no content is skipped.
+        let cap = Double(pages) * extent
+        var frames = reveal.map { $0.frame }
+        var landing: Double?
+        var total = 0.0
+        var steps: [[String: Any]] = []
+        var lastEffect = BridgeScrollEffect.unchanged
+        var firstError: Int32?
+        let deadline = Date().addingTimeInterval(4)
+        // Bounded: at most 12 reveals and 4 s per call, and only while each
+        // reveal moves the content in the requested direction.
+        while steps.count < 12, Date() < deadline, total < goal - 1,
+              let index = bridgeRevealNext(direction: direction, viewport: viewport, candidates: frames,
+                                           landing: landing, remaining: goal - total, room: cap - total) {
+            let before = frames[index]
+            let err = AXUIElementPerformAction(reveal[index].element, "AXScrollToVisible" as CFString)
+            if err != .success && firstError == nil { firstError = err.rawValue }
+            Thread.sleep(forTimeInterval: 0.12)
+            let after = revealRect(reveal[index].element)
+            lastEffect = bridgeRevealEffect(direction: direction, before: before, after: after)
+            guard lastEffect == .moved, let after else { break }
+            let delta = vertical ? (before.minY - after.minY) : (before.minX - after.minX)
+            total += abs(delta)
+            landing = vertical ? (after.minY + after.maxY) / 2 - viewport.minY : (after.minX + after.maxX) / 2 - viewport.minX
+            steps.append(["moved_pt": Int(delta.rounded()), "landing_pt": Int((landing ?? 0).rounded())])
+            // Everything in this container moved together: shift, do not re-walk.
+            frames = frames.map { f in
+                vertical ? BridgeRevealRect(minX: f.minX, minY: f.minY - delta, maxX: f.maxX, maxY: f.maxY - delta)
+                         : BridgeRevealRect(minX: f.minX - delta, minY: f.minY, maxX: f.maxX - delta, maxY: f.maxY)
+            }
+        }
+        let after = scrollProbe(el, direction: direction)
+        var attempt: [String: Any] = [
+            "route": "reveal", "action": "AXScrollToVisible", "candidates": reveal.count,
+            "steps": steps, "moved_pt": Int(total.rounded()), "goal_pt": Int(goal.rounded()),
+            "cap_pt": Int(cap.rounded()),
+            "effect": steps.isEmpty ? lastEffect.rawValue : BridgeScrollEffect.moved.rawValue,
+            "before": scrollProbeDictionary(current), "after": scrollProbeDictionary(after)]
+        if let container { attempt["container"] = container }
+        if let firstError { attempt["ax_error"] = Int(firstError) }
+        attempts.append(attempt)
+        if !steps.isEmpty {
+            step = .done(route: "reveal", axError: firstError)
+        } else if reveal.isEmpty || bridgeRevealNext(direction: direction, viewport: viewport, candidates: frames,
+                                                     landing: nil, remaining: goal, room: cap) == nil {
+            return ["ok": false, "scroll": ["direction": direction.rawValue, "pages": pages, "route": "reveal",
+                                            "candidates": reveal.count],
+                    "message": "Nothing lies beyond the \(direction.rawValue) edge of this element: it is already at that end.",
+                    "detail": "reason=no_content_beyond;role=\(role);candidates=\(reveal.count)"]
+        } else {
+            step = .failed(reason: bridgeScrollFailureReason(lastEffect))
+        }
+        current = after
+    }
+
     var scroll: [String: Any] = [
         "direction": direction.rawValue, "pages": pages,
         "before": scrollProbeDictionary(initial), "after": scrollProbeDictionary(current),
@@ -2201,10 +2377,13 @@ func uiScroll(_ params: [String: Any]) -> [String: Any] {
     case .done(let route, let axError):
         scroll["route"] = route
         scroll["effect"] = "moved"
+        if route == "reveal", let moved = attempts.last?["moved_pt"] { scroll["moved_pt"] = moved }
+        if let container { scroll["container"] = container }
         if let axError { scroll["ax_error"] = Int(axError) }
         let note = axError.map { " (AX returned \($0); effect verified)" } ?? ""
+        let holder = container.map { " (the container that holds the element: \($0))" } ?? ""
         return ["ok": true, "scroll": scroll,
-                "message": "scrolled \(direction.rawValue) \(pages) page(s) via \(route)\(note)"]
+                "message": "scrolled \(direction.rawValue) \(pages) page(s) via \(route)\(holder)\(note)"]
     case .failed(let reason):
         scroll["effect"] = reason
         let errors = attempts.compactMap { $0["ax_error"] as? Int }.map { String($0) }.joined(separator: ",")

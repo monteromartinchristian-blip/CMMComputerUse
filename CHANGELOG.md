@@ -63,6 +63,18 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
   inode that was verified), reads exactly its size, and refuses files over
   2 GiB. A link (including one to `/dev/zero`), a FIFO or a device is refused
   without blocking. Digests are reused while the exact file is unchanged.
+- Acceptance finding D5: `ui.scroll` scrolls Firefox in the background. Its
+  document area offers neither a page action nor an accessible scroll bar, so
+  it used to be refused (`scroll_area_without_scrollbar`). A new last-resort
+  route reveals the content beyond the visible edge with `AXScrollToVisible`.
+  The first step uses the nearest content; later steps use where the browser
+  landed it. It is capped at `pages` viewports, so nothing is skipped, and
+  every step is measured on the revealed element. The content of nested
+  scroll boxes is kept out of the document's targets. An element with nothing
+  of its own to scroll scrolls the container that holds it. At the end of the
+  document the answer is `reason=no_content_beyond`. Page actions and scroll
+  bars keep priority, so Safari and Chrome routes are unchanged. Source guard
+  F8. The adapter shows `moved_pt`, `container` and the steps.
 - Acceptance finding D6: an observation now resolves its window with one
   bounded second look (100 ms) when the context's bound window is not matched
   or its title cannot be read, instead of deciding at once. Under load an

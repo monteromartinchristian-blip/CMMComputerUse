@@ -304,13 +304,20 @@ class ToolRegistry:
             {
                 "name": "computer_use_scroll",
                 "description": (
-                    "Scroll one observed element (usually an AXScrollArea marked "
-                    "'scrollable') with accessibility primitives only: the "
-                    "element's own page action or its scroll bar value. Never "
-                    "posts a scroll-wheel event, never moves the cursor. When the "
-                    "element offers neither, the helper answers "
-                    "CAPABILITY_UNSUPPORTED; report that instead of scrolling "
-                    "another way."
+                    "Scroll one observed element (usually an AXScrollArea, e.g. a "
+                    "browser's page) with accessibility primitives only: the "
+                    "element's own page action, its scroll bar value, or - when "
+                    "it has neither, as in Firefox - revealing the content just "
+                    "beyond its visible edge (AXScrollToVisible), step by step "
+                    "and never more than one viewport at a time. An element "
+                    "with nothing of its own to scroll (a button inside a "
+                    "scrollable box) scrolls the container that holds it. The "
+                    "answer reports the measured distance; nothing is claimed "
+                    "unless the content moved. Never posts a scroll-wheel event, "
+                    "never moves the cursor, never activates the app. When no "
+                    "route exists the helper answers CAPABILITY_UNSUPPORTED, and "
+                    "reason=no_content_beyond means it is already at that end; "
+                    "report that instead of scrolling another way."
                 ),
                 "inputSchema": _schema(
                     {
@@ -1411,14 +1418,27 @@ def _render_scroll(scroll: Any) -> List[str]:
 
     if not isinstance(scroll, dict):
         return []
-    lines = ["scroll: route=%s effect=%s ax_error=%s before=%s after=%s" % (
+    head = "scroll: route=%s effect=%s ax_error=%s before=%s after=%s" % (
         scroll.get("route", "none"), scroll.get("effect"), scroll.get("ax_error", "none"),
-        _probe_text(scroll.get("before")), _probe_text(scroll.get("after")))]
+        _probe_text(scroll.get("before")), _probe_text(scroll.get("after")))
+    # The reveal route (AXScrollToVisible) measures its own distance: the
+    # probes above may legitimately stay put (the scroll area's frame does not
+    # move), so the measured distance is the evidence.
+    if scroll.get("moved_pt") is not None:
+        head += " moved_pt=%s" % scroll["moved_pt"]
+    if scroll.get("container"):
+        head += " container=%s" % scroll["container"]
+    lines = [head]
     for attempt in (scroll.get("attempts") or [])[:4]:
         if isinstance(attempt, dict):
-            lines.append("- attempt %s: effect=%s ax_error=%s %s -> %s" % (
+            line = "- attempt %s: effect=%s ax_error=%s %s -> %s" % (
                 attempt.get("route"), attempt.get("effect"), attempt.get("ax_error", "none"),
-                _probe_text(attempt.get("before")), _probe_text(attempt.get("after"))))
+                _probe_text(attempt.get("before")), _probe_text(attempt.get("after")))
+            if attempt.get("route") == "reveal":
+                line += " steps=%d moved_pt=%s goal_pt=%s candidates=%s" % (
+                    len(attempt.get("steps") or []), attempt.get("moved_pt"), attempt.get("goal_pt"),
+                    attempt.get("candidates"))
+            lines.append(line)
     return lines
 
 

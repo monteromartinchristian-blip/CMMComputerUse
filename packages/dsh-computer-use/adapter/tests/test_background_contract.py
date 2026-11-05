@@ -162,6 +162,37 @@ class ScrollTests(Case):
         self.assertEqual(len(ScrollTests.sent), 1, "an unsupported scroll is never retried another way")
 
 
+class ScrollRevealRenderTests(Case):
+    """D5: Firefox's document scrolls by revealing content (AXScrollToVisible);
+    the model must see the MEASURED distance and which container moved."""
+
+    @staticmethod
+    def responder(request):
+        return ok(request, {"ok": True,
+                            "message": "scrolled down 1 page(s) via reveal (the container that holds the element: AXGroup \"\")",
+                            "scroll": {"route": "reveal", "effect": "moved", "moved_pt": 653,
+                                       "container": "AXGroup \"\"", "before": {}, "after": {},
+                                       "attempts": [{"route": "reveal", "effect": "moved", "moved_pt": 653,
+                                                     "goal_pt": 652, "candidates": 190,
+                                                     "steps": [{"moved_pt": 362}, {"moved_pt": 291}]}]},
+                            "interference": dict(BREACH_LEDGER, verdict="untouched", breach=False,
+                                                 focus_became_target=False, frontmost_after="DeepSeek Harness",
+                                                 transient_focus_changes=0)})
+
+    def test_the_measured_distance_and_the_container_reach_the_model(self):
+        text = text_of(self.call("computer_use_scroll", {"element_id": 4, "snapshot": 5, "direction": "down"}))
+        self.assertIn("route=reveal effect=moved", text)
+        self.assertIn("moved_pt=653", text)
+        self.assertIn('container=AXGroup ""', text)
+        self.assertIn("steps=2 moved_pt=653 goal_pt=652 candidates=190", text)
+
+    def test_the_tool_tells_the_model_how_it_scrolls_and_what_it_never_does(self):
+        tool = next(t for t in self.registry.tools() if t["name"] == "computer_use_scroll")
+        for phrase in ("AXScrollToVisible", "never more than one viewport", "container that holds it",
+                       "no_content_beyond", "Never posts a scroll-wheel event"):
+            self.assertIn(phrase, tool["description"])
+
+
 class ScrollEvidenceTests(Case):
     @staticmethod
     def responder(request):

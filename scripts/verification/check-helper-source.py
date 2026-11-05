@@ -97,6 +97,17 @@ check(not re.search(r"CGEvent|scrollWheel|CGWarp|CGDisplayMoveCursor|\.post\(", 
       and "bridgeScrollEffect(" in scroll_code,
       "ui.scroll: AX-only (no wheel/CGEvent/cursor) and verified by a measured postcondition")
 
+reveal_start = main.index("func revealCandidates(")
+reveal_code = "\n".join(l.split("//", 1)[0] for l in main[reveal_start:scroll_start].splitlines())
+check(not re.search(r"CGEvent|scrollWheel|CGWarp|CGDisplayMoveCursor|\.post\(|kAXFocused|AXRaise|activate\(", reveal_code + scroll_code)
+      and scroll_code.count('AXUIElementPerformAction(reveal[index].element, "AXScrollToVisible"') == 1
+      and scroll_code.count("AXUIElementPerformAction(") == 2
+      and "bridgeRevealEffect(" in scroll_code and "bridgeRevealNext(" in scroll_code
+      and "steps.count < 12, Date() < deadline" in scroll_code
+      and scroll_code.index("if case .unsupported = plan") < scroll_code.index("revealCandidates(of: el)"),
+      "F8: the reveal scroll route (D5) is AXScrollToVisible only, last resort, bounded steps, each measured; "
+      "no wheel, cursor, focus or activation")
+
 sv_start = main.index("func uiSetValue(")
 sv_body = main[sv_start:main.index("\nfunc ", sv_start + 10)]
 check("bridgeSetValueCheck(" in sv_body and "AXUIElementIsAttributeSettable(" in sv_body

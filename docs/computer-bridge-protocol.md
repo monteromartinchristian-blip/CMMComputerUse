@@ -265,8 +265,32 @@ frontmost while the ledger said `verdict=untouched`, `breach=false`. Fixed by:
   `window_chrome: true` in `observation.describe`.
 - **`ui.scroll`** `{element_id, snapshot, direction: up|down|left|right,
   pages?: 1…10}`: the element's own `AXScroll<Dir>ByPage` action, else its
-  scroll bar's `AXValue`. Never a wheel event, never the cursor. Neither route
-  → `CAPABILITY_UNSUPPORTED`
+  scroll bar's `AXValue`, else — added 2026-11-04 for Firefox, whose document
+  area has neither (acceptance finding D5) — the **reveal** route:
+  - **How it scrolls.** It performs `AXScrollToVisible` on the descendant
+    beyond the visible edge. The browser then scrolls the document, or the
+    inner box that holds that descendant.
+  - **The first step** reveals the nearest content beyond the edge. That never
+    skips content, whatever the browser's alignment.
+  - **Later steps** use where the browser landed that element (Firefox centres
+    it) to choose the next one.
+  - **Hard cap:** `pages` viewports per call, so content is never skipped. A
+    browser that centres moves about half a viewport per page; an
+    edge-aligned one about 0.9.
+  - **Nested boxes.** The content of a nested scroll box (children overflowing
+    its frame) belongs to that box, never to the document.
+  - **Elements with nothing of their own to scroll.** An element such as a
+    line or a button inside a box scrolls the container that holds it.
+    `scroll.container` names it.
+  - **Measurement.** Every step is measured on the revealed element's own
+    position: `scroll.moved_pt`, plus `steps`, `goal_pt` and `cap_pt` in the
+    attempt.
+  - **At the end.** Nothing beyond the edge → `ACTION_FAILED`
+    `detail=…;reason=no_content_beyond;candidates=…`.
+  - **What it never does.** No wheel event, no cursor, no focus, no
+    activation, no window raise.
+
+  No route at all → `CAPABILITY_UNSUPPORTED`
   `detail=…;reason=scroll_area_without_scrollbar|scrollbar_not_settable|not_scrollable|invalid_direction;role=…`.
   `AXScrollArea` elements are listed with `scrollable` / `scroll_unsupported`.
   **Verified postcondition** (2026-11-02, after a live run where

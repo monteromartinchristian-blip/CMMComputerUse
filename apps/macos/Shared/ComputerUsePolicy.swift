@@ -819,22 +819,30 @@ public enum BridgeScrollDirection: String, CaseIterable, Sendable {
 
 /// How `ui.scroll` will move one observed element, or why it cannot.
 ///
-/// Only accessibility primitives: an action the element advertises, or the
-/// value of its own scroll bar. NEVER a scroll-wheel event: that is global
-/// input, lands under the cursor and (to aim it) needs the cursor moved —
-/// exactly what background mode forbids.
+/// Only accessibility primitives: an action the element advertises, the
+/// value of its own scroll bar, or — when neither exists — `AXScrollToVisible`
+/// on the descendant just beyond the visible edge (the browser itself scrolls
+/// the document or the inner container that holds it; acceptance finding D5,
+/// Firefox). NEVER a scroll-wheel event: that is global input, lands under the
+/// cursor and (to aim it) needs the cursor moved — exactly what background
+/// mode forbids.
 public enum BridgeScrollPlan: Equatable, Sendable {
     case pageAction(String)
     case scrollBarValue
+    case revealDescendant
     case unsupported(reason: String)
 }
 
+/// `canReveal`: some descendant of the element advertises AXScrollToVisible.
+/// It is the LAST route: elements that scroll through a page action or a
+/// settable scroll bar keep doing so.
 public func bridgeScrollPlan(
     direction: BridgeScrollDirection, actions: [String], role: String,
-    hasScrollBar: Bool, scrollBarSettable: Bool
+    hasScrollBar: Bool, scrollBarSettable: Bool, canReveal: Bool = false
 ) -> BridgeScrollPlan {
     if actions.contains(direction.pageAction) { return .pageAction(direction.pageAction) }
     if hasScrollBar && scrollBarSettable { return .scrollBarValue }
+    if canReveal { return .revealDescendant }
     if hasScrollBar { return .unsupported(reason: "scrollbar_not_settable") }
     if role == "AXScrollArea" { return .unsupported(reason: "scroll_area_without_scrollbar") }
     return .unsupported(reason: "not_scrollable")
@@ -849,6 +857,96 @@ public func bridgeScrollBarTarget(
     let step = Double(max(1, min(pages, 10))) * max(0.01, min(pageFraction, 1.0))
     let sign: Double = (direction == .down || direction == .right) ? 1 : -1
     return max(0, min(1, current + sign * step))
+}
+
+// MARK: - Scrolling by revealing a descendant (AXScrollToVisible)
+
+/// A frame in AX screen coordinates (top-left origin, y grows downward).
+public struct BridgeRevealRect: Equatable, Sendable {
+    public var minX: Double
+    public var minY: Double
+    public var maxX: Double
+    public var maxY: Double
+
+    public init(minX: Double, minY: Double, maxX: Double, maxY: Double) {
+        self.minX = minX
+        self.minY = minY
+        self.maxX = maxX
+        self.maxY = maxY
+    }
+}
+
+/// The next descendant to reveal while scrolling (index into `candidates`), or
+/// nil when nothing lies ENTIRELY beyond the edge in `direction` (the element
+/// is at that end) or no further step fits.
+///
+/// Browsers do not agree on where a revealed element lands: Firefox centres
+/// it (live measurement while fixing D5), others align an edge. So:
+/// * first step (`landing == nil`): the nearest candidate beyond the edge —
+///   whatever the alignment, that never skips content;
+/// * then `landing` (where the previous target's centre landed, measured from
+///   the viewport's leading edge: top for vertical, left for horizontal)
+///   predicts how far each candidate would move the content. The farthest one
+///   within `min(remaining, room)` is chosen; failing that, the nearest one if
+///   it stays within `room`. `room` is what is left of the hard cap (the
+///   caller's `pages` viewports): content is NEVER skipped, so a browser that
+///   centres may cover less than `remaining`, and the caller reports the
+///   distance it measured.
+public func bridgeRevealNext(
+    direction: BridgeScrollDirection, viewport: BridgeRevealRect, candidates: [BridgeRevealRect],
+    landing: Double?, remaining: Double, room: Double
+) -> Int? {
+    let vertical = direction.isVertical
+    let forward = direction == .down || direction == .right
+    func lead(_ r: BridgeRevealRect) -> Double { vertical ? r.minY : r.minX }
+    func trail(_ r: BridgeRevealRect) -> Double { vertical ? r.maxY : r.maxX }
+    func centre(_ r: BridgeRevealRect) -> Double { (lead(r) + trail(r)) / 2 }
+    let start = vertical ? viewport.minY : viewport.minX
+    let end = vertical ? viewport.maxY : viewport.maxX
+    let tolerance = 0.5
+    let beyond = candidates.indices.filter {
+        forward ? lead(candidates[$0]) >= end - tolerance : trail(candidates[$0]) <= start + tolerance
+    }
+    guard let landing else {
+        return forward ? beyond.min { lead(candidates[$0]) < lead(candidates[$1]) }
+                       : beyond.max { trail(candidates[$0]) < trail(candidates[$1]) }
+    }
+    func expected(_ i: Int) -> Double {
+        forward ? centre(candidates[i]) - (start + landing) : (start + landing) - centre(candidates[i])
+    }
+    let moving = beyond.filter { expected($0) > 0 }
+    let limit = max(0, min(remaining, room))
+    if let best = moving.filter({ expected($0) <= limit }).max(by: { expected($0) < expected($1) }) { return best }
+    guard let nearest = moving.min(by: { expected($0) < expected($1) }), expected(nearest) <= room else { return nil }
+    return nearest
+}
+
+/// Is `container` a scroller of its own? Its children extend beyond its frame
+/// (by more than `tolerance` points on either axis): the content is clipped
+/// and scrolled inside it. Firefox reports such content at its unclipped
+/// positions, so without this the content of an inner box looks like content
+/// below the fold of the document (live finding while fixing D5).
+public func bridgeOverflows(
+    container: BridgeRevealRect, children: [BridgeRevealRect], tolerance: Double = 2.0
+) -> Bool {
+    children.contains { child in
+        child.maxY > container.maxY + tolerance || child.minY < container.minY - tolerance
+            || child.maxX > container.maxX + tolerance || child.minX < container.minX - tolerance
+    }
+}
+
+/// Did revealing the target actually scroll? Measured on the target itself:
+/// scrolling down moves it up (its y decreases), and so on. A call that only
+/// returned no error is not a scroll.
+public func bridgeRevealEffect(
+    direction: BridgeScrollDirection, before: BridgeRevealRect, after: BridgeRevealRect?,
+    pointEpsilon: Double = 1.0
+) -> BridgeScrollEffect {
+    guard let after else { return .unmeasurable }
+    let delta = direction.isVertical ? after.minY - before.minY : after.minX - before.minX
+    if abs(delta) <= pointEpsilon { return .unchanged }
+    let forward = direction == .down || direction == .right
+    return (delta < 0) == forward ? .moved : .wrongDirection
 }
 
 // MARK: - Scroll postcondition
