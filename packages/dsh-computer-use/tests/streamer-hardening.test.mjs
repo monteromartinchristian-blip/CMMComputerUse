@@ -74,10 +74,13 @@ function fakeHelper({captureDelay = 0} = {}) {
     close: () => new Promise(done => server.close(() => { rmSync(dir, {recursive: true, force: true}); done(); }))})));
 }
 
+const tokens = new Map();
+const tokenOf = port => tokens.get(port);
 async function streamer(socketPath) {
   const server = runStreamer(socketPath, 0);
   if (!server.listening) await new Promise(resolve => server.once('listening', resolve));
   const port = server.address().port;
+  tokens.set(port, server.liveToken);
   assert.notEqual(port, 47183);
   return {port, close: () => new Promise(resolve => { server.closeAllConnections?.(); server.close(() => resolve()); })};
 }
@@ -98,7 +101,7 @@ function fetchRaw(port, path, headers = {}) {
 /** Open a mirror and keep it open; resolves once the first frame arrived. */
 function openMirror(port, query) {
   return new Promise((resolve, reject) => {
-    const req = httpRequest({host: '127.0.0.1', port, path: '/stream.mjpg?token=cmm-cu-live&' + query}, response => {
+    const req = httpRequest({host: '127.0.0.1', port, path: '/stream.mjpg?token=' + tokenOf(port) + '&' + query}, response => {
       if (response.statusCode !== 200) { response.resume(); resolve({status: response.statusCode, close: () => req.destroy()}); return; }
       response.once('data', () => resolve({status: 200, close: () => req.destroy()}));
     });
@@ -134,7 +137,7 @@ test('X-01: over HTTP a web origin is refused, the renderer origin is served, no
   const helper = await fakeHelper();
   const s = await streamer(helper.path);
   try {
-    const status = '/stream/status?token=cmm-cu-live&slot=A';
+    const status = '/stream/status?token=' + tokenOf(s.port) + '&slot=A';
     const web = await fetchRaw(s.port, status, {Origin: 'https://evil.example'});
     assert.equal(web.status, 403);
     assert.equal(web.headers['access-control-allow-origin'], undefined);
@@ -150,7 +153,7 @@ test('X-01: over HTTP a web origin is refused, the renderer origin is served, no
     const noToken = await fetchRaw(s.port, '/stream/status?slot=A', {Origin: 'dsh-app://app'});
     assert.equal(noToken.status, 403, 'the token is still required');
     // A refused request must not have reached the helper at all.
-    const refusedFrame = await fetchRaw(s.port, '/frame.png?token=cmm-cu-live&app=X&window=Y', {Origin: 'https://evil.example'});
+    const refusedFrame = await fetchRaw(s.port, '/frame.png?token=' + tokenOf(s.port) + '&app=X&window=Y', {Origin: 'https://evil.example'});
     assert.equal(refusedFrame.status, 403);
     assert.equal(helper.calls.filter(call => call.operation === 'observation.capture_screen').length, 0);
   } finally { await s.close(); await helper.close(); }
@@ -200,7 +203,7 @@ test('B-13: a replaced viewer leaving does not stop the replacement\'s stream', 
     await settle(500);
     assert.equal([...helper.streams.values()].filter(stream => stream.windowId === 12).length, 1,
       'the replaced viewer leaving must not stop the replacement\'s stream');
-    const status = JSON.parse((await fetchRaw(s.port, '/stream/status?token=cmm-cu-live&slot=A')).body);
+    const status = JSON.parse((await fetchRaw(s.port, '/stream/status?token=' + tokenOf(s.port) + '&slot=A')).body);
     assert.equal(status.viewers, 1, 'one viewer left on the slot');
     second.close();
     await settle(400);
@@ -215,8 +218,8 @@ test('frame.png: concurrent requests for two windows each capture their own wind
   const s = await streamer(helper.path);
   try {
     const [one, two] = await Promise.all([
-      fetchRaw(s.port, '/frame.png?token=cmm-cu-live&app=AppA&window=Alpha'),
-      fetchRaw(s.port, '/frame.png?token=cmm-cu-live&app=AppB&window=Beta'),
+      fetchRaw(s.port, '/frame.png?token=' + tokenOf(s.port) + '&app=AppA&window=Alpha'),
+      fetchRaw(s.port, '/frame.png?token=' + tokenOf(s.port) + '&app=AppB&window=Beta'),
     ]);
     assert.equal(one.status, 200);
     assert.equal(two.status, 200);
@@ -224,8 +227,8 @@ test('frame.png: concurrent requests for two windows each capture their own wind
       .map(call => call.args.window_title).sort();
     assert.deepEqual(asked, ['Alpha', 'Beta'], 'each window is captured on its own');
     const same = await Promise.all([
-      fetchRaw(s.port, '/frame.png?token=cmm-cu-live&app=AppA&window=Alpha'),
-      fetchRaw(s.port, '/frame.png?token=cmm-cu-live&app=AppA&window=Alpha'),
+      fetchRaw(s.port, '/frame.png?token=' + tokenOf(s.port) + '&app=AppA&window=Alpha'),
+      fetchRaw(s.port, '/frame.png?token=' + tokenOf(s.port) + '&app=AppA&window=Alpha'),
     ]);
     assert.equal(same.every(response => response.status === 200), true);
     const alphaCalls = helper.calls.filter(call => call.operation === 'observation.capture_screen'

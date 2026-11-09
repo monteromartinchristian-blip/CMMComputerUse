@@ -6,6 +6,10 @@ The full project changelog, including the macOS helper, lives in the repository.
 
 ## Unreleased
 
+- X-01: the live-mirror token is random per start (256 bits), handed to the streamer
+  through stdin and to the renderer through the projection view; no fixed token
+  ships in the package. See the repository CHANGELOG.
+
 - Version 0.3.3 (package and adapter agree). `HELPER_TOO_OLD` refusals when the
   helper lacks a capability; `computer_use_status` shows adapter and helper
   versions and features. Tool budget of 55 s under DSH's 70 s cut; waits capped

@@ -2,7 +2,7 @@ import {KEY, MAX_LANES, initialState, fold, validAttachment, bypassReason} from 
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {connect} from 'node:net';
-import {randomBytes} from 'node:crypto';
+import {randomBytes, timingSafeEqual} from 'node:crypto';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -26,18 +26,25 @@ function resolveSocket(configured) {
   return chosen.startsWith('~/') ? join(homedir(), chosen.slice(2)) : chosen;
 }
 
-// Fixed loopback endpoint. The helper's own policy still decides which window
-// may be captured. The token is NOT a secret: it is fixed and public, because
-// the renderer builds an <img src> URL (which cannot carry a header) and there
-// is no verified Host-to-renderer channel to hand it a per-start value. What
-// actually protects the endpoint is `requestGuard` (loopback `Host`, only a
-// `dsh-app:` `Origin`, no wildcard CORS), which closes the web-page vector. A
-// process of the same user can still ask for frames of the windows the policy
-// authorizes (audit X-01, open until the renderer can receive a secret). A
-// fixed port is deliberate: the renderer's URL is configuration, so it must not
-// change between restarts of the same session projection.
+// Loopback endpoint on a fixed port. The helper's own policy still decides
+// which window may be captured. Reading anything from it takes this run's
+// secret: a 256-bit random token drawn by the Host at every start, handed to
+// the streamer child through its stdin (argv and the environment of a process
+// are readable by any process of the same user) and to the renderer through
+// the session projection's *view* (the persisted state never carries it). The
+// <img src> of the renderer cannot carry a header, so the token travels in the
+// query. `requestGuard` (loopback `Host`, only a `dsh-app:` `Origin`, no
+// wildcard CORS) additionally keeps web pages out (audit X-01). A fixed port
+// is deliberate: it is configuration, not a secret.
 const LIVE_PORT = 47183;
-const LIVE_TOKEN = 'cmm-cu-live';
+const LIVE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+/** A fresh 256-bit token, base64url (43 characters). */
+export const newLiveToken = () => randomBytes(32).toString('base64url');
+export const isLiveToken = value => typeof value === 'string' && LIVE_TOKEN_PATTERN.test(value);
+const tokenMatches = (given, expected) => {
+  if (typeof given !== 'string' || given.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+};
 /**
  * Who may talk to the streamer from a browser context (audit X-01).
  * `Host` must be the loopback name with the streamer's own port, which stops
@@ -105,8 +112,11 @@ function captureOnce(socket, app, window) {
     });
 }
 
-function runStreamer(socket, port = LIVE_PORT) {
-  const token = LIVE_TOKEN;
+function runStreamer(socket, port = LIVE_PORT, options = {}) {
+  // The Host injects its token; a direct caller (tests) gets a fresh one. A
+  // given value that is not a well formed token is a bug, never a fallback.
+  const token = options.token === undefined ? newLiveToken() : options.token;
+  if (!isLiveToken(token)) throw new Error('invalid live token');
   const pending = new Map();
   // 0.3.3: up to MAX_SLOTS independent mirrors (panel A and panel B), each
   // with its own helper stream, counters, phase, viewers and recovery. A slot
@@ -334,7 +344,7 @@ function runStreamer(socket, port = LIVE_PORT) {
     if (!verdict.ok) { response.writeHead(403, headers).end(); return; }
     if (request.method === 'OPTIONS') { response.writeHead(204, {...headers, 'Access-Control-Allow-Methods': 'GET'}).end(); return; }
     if (url.pathname === '/stream.mjpg') {
-      if (url.searchParams.get('token') !== token) { response.writeHead(403, headers).end(); return; }
+      if (!tokenMatches(url.searchParams.get('token'), token)) { response.writeHead(403, headers).end(); return; }
       const name = slotName(url);
       // Two mirrors at once, never a third: the helper refuses a third stream
       // and this endpoint refuses a third slot before asking it.
@@ -394,7 +404,7 @@ function runStreamer(socket, port = LIVE_PORT) {
     if (url.pathname === '/stream/status') {
       // Liveness for the viewer only: counters and the last frame time, never
       // pixels and never a helper request of its own.
-      if (url.searchParams.get('token') !== token) { response.writeHead(403, headers).end(); return; }
+      if (!tokenMatches(url.searchParams.get('token'), token)) { response.writeHead(403, headers).end(); return; }
       const stats = (slots.get(slotName(url)) || {stats: {frames: 0, lastFrameAt: 0, viewers: 0, mode: 'idle',
         error: null, windowId: null, phase: 'idle'}}).stats;
       const body = JSON.stringify({ok: true, slot: slotName(url) || null, frames: stats.frames,
@@ -407,7 +417,7 @@ function runStreamer(socket, port = LIVE_PORT) {
       return;
     }
     if (url.pathname !== '/frame.png') { response.writeHead(404, headers).end(); return; }
-    if (url.searchParams.get('token') !== token) { response.writeHead(403, headers).end(); return; }
+    if (!tokenMatches(url.searchParams.get('token'), token)) { response.writeHead(403, headers).end(); return; }
     try {
       // Coalesce: a slow capture must not turn parallel polls into 429s, which
       // the renderer would see as a broken stream and stop showing the mirror.
@@ -441,6 +451,7 @@ function runStreamer(socket, port = LIVE_PORT) {
     stopAll().then(done, done);
     setTimeout(done, 1500).unref();
   });
+  server.liveToken = token;
   return server;
 }
 
@@ -449,7 +460,21 @@ if (process.argv.includes('--stream')) {
   // which is configuration the renderer's URL depends on.
   const portIndex = process.argv.indexOf('--port');
   const port = portIndex >= 0 ? Number(process.argv[portIndex + 1]) : LIVE_PORT;
-  runStreamer(resolveSocket(''), Number.isSafeInteger(port) && port >= 0 && port < 65536 ? port : LIVE_PORT);
+  // The run's token arrives on stdin, one line, before anything listens. Without
+  // a well formed one there is no endpoint at all (never a default token).
+  let received = '';
+  let started = false;
+  const begin = text => {
+    if (started) return;
+    started = true;
+    const token = text.split('\n')[0].trim();
+    if (!isLiveToken(token)) { process.stdout.write('ERROR live_token\n'); process.exit(1); }
+    runStreamer(resolveSocket(''), Number.isSafeInteger(port) && port >= 0 && port < 65536 ? port : LIVE_PORT, {token});
+  };
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', chunk => { received += chunk; if (received.includes('\n')) begin(received); });
+  process.stdin.on('end', () => begin(received));
+  process.stdin.on('error', () => begin(received));
 }
 export {runStreamer};
 
@@ -511,8 +536,35 @@ export const stateSchema = {parse(value) {
       || (value.lanes !== undefined && !validLanes(value.lanes, value.revision))) throw new Error('Invalid CMM panel checkpoint');
   return value;
 }};
+/**
+ * The projection's client view: the state plus how to reach the live mirror.
+ * The token is this Host's own (`live`), drawn at every start; it is part of
+ * the view only, so the persisted state, the checkpoint and the log never
+ * hold it. The view reference is stable per state reference.
+ */
+function liveView(live) {
+  const cache = new WeakMap();
+  return state => {
+    if (!state || typeof state !== 'object') return state;
+    let view = cache.get(state);
+    if (!view) { view = {...state, live}; cache.set(state, view); }
+    return view;
+  };
+}
+const viewSchema = {parse(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid CMM panel view');
+  const {live, ...state} = value;
+  if (live !== undefined) {
+    if (!live || typeof live !== 'object' || Array.isArray(live)
+        || Object.keys(live).some(k => k !== 'port' && k !== 'token')
+        || !Number.isSafeInteger(live.port) || live.port < 1 || live.port > 65535
+        || !isLiveToken(live.token)) throw new Error('Invalid CMM panel view');
+  }
+  stateSchema.parse(state);
+  return value;
+}};
 export function apply(ctx, config) {
-  let live = null;
+  const live = Object.freeze({port: LIVE_PORT, token: newLiveToken()});
   let child = null;
   const socket = resolveSocket(config && config.socket);
   const startStreamer = () => {
@@ -520,15 +572,14 @@ export function apply(ctx, config) {
     try {
       child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--stream', '--socket', socket], {
         env: {...process.env, ELECTRON_RUN_AS_NODE: '1'},
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['pipe', 'pipe', 'ignore'],
       });
     } catch { child = null; return; }
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', text => {
-      const match = /READY (\d+)/.exec(text);
-      if (match && !live) live = {port: LIVE_PORT, token: LIVE_TOKEN};
-    });
-    child.on('exit', () => { child = null; live = null; });
+    // The token goes through stdin only: not argv, not the environment.
+    child.stdin.on('error', () => {});
+    child.stdin.end(live.token + '\n');
+    child.stdout.on('data', () => {});
+    child.on('exit', () => { child = null; });
   };
   startStreamer();
   // 10: fold learned `scroll`, window-raised and helper-latch breaches.
@@ -539,9 +590,9 @@ export function apply(ctx, config) {
   // sessions apply them.
   ctx.sessionProjections.register({key:KEY,stateVersion:13,stateSchema,
     init:initialState,apply:fold,
-    wire:{viewSchema:stateSchema,view:state=>state}});
+    wire:{viewSchema,view:liveView(live)}});
   if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => { try { child && child.kill('SIGTERM'); } catch {} child = null; live = null; });
+    ctx.effect(() => () => { try { child && child.kill('SIGTERM'); } catch {} child = null; });
   }
   // Monotonic refusal after a verified helper breach in this session, including
   // a resumed log. No stop button: this does not cancel an in-flight tool.

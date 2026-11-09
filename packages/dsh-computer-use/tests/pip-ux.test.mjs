@@ -408,3 +408,15 @@ test('F-09: a tab switch (same window id, new title) keeps the live mirror URL',
   const after = src(s.draw({sessionId: 'a', mode: 'mini'}));
   assert.equal(after, before, 'same <img> source: the stream is not reopened');
 });
+
+test('X-01: the live URL carries the run token from the view, and no view means no live URL', () => {
+  const first = observed(undefined, Date.now());
+  const s = seat(first);
+  const src = tree => nodes(tree, 'img').map(i => String(i.props.src)).find(u => u.includes('/stream.mjpg?'));
+  const url = src(s.draw({sessionId: 'a', mode: 'mini'}));
+  assert.ok(url, 'the mirror is drawn when the view has the streamer address');
+  assert.ok(url.includes('token=' + encodeURIComponent(s.TOKEN)), 'the token is the one the Host put in the view');
+  assert.ok(!url.includes('cmm-cu-live'));
+  s.setLiveView(false); // an older Host, or one whose streamer never started
+  assert.equal(src(s.draw({sessionId: 'a', mode: 'mini'})), undefined, 'no token, no live URL: the admitted frame stays');
+});

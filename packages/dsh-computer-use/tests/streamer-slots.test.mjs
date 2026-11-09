@@ -77,10 +77,13 @@ function fakeHelper({multi = true, failOnce = null} = {}) {
     close: () => new Promise(done => server.close(() => { rmSync(dir, {recursive: true, force: true}); done(); }))})));
 }
 
+// The run's token per ephemeral port (each streamer draws its own).
+const tokens = new Map();
 async function streamer(socketPath) {
   const server = runStreamer(socketPath, 0);
   if (!server.listening) await new Promise(resolve => server.once('listening', resolve));
   const port = server.address().port;
+  tokens.set(port, server.liveToken);
   assert.notEqual(port, 47183, 'never the production streamer port');
   return {port, close: () => new Promise(resolve => { server.closeAllConnections?.(); server.close(() => resolve()); })};
 }
@@ -88,7 +91,7 @@ async function streamer(socketPath) {
 /** Open a mirror; resolves once `frames` frames arrived. Returns the request. */
 function mirror(port, slot, frames = 2, extra = '') {
   return new Promise((resolve, reject) => {
-    const url = `http://127.0.0.1:${port}/stream.mjpg?token=cmm-cu-live&app=App${slot}&window=W${slot}`
+    const url = `http://127.0.0.1:${port}/stream.mjpg?token=${tokens.get(port)}&app=App${slot}&window=W${slot}`
       + `&window_id=${slot === 'A' ? 11 : 12}${slot ? '&slot=' + slot : ''}&bundle=com.example.${slot}&pid=50${slot ? 1 : 0}${extra}`;
     const request = get(url, response => {
       if (response.statusCode !== 200) { resolve({status: response.statusCode, request}); response.resume(); return; }
@@ -103,7 +106,7 @@ function mirror(port, slot, frames = 2, extra = '') {
 }
 
 const status = (port, slot) => new Promise((resolve, reject) => {
-  get(`http://127.0.0.1:${port}/stream/status?token=cmm-cu-live${slot ? '&slot=' + slot : ''}`, response => {
+  get(`http://127.0.0.1:${port}/stream/status?token=${tokens.get(port)}${slot ? '&slot=' + slot : ''}`, response => {
     let body = '';
     response.on('data', c => { body += c; });
     response.on('end', () => resolve(JSON.parse(body)));
@@ -247,7 +250,7 @@ test('F-09: a title change on the same window id keeps the helper stream (tab sw
     const a = await mirror(live.port, 'A', 1);
     // The same panel re-opened after a tab switch renamed the window.
     const renamed = await new Promise((resolve, reject) => {
-      const request = get(`http://127.0.0.1:${live.port}/stream.mjpg?token=cmm-cu-live&app=AppA&window=Other%20page`
+      const request = get(`http://127.0.0.1:${live.port}/stream.mjpg?token=${tokens.get(live.port)}&app=AppA&window=Other%20page`
         + '&window_id=11&slot=A&bundle=com.example.A&pid=501', response => {
         response.once('data', () => resolve({request}));
       });

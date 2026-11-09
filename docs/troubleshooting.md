@@ -99,12 +99,11 @@ launchctl bootout gui/$(id -u)/com.cmm.chat.computer-use
 
 By design, a frozen stream is labelled rather than presented as live. The
 streamer publishes its own counters at
-`http://127.0.0.1:47183/stream/status?token=cmm-cu-live`:
-
-```bash
-curl -s 'http://127.0.0.1:47183/stream/status?token=cmm-cu-live'
-# {"ok":true,"frames":412,"lastFrameAt":…,"viewers":1,"mode":"live",…}
-```
+`http://127.0.0.1:47183/stream/status?token=<run token>`. The token is random
+per start of DeepSeek Harness and is not written anywhere you can read it (by
+design: any local process could otherwise read the mirrored windows), so a
+manual `curl` is refused with 403. The panel's own label is the diagnostic; the
+counters it reads are:
 
 - `frames` advancing, `mode: "live"` → healthy; a paused label means the panel
   lost the stream and is re-arming.

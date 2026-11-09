@@ -10,6 +10,11 @@ export function seat(state,{lang}={}) {
   const dictionaries={};
   let definition, entry, slots=[], cursor=0, effects=[], effectCursor=0, effectSlots=[], writes=0;
   let current=state;
+  // What the Host's view adds: the streamer's port and this run's random token.
+  const TOKEN='Tk_'+'a1B2c3D4'.repeat(5);
+  let liveOn=true;
+  const views=new WeakMap();
+  const snapshot=()=>{if(!liveOn||!current||typeof current!=='object')return current;let v=views.get(current);if(!v){v={...current,live:{port:47183,token:TOKEN}};views.set(current,v);}return v;};
   const react={
     createElement:(type,props,...children)=>({type,props:props||{},children}),
     useState:init=>{
@@ -44,7 +49,7 @@ export function seat(state,{lang}={}) {
   const selected={byId:{a:{id:'a',retainedBy:{mainView:1}}}};
   const ctx={effect:fn=>fn(),locale:{register:(_ns,l,dict)=>{dictionaries[l]=dict;return()=>{}},bind:()=>k=>lang?(dictionaries[lang]?.[k]??k):k,subscribe:()=>()=>{},getSnapshot:()=>0},
     slots:{inject:(_name,fn)=>fn(),register:(_opts,view)=>{entry=view;return()=>{}}},
-    sessions:{list:{getSnapshot:()=>selected},binding:()=>({session:{projections:{faceOf:()=>({getSnapshot:()=>current,subscribe:()=>()=>{}})},readAttachment:()=>{throw Error('control invoked attachment authority')}}})},
+    sessions:{list:{getSnapshot:()=>selected},binding:()=>({session:{projections:{faceOf:()=>({getSnapshot:snapshot,subscribe:()=>()=>{}})},readAttachment:()=>{throw Error('control invoked attachment authority')}}})},
     layout:{panelInfo:{getSnapshot:()=>({activePanelId:null})}}};
   definition.factory(name=>{if(name!=='react')throw Error('unexpected host module');return react}).apply(ctx);
   let view;
@@ -57,6 +62,8 @@ export function seat(state,{lang}={}) {
     draw(v){cursor=0;effectCursor=0;effects=[];props.view=v;return pip.type(props);},
     get writes(){return writes;},
     setState(next){current=next;},
+    setLiveView(on){liveOn=on;},
+    TOKEN,
     getView:()=>view,
     select(id){selected.byId={[id]:{id,retainedBy:{mainView:1}}};},
     effects:()=>effects,

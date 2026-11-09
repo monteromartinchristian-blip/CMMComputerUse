@@ -109,10 +109,15 @@ not deployed. Contract: [docs/browser-contract.md](docs/browser-contract.md).
   panel never leaves its slot taken (the default panel plus A used to leave B at
   429 for ever), a replaced viewer leaving no longer stops the replacement's
   stream, `/frame.png` captures are coalesced per window, and a port that cannot
-  be bound is a one-line `ERROR` instead of an unhandled exception. **Not
-  closed:** the token in the URL is fixed (an `<img>` cannot send headers and
-  the Host has no verified channel to the renderer), so a local process can
-  still request frames of authorized windows.
+  be bound is a one-line `ERROR` instead of an unhandled exception.
+  **Closed (second half):** the streamer's token is no longer a fixed literal.
+  The Host draws a 256-bit random token at every start, gives it to the
+  streamer child through its stdin (never argv or environment), and the
+  renderer receives it in the session projection's *view* (the persisted state,
+  checkpoint and log never hold it); the streamer compares it in constant time
+  on `/stream.mjpg`, `/frame.png` and `/stream/status`, and refuses to start
+  without a well formed one. A process that does not hold this run's token can
+  no longer read any of the three endpoints.
 - **M-01.** Several clients with open expectations in one folder: a file nobody
   named is nobody's (only a `name_hint` attributes it).
 - **M-02.** A completed download whose file is replaced by another file is

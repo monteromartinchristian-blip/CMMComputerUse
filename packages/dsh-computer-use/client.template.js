@@ -108,7 +108,11 @@ window.__ModuleLoader__.load({
         // so it shows what Computer Use is doing instead of a still admitted by
         // a tool result. The admitted frame remains the fallback.
         const target=state.target;
-        const liveEnabled=!!(target&&model.visible&&open);
+        // The streamer's address and this run's token come with the projection's
+        // view (the Host draws a new token at every start). Without them there
+        // is no live URL at all: the admitted frame stays the fallback.
+        const live=state.live,liveReady=!!(live&&Number.isSafeInteger(live.port)&&typeof live.token==='string'&&live.token.length>=43);
+        const liveEnabled=!!(target&&model.visible&&open&&liveReady);
         const [liveTick,setLiveTick]=React.useState(0),[liveBroken,setLiveBroken]=React.useState(false);
         const [streamNonce,setStreamNonce]=React.useState(0);
         const rearm=React.useRef(0);
@@ -135,7 +139,7 @@ window.__ModuleLoader__.load({
         const titleFor=React.useRef({id:null,title:''});
         if(target&&target.windowId&&titleFor.current.id!==target.windowId)titleFor.current={id:target.windowId,title:target.window};
         const urlTitle=target&&target.windowId?titleFor.current.title:(target?target.window:'');
-        const liveUrl=liveEnabled?'http://127.0.0.1:47183/stream.mjpg?token=cmm-cu-live'
+        const liveUrl=liveEnabled?'http://127.0.0.1:'+live.port+'/stream.mjpg?token='+encodeURIComponent(live.token)
           +'&app='+encodeURIComponent(target.bundle)+'&window='+encodeURIComponent(urlTitle)
           +(target.windowId?'&window_id='+target.windowId:'')
           +(label?'&slot='+label+'&bundle='+encodeURIComponent(target.bundle)+(target.pid?'&pid='+target.pid:''):'')
