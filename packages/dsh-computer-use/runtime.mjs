@@ -303,9 +303,39 @@ function openLane(state,event,id) {
   }
   return {...state,pending,lanes};
 }
+/**
+ * P2: a context this session never opened (the helper keeps contexts across
+ * sessions) is ADOPTED the first time a successful result of the current
+ * session proves its identity. The proof is the helper's own `cmm_view` line:
+ * its `context_id` must be the context the call named and its `context_label`
+ * one of A-D that no other panel uses (the label is the streamer slot). Never
+ * from a refusal, never above the two-panel limit, never evicting a panel.
+ */
+function adoptLane(state,event,call) {
+  const msg=event.data?.message;
+  if(!msg||msg.isError)return null;
+  const text=(msg.content||[]).filter(b=>b.type==='text'&&typeof b.text==='string').map(b=>b.text.slice(0,16384)).join('\n').slice(0,32768);
+  if(/^REFUSED /m.test(text))return null;
+  const lanes=state.lanes||{};
+  if(Object.keys(lanes).length>=MAX_LANES)return null;
+  const identity=viewIdentity(text);
+  if(!identity||identity.context_id!==call.context)return null;
+  const label=identity.context_label;
+  if(typeof label!=='string'||!/^[A-D]$/.test(label))return null;
+  if(Object.values(lanes).some(l=>l&&l.label===label))return null;
+  return {...emptyLane(label),lastCall:call.revision};
+}
 function foldLane(state,event,call) {
   const id=event.data?.message?.source?.callId;
-  const lane=state.lanes[call.context];
+  let lane=state.lanes[call.context];
+  if(!lane&&call.name!=='context_close') {
+    const adopted=adoptLane(state,event,call);
+    if(adopted) {
+      lane=adopted;
+      state={...state,lanes:{...state.lanes,[call.context]:lane}};
+      call={...call,target:null};
+    }
+  }
   if(call.name==='context_close') {
     const pending={...state.pending}; delete pending[id];
     const lanes={...state.lanes};
@@ -696,4 +726,22 @@ export function overlayPosition(position,frame,card) {
   const minY=Math.min(68,maxY);
   return {x:Math.max(GUTTER,Math.min(maxX,position?.x??maxX)),
     y:Math.max(minY,Math.min(maxY,position?.y??minY))};
+}
+
+/**
+ * Default place of a panel that the person has not moved (P1). With no
+ * previous panel it is the 0.3.2 home (top right). Otherwise it is BESIDE the
+ * previous panel's real box, on the same row; when the window is too narrow
+ * for two columns it goes BELOW it; when nothing fits it falls back to the
+ * home position (still inside the window). `prev` is {x,y,width,height}.
+ */
+export function autoPosition(prev,frame,card) {
+  const home=overlayPosition(null,frame,card);
+  if(!prev)return home;
+  const maxY=Math.max(GUTTER,frame.height-card.height-GUTTER);
+  const beside=prev.x-GUTTER-card.width;
+  if(beside>=GUTTER)return overlayPosition({x:beside,y:prev.y},frame,card);
+  const below=prev.y+prev.height+GUTTER;
+  if(below<=maxY)return overlayPosition({x:prev.x,y:below},frame,card);
+  return home;
 }

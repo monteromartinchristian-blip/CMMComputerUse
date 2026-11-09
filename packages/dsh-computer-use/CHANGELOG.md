@@ -6,6 +6,12 @@ The full project changelog, including the macOS helper, lives in the repository.
 
 ## Unreleased
 
+- PiP split view: two panels are born side by side (the default place of a panel
+  is derived from the previous panel's real box, re-derived on resize, and only a
+  drag makes it manual), and a context reused from another session gets its panel
+  as soon as the current session observes or acts on it (adopted from the helper's
+  own `cmm_view` identity; no duplicates, never above two panels).
+
 - X-01: the live-mirror token is random per start (256 bits), handed to the streamer
   through stdin and to the renderer through the projection view; no fixed token
   ships in the package. See the repository CHANGELOG.

@@ -176,18 +176,33 @@ window.__ModuleLoader__.load({
           const timers=due.map(x=>setTimeout(()=>setTick(v=>v+1),x-now+80));
           return ()=>timers.forEach(id=>clearTimeout(id));
         },[model.visible,model.mode,model.frameAt]);
-        const bound=React.useCallback(point=>{
+        // Split view (P1): until the person moves a panel, its place is derived
+        // from the PREVIOUS panel's real box (beside it, or below it when the
+        // window is too narrow), and re-derived on every resize. A drag or an
+        // arrow key makes the position manual, clamped as in 0.3.2.
+        const manual=React.useRef(false);
+        const previousPanel=()=>index>0&&frameRef.current?frameRef.current.querySelectorAll('[data-panel]')[index-1]||null:null;
+        const bound=React.useCallback((point,byUser)=>{
           const parent=frameRef.current,card=box.current;
           if(!parent||!card)return;
-          const next=overlayPosition(point,{width:parent.clientWidth,height:parent.clientHeight},{width:card.offsetWidth,height:card.offsetHeight});
+          if(byUser)manual.current=true;
+          const frame={width:parent.clientWidth,height:parent.clientHeight},size={width:card.offsetWidth,height:card.offsetHeight};
+          let next;
+          if(manual.current)next=overlayPosition(point,frame,size);
+          else{
+            const before=index>0?parent.querySelectorAll('[data-panel]')[index-1]:null;
+            next=autoPosition(before?{x:before.offsetLeft,y:before.offsetTop,width:before.offsetWidth,height:before.offsetHeight}:null,frame,size);
+          }
           setPosition(old=>old?.x===next.x&&old?.y===next.y?old:next);
-        },[frameRef]);
+        },[frameRef,index]);
         React.useLayoutEffect(()=>{
           if(!model.visible)return;
-          bound(position);
-          const observer=new ResizeObserver(()=>bound(position));
+          bound(manual.current?position:null);
+          const observer=new ResizeObserver(()=>bound(manual.current?position:null));
           if(frameRef.current)observer.observe(frameRef.current);
           if(box.current)observer.observe(box.current);
+          const before=previousPanel();
+          if(before)observer.observe(before);
           return ()=>observer.disconnect();
         },[model.visible,model.mode,bound,position]);
         React.useEffect(()=>{
@@ -220,10 +235,10 @@ window.__ModuleLoader__.load({
         const toggleDetails=()=>setDetails(v=>!v);
         const move={
           onPointerDown:e=>{if(e.button!==0)return;if(e.target&&e.target.closest&&e.target.closest('button'))return;e.preventDefault();drag.current={id:e.pointerId,x:e.clientX,y:e.clientY,left:box.current.offsetLeft,top:box.current.offsetTop};e.currentTarget.setPointerCapture(e.pointerId);},
-          onPointerMove:e=>{const d=drag.current;if(d?.id===e.pointerId)bound({x:d.left+e.clientX-d.x,y:d.top+e.clientY-d.y});},
+          onPointerMove:e=>{const d=drag.current;if(d?.id===e.pointerId)bound({x:d.left+e.clientX-d.x,y:d.top+e.clientY-d.y},true);},
           onPointerUp:e=>{drag.current=null;if(e.currentTarget.hasPointerCapture(e.pointerId))e.currentTarget.releasePointerCapture(e.pointerId);},
           onPointerCancel:()=>{drag.current=null;},
-          onKeyDown:e=>{const delta={ArrowLeft:[-16,0],ArrowRight:[16,0],ArrowUp:[0,-16],ArrowDown:[0,16]}[e.key];if(delta){e.preventDefault();e.stopPropagation();bound({x:box.current.offsetLeft+delta[0],y:box.current.offsetTop+delta[1]});}}
+          onKeyDown:e=>{const delta={ArrowLeft:[-16,0],ArrowRight:[16,0],ArrowUp:[0,-16],ArrowDown:[0,16]}[e.key];if(delta){e.preventDefault();e.stopPropagation();bound({x:box.current.offsetLeft+delta[0],y:box.current.offsetTop+delta[1]},true);}}
         };
         const facts=model.technical||{},rows=[];
         const row=(label,value)=>{if(value!==null&&value!==undefined&&value!=='')rows.push([label,value]);};
@@ -285,8 +300,8 @@ window.__ModuleLoader__.load({
             e.preventDefault();e.stopPropagation();action('collapse');
           },
           'data-panel':label||'default',
-          // The second panel starts beside the first; both move independently.
-          style:position?{left:position.x,top:position.y,right:'auto'}:index>0?{right:16+index*336}:undefined},
+          // The second panel is born beside the first (autoPosition); both move independently.
+          style:position?{left:position.x,top:position.y,right:'auto'}:undefined},
           h('style',null,css),
           !open?h('button',{ref:indicator,className:'cmm-cu-pill',type:'button','aria-label':t('openView')+' · '+title,'aria-expanded':false,onClick:()=>action('open')},
             dot,h('span',{className:'cmm-cu-pill-name'},title),status)
